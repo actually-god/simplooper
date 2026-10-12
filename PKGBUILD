@@ -1,10 +1,7 @@
-# Maintainer: <your name> <your email>
+# Maintainer: actually-god <actually-god@users.noreply.github.com>
 #
 # Simplooper — lightweight JACK step looper (eframe/egui + jack crate).
-#
-# NOTE (pre-upload): the url/source below point at a placeholder repository.
-# Replace with the real upstream git URL before submitting to the AUR, and
-# replace SKIP with the sha256 of the source tarball or git commit.
+# Upstream: https://github.com/actually-god/simplooper
 
 pkgname=simplooper
 # Keep in sync with Cargo.toml
@@ -12,7 +9,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Lightweight JACK step looper: four quantized loops, MIDI and keyboard control"
 arch=(x86_64)
-url="https://github.com/your-username/simplooper"  # TODO: real upstream URL
+url="https://github.com/actually-god/simplooper"
 license=(MIT)
 
 # Runtime: the binary dlopens libjack at runtime (no NEEDED entry), so we
@@ -25,7 +22,7 @@ depends=(libjack.so)
 # Build: cargo/rust may come from rustup or pacman; `jack` asks for the
 # headers + .pc file, provided by either JACK implementation.
 makedepends=(cargo rust pkgconf jack)
-source=("https://github.com/your-username/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
+source=("https://github.com/actually-god/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP')  # TODO: real checksum before AUR submission
 
 build() {

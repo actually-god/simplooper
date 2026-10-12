@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Minimalist live audio looper for JACK/PipeWire (Rust, eframe)"
 license = "MIT"
-# TODO: point at the real repository before uploading to the AUR.
-repository = "https://github.com/your-username/simplooper"
+repository = "https://github.com/actually-god/simplooper"
 keywords = ["audio", "jack", "looper", "midi"]
 categories = ["multimedia::audio"]
 
