@@ -1,2 +1,9 @@
 /target
 *.rs.bk
+
+# makepkg artifacts from in-tree builds (see README: Where to run makepkg)
+/pkg/
+*.pkg.tar.zst
+/src/simplooper-*/
+/src/*.tar.gz
+/*.tar.gz
