@@ -23,7 +23,7 @@ depends=(libjack.so)
 # headers + .pc file, provided by either JACK implementation.
 makedepends=(cargo rust pkgconf jack)
 source=("https://github.com/actually-god/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('bce5aca104c1a790d87b8f747132adea274e571ad302277d7e04c41ce28054ca')
+sha256sums=('7242484f52b92ee7082411199561713d83345e46f973108c9bb837f8d07180b9')
 
 build() {
   # Remap the build dir out of the binary so no $srcdir paths leak into
