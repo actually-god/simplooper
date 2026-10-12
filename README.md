@@ -158,6 +158,22 @@ makepkg -si   # in this directory (installs any missing deps, then the package)
 ./tests/packaging.sh --full   # optional: verify packaging end-to-end
 ```
 
+Where to run `makepkg`: running it inside a copy of this project makes
+makepkg's default source dir `$PWD/src`, which collides with Rust's own
+`src/`. The PKGBUILD copes (it builds from the extracted
+`simplooper-<ver>/` subdirectory by absolute path), but the downloaded
+tarball and extracted tree are left inside `src/` afterwards. A dedicated
+build dir is tidier:
+
+```sh
+mkdir -p ~/build/simplooper && cd ~/build/simplooper
+cp /path/to/repo/PKGBUILD .
+makepkg -si   # fetches the v${pkgver} tag tarball and builds it
+```
+
+Never use `makepkg -C` inside a project copy — `-C` wipes `$PWD/src`, i.e.
+the Rust sources.
+
 The `source=` URL points at the `v${pkgver}` tag on GitHub — cut a tag for
 each release (`git tag v0.1.0 && git push origin v0.1.0`). The sha256 in
 `sha256sums` must match that tarball; recompute it after every tagged release.

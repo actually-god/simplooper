@@ -29,17 +29,22 @@ build() {
   # Remap the build dir out of the binary so no $srcdir paths leak into
   # panic/track_caller strings (keeps makepkg's packaging check clean).
   export RUSTFLAGS="--remap-path-prefix=${srcdir}=/usr/src/${pkgname}"
+  # GitHub tag tarballs extract into a top-level directory. cd into it so
+  # cargo uses THIS Cargo.toml (not one in a parent dir) and puts target/
+  # inside the source tree — package() below refers to that exact path.
+  cd "${srcdir}/${pkgname}-${pkgver}"
   cargo build --release --locked
 }
 
 package() {
-  install -Dm755 "target/release/${pkgname}" -t "${pkgdir}/usr/bin"
+  local s="${srcdir}/${pkgname}-${pkgver}"
+  install -Dm755 "${s}/target/release/${pkgname}" -t "${pkgdir}/usr/bin"
 
-  install -Dm644 "${pkgname}.desktop" \
+  install -Dm644 "${s}/${pkgname}.desktop" \
     -t "${pkgdir}/usr/share/applications"
 
   # Placeholder icon (a blank slate square) — replaced when the real
   # artwork is provided. Must be named after the app: Icon=simplooper.
-  install -Dm644 "assets/icon.png" \
+  install -Dm644 "${s}/assets/icon.png" \
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/simplooper.png"
 }

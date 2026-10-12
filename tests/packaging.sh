@@ -80,24 +80,42 @@ for d in $all_deps; do
   fi
 done
 
-# --- 8. optional full build ---------------------------------------------------
+# --- 8. source layout + explicit paths (in-tree build regression) -----------
+# GitHub tag tarballs extract into a top-level ${pkgname}-${pkgver}/ dir, and
+# running makepkg inside a project copy makes $srcdir=$PWD/src — so
+# build()/package() must reference the extracted dir by absolute path.
+grep -q 'cd "\${srcdir}/\${pkgname}-\${pkgver}"' PKGBUILD \
+  || err "build() must cd into \${srcdir}/\${pkgname}-\${pkgver} (GitHub tarballs have a top-level dir)"
+sed -n '/^package()/,$p' PKGBUILD | grep -q '\${srcdir}' \
+  || err "package() must reference \${srcdir} (install from absolute paths, not CWD-relative)"
+
+# --- 9. optional full build ---------------------------------------------------
 if [ "${1:-}" = "--full" ]; then
   tmp=$(mktemp -d) || exit 1
   trap 'rm -rf "$tmp"' EXIT
-  note "sandbox makepkg build in $tmp"
-  tar czf "$tmp/simplooper-${pkgbuild_ver}.tar.gz" --exclude=target --exclude=.git . \
+  note "sandbox makepkg build in $tmp (mirrors an in-tree project copy)"
+  # Reproduce the user's exact layout: a copy of the project folder with the
+  # PKGBUILD inside it, so makepkg's default $srcdir=$PWD/src collides with
+  # Rust's own src/ — the scenario that broke package() before.
+  mkdir -p "$tmp/proj" "$tmp/stage/simplooper-${pkgbuild_ver}"
+  tar cf - --exclude=target --exclude=.git . | tar xf - -C "$tmp/proj" \
+    || { err "could not stage project copy"; }
+  # GitHub-layout source tarball: files under a top-level dir.
+  tar cf - --exclude=target --exclude=.git . | tar xf - -C "$tmp/stage/simplooper-${pkgbuild_ver}" \
+    || { err "could not stage source tree"; }
+  tar czf "$tmp/proj/simplooper-${pkgbuild_ver}.tar.gz" -C "$tmp/stage" "simplooper-${pkgbuild_ver}" \
     || { err "could not create source tarball"; }
-  sum=$(sha256sum "$tmp/simplooper-${pkgbuild_ver}.tar.gz" | cut -d' ' -f1)
-  cp PKGBUILD "$tmp/PKGBUILD"
-  sed -i "s|^source=.*|source=(\"simplooper-${pkgbuild_ver}.tar.gz\")|" "$tmp/PKGBUILD"
-  sed -i "s|^sha256sums=.*|sha256sums=('$sum')|" "$tmp/PKGBUILD"
+  sum=$(sha256sum "$tmp/proj/simplooper-${pkgbuild_ver}.tar.gz" | cut -d' ' -f1)
+  cp PKGBUILD "$tmp/proj/PKGBUILD"
+  sed -i "s|^source=.*|source=(\"simplooper-${pkgbuild_ver}.tar.gz\")|" "$tmp/proj/PKGBUILD"
+  sed -i "s|^sha256sums=.*|sha256sums=('$sum')|" "$tmp/proj/PKGBUILD"
   # --nodeps: dep resolvability was already verified in step 7; we must not
   # let makepkg install pacman rust/cargo over a rustup toolchain.
-  if ! (cd "$tmp" && makepkg --nodeps >build.log 2>&1); then
-    err "sandbox makepkg build failed (see $tmp/build.log)"
-    tail -20 "$tmp/build.log" >&2
+  if ! (cd "$tmp/proj" && makepkg --nodeps >build.log 2>&1); then
+    err "sandbox makepkg build failed (see $tmp/proj/build.log)"
+    tail -20 "$tmp/proj/build.log" >&2
   fi
-  pkg=$(ls "$tmp"/*.pkg.tar.zst 2>/dev/null | head -1)
+  pkg=$(ls "$tmp"/proj/*.pkg.tar.zst "$tmp"/proj/pkg/*.pkg.tar.zst 2>/dev/null | head -1)
   if [ -z "$pkg" ]; then
     err "no .pkg.tar.zst produced"
   else
@@ -107,7 +125,7 @@ if [ "${1:-}" = "--full" ]; then
       || err "package missing desktop entry"
     tar -tf "$pkg" | grep -q "usr/share/icons/hicolor/256x256/apps/simplooper.png$" \
       || err "package missing icon (must install as simplooper.png)"
-    if grep -q 'reference to \$srcdir' "$tmp/build.log"; then
+    if grep -q 'reference to \$srcdir' "$tmp/proj/build.log"; then
       err "build log contains a \$srcdir path leak"
     fi
   fi
