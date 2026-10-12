@@ -15,8 +15,16 @@ arch=(x86_64)
 url="https://github.com/your-username/simplooper"  # TODO: real upstream URL
 license=(MIT)
 
-depends=(libjack)
-makedepends=(cargo rust libjack pkgconf)
+# Runtime: the binary dlopens libjack at runtime (no NEEDED entry), so we
+# depend on the shared library itself rather than a specific JACK package.
+# Both pipewire-jack and the official libjack provide `libjack.so` (the same
+# convention as ardour), which keeps `makepkg -si` working no matter which
+# JACK implementation is installed or present in the enabled repos — a plain
+# `libjack` package name does not exist on every distro (e.g. CachyOS).
+depends=(libjack.so)
+# Build: cargo/rust may come from rustup or pacman; `jack` asks for the
+# headers + .pc file, provided by either JACK implementation.
+makedepends=(cargo rust pkgconf jack)
 source=("https://github.com/your-username/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP')  # TODO: real checksum before AUR submission
 
