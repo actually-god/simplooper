@@ -1,0 +1,22 @@
+[package]
+name = "simplooper"
+version = "0.1.0"
+edition = "2021"
+description = "Minimalist live audio looper for JACK/PipeWire (Rust, eframe)"
+license = "MIT"
+# TODO: point at the real repository before uploading to the AUR.
+repository = "https://github.com/your-username/simplooper"
+keywords = ["audio", "jack", "looper", "midi"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+eframe = "0.36.2"
+egui = "0.36"
+jack = "0.13.5"
+# Only used to decode the bundled application icon (assets/icon.png).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
