@@ -39,12 +39,11 @@ independent/dependent loop modes, and an easy quantize tool.
 ## Requirements
 
 - Rust (stable) and `cargo`
-- Build-time system libraries: `libjack` (JACK headers + lib), `pkgconf`.
+- Build-time system libraries: JACK headers + `.pc` file (provided by
+  `pipewire-jack` or the official `libjack` package), plus `pkgconf`.
   No other system deps — the GUI stack is pure-Rust.
 - A JACK-compatible audio server:
   - **PipeWire** (recommended): just install `pipewire` + `pipewire-jack`.
-    On this system the installed `libjack` *is* PipeWire-JACK, so no extra
-    setup is needed.
   - or classic **jack2** (`jackd`).
 
 The app opens its JACK client with `NO_START`, so it will never spawn a server
@@ -140,15 +139,23 @@ src/
 The repository is laid out to be packaged directly with `makepkg`:
 
 - `PKGBUILD` — builds with `cargo build --release --locked` and installs the
-  binary, the desktop entry, and the icon into the hicolor theme.
+  binary, the desktop entry, and the icon into the hicolor theme. Depends on
+  `libjack.so` (the shared library, not a specific package) so it resolves
+  with either JACK implementation: pipewire-jack or official libjack.
 - `simplooper.desktop` — application-menu entry (`Icon=simplooper`).
 - `assets/icon.png` — **placeholder** blank icon; drop the final artwork over
   this file before release (the PKGBUILD installs whatever is in it).
+- `tests/packaging.sh` — packaging regression test: checks PKGBUILD syntax,
+  required fields, version sync with Cargo.toml, referenced files, desktop
+  entry, icon, and that every dependency is installed or installable from the
+  enabled repos (the failure mode of `makepkg -si`). Add `--full` for a
+  sandboxed makepkg build + package-content verification.
 
 To build a local `.pkg.tar.zst`:
 
 ```sh
-makepkg -s   # in this directory (needs cargo, rust, libjack, pkgconf)
+makepkg -si   # in this directory (installs any missing deps, then the package)
+./tests/packaging.sh --full   # optional: verify packaging end-to-end
 ```
 
 The AUR `source=` URL and checksum in `PKGBUILD` are placeholders until the
@@ -166,6 +173,9 @@ The e2e suite drives a real JACK client pair: it feeds a controllable source
 (constant or PRNG) into simplooper, records → quantizes → overdubs → plays,
 and discriminates independent vs dependent mode by autocorrelation of the
 captured output. Tests self-skip when no JACK/PipeWire server is running.
+
+Packaging is covered by `tests/packaging.sh` (see the Packaging section):
+run it before submitting to the AUR or after any PKGBUILD change.
 
 ## Roadmap (live looping)
 
