@@ -158,8 +158,9 @@ makepkg -si   # in this directory (installs any missing deps, then the package)
 ./tests/packaging.sh --full   # optional: verify packaging end-to-end
 ```
 
-The AUR `source=` URL and checksum in `PKGBUILD` are placeholders until the
-project has a real upstream git repository; update them before submitting.
+The `source=` URL points at the `v${pkgver}` tag on GitHub — cut a tag for
+each release (`git tag v0.1.0 && git push origin v0.1.0`). The sha256 in
+`sha256sums` must match that tarball; recompute it after every tagged release.
 
 ## Tests
 
