@@ -597,6 +597,14 @@ fn e2e_loop_engine() {
     assert!(v > 0.01, "no signal in capture (var {v})");
     let d = acf_norm(x, lmax as usize);
     assert!(d > 0.5 * v, "dependent: no period at lmax (acf {d} vs var {v})");
+    // Shorter loops must repeat (tile) across the ensemble — not play once
+    // and go silent until the root ends. Track 1's contribution is strictly
+    // periodic with its own length under modulo-wrap playback.
+    let d1 = acf_norm(x, len1 as usize);
+    assert!(
+        d1 > 0.5 * v,
+        "dependent: shorter loop not repeating (acf at len1 {d1} vs var {v})"
+    );
 
     // --- Phase 7: clear ------------------------------------------------------
     b.cmd(Cmd::ClearTrack { i: 0 });
