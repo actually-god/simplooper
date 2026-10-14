@@ -72,11 +72,12 @@ pub enum Cmd {
     TogglePlay { i: usize },
     /// Stop and erase a loop track.
     ClearTrack { i: usize },
-    /// true = dependent looping (ensemble clock), false = independent players.
+    /// true = dependent looping (finite ensemble clock), false = independent players.
     SetDependent(bool),
     /// Dependent-mode ensemble length in units of the longest ("root") loop,
-    /// clamped to 1..=64. With N the ensemble period is N root loops; every
-    /// track repeats within it and everything restarts in sync at the end.
+    /// clamped to 1..=64. The ensemble plays exactly N root loops: every track
+    /// repeats within the period and all tracks stop together at its end
+    /// (changing N while playing restarts the ensemble).
     SetRootLoops(u32),
     /// Easy-quantize every loop against Loop 1's recorded length.
     Quantize { num: u32, den: u32, bars: u32, unit: crate::quantize::Unit },
@@ -423,6 +424,7 @@ fn run(
         pos: [0u64; MAX_LOOPS],
         master_pos: 0,
         prev_mode: 0,
+        prev_root: 1,
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -812,6 +814,8 @@ struct Proc {
     /// Dependent-mode ensemble clock (samples since the ensemble started).
     master_pos: u64,
     prev_mode: u8,
+    /// Last root-loops value seen; a change restarts the ensemble.
+    prev_root: u32,
 }
 
 impl ProcessHandler for Proc {
@@ -896,9 +900,15 @@ impl ProcessHandler for Proc {
         // Dependent-mode ensemble: the longest PLAYING/overdubbing track is
         // the "root" loop; the ensemble period is `root_loops` copies of it.
         // Every track repeats continuously (p % len) across the period, so
-        // shorter recordings tile horizontally until everything restarts in
-        // sync together at the period boundary.
-        let root = self.engine.root_loops.load(Ordering::Relaxed).max(1) as u64;
+        // shorter recordings tile horizontally until everything stops in sync
+        // together at the period boundary — no gaps, ever.
+        let root = self.engine.root_loops.load(Ordering::Relaxed).max(1);
+        if root != self.prev_root {
+            // Ensemble length changed: restart so it plays exactly N fresh
+            // root loops from here.
+            self.prev_root = root;
+            self.master_pos = 0;
+        }
         let mut lmax = 0u64;
         if dependent {
             for i in 0..MAX_LOOPS {
@@ -907,7 +917,7 @@ impl ProcessHandler for Proc {
                 }
             }
         }
-        let period = lmax * root;
+        let period = lmax * root as u64;
 
         // Per-track read offsets for the GUI playback bars, republished every
         // 8 samples (RT-cheap; display resolution is far coarser than that).
@@ -968,7 +978,10 @@ impl ProcessHandler for Proc {
                         }
                     }
                 }
-                if dependent {
+                // Advance the ensemble clock only while something is actually
+                // playing: a stopped ensemble stays put, so REC-only cycles
+                // can't drift the phase of a later playback.
+                if dependent && period > 0 {
                     self.master_pos += 1;
                 }
             }
@@ -991,6 +1004,19 @@ impl ProcessHandler for Proc {
                     unsafe { *out_bufs[s].add(i) = v };
                 }
             }
+        }
+        // Finite ensemble: at the period end, stop every playing track in
+        // sync and restart the clock. (At most one block of samples can
+        // overshoot the boundary — content is continuous, so no glitch.)
+        if dependent && period > 0 && self.master_pos >= period {
+            for t in 0..MAX_LOOPS {
+                if st_now[t] == TR_PLAY || st_now[t] == TR_OD {
+                    self.engine.state[t].store(TR_IDLE, Ordering::Relaxed);
+                }
+            }
+            self.master_pos = 0;
+            let (states, lens_snap) = loop_state(&self.engine);
+            let _ = self.tx.try_send(Evt::LoopState { states, lens: lens_snap });
         }
         // Publish final positions for this block.
         for t in 0..MAX_LOOPS {

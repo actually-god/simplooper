@@ -368,7 +368,7 @@ fn e2e_loop_engine() {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 16;
+    let ring_n = 1usize << 19; // big enough to hold a whole dependent-mode run
     let ring: Arc<Vec<AtomicU32>> =
         Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
     let widx = Arc::new(AtomicU64::new(0));
@@ -579,28 +579,99 @@ fn e2e_loop_engine() {
         "independent: unexpected correlation at lmax (acf {c} vs {a})"
     );
 
-    // --- Phase 6: dependent mode — the ensemble repeats with period lmax ---
+    // --- Phase 6: dependent mode — finite ensemble of N root loops ---------
+    // Stop both tracks first so the run is bracketed by silence at the sink
+    // (the input is silent too), letting us measure its exact span.
+    b.cmd(Cmd::TogglePlay { i: 0 });
+    b.cmd(Cmd::TogglePlay { i: 1 });
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        Duration::from_secs(2),
+        "silence before the dependent run",
+    );
+
+    b.cmd(Cmd::SetRootLoops(8)); // ensemble plays exactly 8 root loops
     b.cmd(Cmd::SetDependent(true));
+    b.cmd(Cmd::TogglePlay { i: 0 });
+    b.cmd(Cmd::TogglePlay { i: 1 });
     assert!(
         wait_for(
             &b,
-            |e| matches!(e, Evt::LoopState { .. }),
+            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_PLAY && states[1] == TR_PLAY),
             Duration::from_secs(2)
         )
         .is_some(),
-        "no LoopState after SetDependent"
+        "tracks did not start in dependent mode"
     );
-    std::thread::sleep(Duration::from_millis(400));
-    let x = read_ring(&ring, &widx, CAP_N, Duration::from_secs(3)).expect("capture");
-    let x = &x[2048..];
-    let v = var(x);
-    assert!(v > 0.01, "no signal in capture (var {v})");
-    let d = acf_norm(x, lmax as usize);
-    assert!(d > 0.5 * v, "dependent: no period at lmax (acf {d} vs var {v})");
+
+    // Finite ensemble: after exactly N root loops the whole ensemble stops
+    // in sync — no endless repeat.
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::LoopState { states, .. } if states.iter().all(|&s| s == TR_IDLE)),
+            Duration::from_secs(8)
+        )
+        .is_some(),
+        "ensemble did not stop after N root loops"
+    );
+    std::thread::sleep(Duration::from_millis(100)); // let the tail drain into the ring
+
+    // The run must last exactly N × lmax samples (the root loop repeated N
+    // times) with no silent gaps inside — "extra silence should never be a
+    // symptom of dependent mode". Chunk-gate the capture: the input is silent,
+    // so any activity at the sink is ensemble playback. The window may include
+    // the tail of phase 5's independent playback at its very start; the run is
+    // the LAST active region, bounded by silence on the left.
+    let end = widx.load(Ordering::Relaxed);
+    // The run lasts N × lmax samples; size the window from the live lengths
+    // (quantize jitter makes lmax vary between runs) plus settle margin.
+    let need = (lmax as usize * 8 + 20_000).min(ring_n - 1);
+    let x: Vec<f32> = (0..need)
+        .map(|i| {
+            f32::from_bits(
+                ring[((end - need as u64 + i as u64) % ring_n as u64) as usize]
+                    .load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+    let chunk = 480usize;
+    let rms = |c: &[f32]| {
+        (c.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / c.len() as f64).sqrt()
+    };
+    let act: Vec<bool> = (0..x.len() / chunk)
+        .map(|k| rms(&x[k * chunk..(k + 1) * chunk]) > 0.05)
+        .collect();
+    let e = act
+        .iter()
+        .rposition(|&a| a)
+        .expect("dependent: no signal captured");
+    let mut s = e;
+    while s > 0 && act[s - 1] {
+        s -= 1;
+    }
+    assert!(
+        s > 0 && !act[s - 1],
+        "dependent: run not bounded by silence on the left (window too small?)"
+    );
+    // Contiguity of [s, e] is guaranteed by construction: every chunk between
+    // the run's first and last active chunk is active — no silent gaps.
+    let first = s * chunk;
+    let last = (e + 1) * chunk;
+    let span = (last - first) as i64;
+    let expected = lmax as i64 * 8;
+    assert!(
+        (span - expected).abs() <= 2000,
+        "ensemble lasted {span} samples, expected ~{expected} (8 × lmax)"
+    );
+
     // Shorter loops must repeat (tile) across the ensemble — not play once
     // and go silent until the root ends. Track 1's contribution is strictly
     // periodic with its own length under modulo-wrap playback.
-    let d1 = acf_norm(x, len1 as usize);
+    let xa = &x[first..last];
+    let v = var(xa);
+    assert!(v > 0.01, "no signal in run (var {v})");
+    let d1 = acf_norm(xa, len1 as usize);
     assert!(
         d1 > 0.5 * v,
         "dependent: shorter loop not repeating (acf at len1 {d1} vs var {v})"
