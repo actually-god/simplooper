@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //! - top bar: hamburger (settings), status, xruns, peak meter, master gain
-//! - left side panel (optional): audio ports, MIDI bindings, easy quantize
+//! - left side panel (optional): audio ports, MIDI + keyboard bindings, easy quantize
 //! - central: independent/dependent mode checkbox + four loop tracks, each
 //!   with a waveform of the recorded audio and REC / OD / play / clear buttons
 //! - bottom: MIDI monitor
@@ -15,7 +15,8 @@ use eframe::Frame;
 use egui::{Color32, RichText, Sense, Slider};
 
 use crate::audio::{Backend, Cmd, Evt, PortInfo, MAX_LOOPS, TR_OD, TR_PLAY, TR_REC};
-use crate::midi::{hex, MidiBind, MidiMsg};
+use crate::config::{Config, MidiBinding};
+use crate::midi::{hex, MidiAction, MidiBind, MidiMsg};
 use crate::quantize::Unit;
 
 /// One row in the MIDI monitor log.
@@ -34,6 +35,123 @@ struct WaveCache {
     gen: u64,
     cols: usize,
     data: Vec<[f32; 2]>,
+}
+
+/// Number of bindable actions — one keyboard slot per entry of
+/// [`MidiAction::ALL`].
+pub const N_ACTIONS: usize = MidiAction::ALL.len();
+
+/// Default keyboard bindings, one per entry of `MidiAction::ALL` (same order);
+/// `None` = no default binding.
+const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = [
+    Some(egui::Key::Num1),
+    Some(egui::Key::Num2),
+    Some(egui::Key::Num3),
+    Some(egui::Key::Num4),
+    Some(egui::Key::R),
+    Some(egui::Key::O),
+    Some(egui::Key::C),
+    Some(egui::Key::Space),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(egui::Key::D),
+];
+
+/// Keys a user may plausibly bind to a shortcut.
+const KEY_CANDIDATES: [egui::Key; 51] = [
+    egui::Key::Num0,
+    egui::Key::Num1,
+    egui::Key::Num2,
+    egui::Key::Num3,
+    egui::Key::Num4,
+    egui::Key::Num5,
+    egui::Key::Num6,
+    egui::Key::Num7,
+    egui::Key::Num8,
+    egui::Key::Num9,
+    egui::Key::Space,
+    egui::Key::Enter,
+    egui::Key::Tab,
+    egui::Key::A,
+    egui::Key::B,
+    egui::Key::C,
+    egui::Key::D,
+    egui::Key::E,
+    egui::Key::F,
+    egui::Key::G,
+    egui::Key::H,
+    egui::Key::I,
+    egui::Key::J,
+    egui::Key::K,
+    egui::Key::L,
+    egui::Key::M,
+    egui::Key::N,
+    egui::Key::O,
+    egui::Key::P,
+    egui::Key::Q,
+    egui::Key::R,
+    egui::Key::S,
+    egui::Key::T,
+    egui::Key::U,
+    egui::Key::V,
+    egui::Key::W,
+    egui::Key::X,
+    egui::Key::Y,
+    egui::Key::Z,
+    egui::Key::F1,
+    egui::Key::F2,
+    egui::Key::F3,
+    egui::Key::F4,
+    egui::Key::F5,
+    egui::Key::F6,
+    egui::Key::F7,
+    egui::Key::F8,
+    egui::Key::F9,
+    egui::Key::F10,
+    egui::Key::F11,
+    egui::Key::F12,
+];
+
+/// Name a key is persisted under (its Debug name; reversible via `key_from_name`).
+fn key_debug(k: egui::Key) -> String {
+    format!("{k:?}")
+}
+
+/// Short display form of a key for the shortcut rows.
+fn key_display(k: egui::Key) -> String {
+    match k {
+        egui::Key::Num0 => "0".into(),
+        egui::Key::Num1 => "1".into(),
+        egui::Key::Num2 => "2".into(),
+        egui::Key::Num3 => "3".into(),
+        egui::Key::Num4 => "4".into(),
+        egui::Key::Num5 => "5".into(),
+        egui::Key::Num6 => "6".into(),
+        egui::Key::Num7 => "7".into(),
+        egui::Key::Num8 => "8".into(),
+        egui::Key::Num9 => "9".into(),
+        egui::Key::Space => "space".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Parse a persisted key name back into an `egui::Key` (None if unknown).
+fn key_from_name(s: &str) -> Option<egui::Key> {
+    KEY_CANDIDATES.iter().find(|k| format!("{k:?}") == s).copied()
 }
 
 pub struct App {
@@ -69,12 +187,19 @@ pub struct App {
     q_unit_is_bar: bool,
     q_result: Option<String>,
 
-    // --- MIDI bindings for REC/OD buttons ---
-    rec_bind: [Option<MidiBind>; MAX_LOOPS],
-    od_bind: [Option<MidiBind>; MAX_LOOPS],
-    /// Recently seen bindable messages (most recent last), offered in the
-    /// binding combo boxes.
-    bind_history: Vec<MidiBind>,
+    // --- MIDI bindings: one slot per entry of MidiAction::ALL (25) ---
+    midi_binds: [Option<MidiBind>; N_ACTIONS],
+
+    // --- rebindable keyboard shortcuts (one slot per MidiAction::ALL entry) ---
+    short_keys: [Option<egui::Key>; N_ACTIONS],
+    /// Action slot currently in "press a key" learn mode, if any.
+    learning_slot: Option<usize>,
+    /// MIDI slot currently capturing the next NOTE ON / CC / PC message, if any.
+    midi_learning_slot: Option<usize>,
+
+    // --- dependent-mode ensemble length (in units of the longest loop) ---
+    root_loops: u32,
+    q_root: String,
 
     // --- MIDI monitor state ---
     last_midi: Option<MidiLine>,
@@ -84,6 +209,30 @@ pub struct App {
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, backend: Backend) -> Self {
+        // Load persisted settings (shortcuts, MIDI binds, root loops).
+        let cfg = Config::load();
+        let mut short_keys = core::array::from_fn(|i| SHORTCUT_DEFAULTS[i]);
+        // Old configs stored 9 slots in the legacy order (select 1–4, play/stop,
+        // record, overdub, clear, dependent); remap them onto the per-action
+        // table. Newer configs store one entry per MidiAction::ALL slot.
+        const OLD_TO_NEW: [usize; 9] = [0, 1, 2, 3, 7, 4, 5, 6, N_ACTIONS - 1];
+        if cfg.shortcuts.len() == 9 {
+            for (old, name) in cfg.shortcuts.iter().enumerate() {
+                short_keys[OLD_TO_NEW[old]] = name.as_deref().and_then(key_from_name);
+            }
+        } else {
+            for (i, name) in cfg.shortcuts.iter().enumerate().take(N_ACTIONS) {
+                short_keys[i] = name.as_deref().and_then(key_from_name);
+            }
+        }
+        let mut midi_binds = [None; N_ACTIONS];
+        for b in &cfg.midi {
+            if MidiAction::idx(b.action) < N_ACTIONS {
+                midi_binds[MidiAction::idx(b.action)] = b.bind;
+            }
+        }
+        let root_loops = cfg.root_loops.clamp(1, 64);
+
         Self {
             backend,
             status: "starting…".into(),
@@ -107,9 +256,12 @@ impl App {
             q_bars: "2".into(),
             q_unit_is_bar: false,
             q_result: None,
-            rec_bind: [None; MAX_LOOPS],
-            od_bind: [None; MAX_LOOPS],
-            bind_history: Vec::new(),
+            midi_binds,
+            short_keys,
+            learning_slot: None,
+            midi_learning_slot: None,
+            root_loops,
+            q_root: root_loops.to_string(),
             last_midi: None,
             midi_log: VecDeque::with_capacity(300),
             peak_disp: 0.0,
@@ -127,28 +279,51 @@ impl App {
         )
     }
 
-    /// Remember a bindable message so it can be picked in the binding UI.
-    fn push_bind(&mut self, b: MidiBind) {
-        if let Some(pos) = self.bind_history.iter().position(|x| *x == b) {
-            self.bind_history.swap_remove(pos);
-        }
-        self.bind_history.push(b);
-        if self.bind_history.len() > 32 {
-            self.bind_history.remove(0);
-        }
-    }
-
     /// Global keyboard shortcuts (IDEA.md: "simple action mapping system with
-    /// midi input and keyboard support"). Keys 1–4 select a loop; the
-    /// transport keys act on the selected one. Press edges are read from the
-    /// per-frame event list so key auto-repeat doesn't re-fire an action, and
-    /// the keys are ignored while a text field (quantize fields) has focus.
+    /// midi input and keyboard support"). Every action in MidiAction::ALL has
+    /// a rebindable key slot (Settings → MIDI + Keyboard Bindings); keys are
+    /// persisted. Press edges are read from the per-frame event list so key
+    /// auto-repeat doesn't re-fire an action, and the keys are ignored while a
+    /// text field has focus.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // Ignore keys while a text field has focus (tracked in `ui()`), so
         // typing "1" into the quantize fields doesn't switch loops.
         if self.in_text_edit {
             return;
         }
+
+        // Learn mode: the next key press becomes the slot's new binding.
+        if let Some(slot) = self.learning_slot {
+            let key = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(k) = key {
+                if k == egui::Key::Escape {
+                    self.learning_slot = None; // cancel
+                } else if k == egui::Key::Delete {
+                    // Del is a fixed binding (clears the selected loop); it can
+                    // never be assigned to a shortcut slot.
+                    self.status = "Del is reserved — it always clears the selected loop".into();
+                } else {
+                    match self.short_keys.iter().position(|s| *s == Some(k)) {
+                        Some(s) if s != slot => {
+                            self.status =
+                                format!("{} is already bound — try another key", key_display(k));
+                        }
+                        _ => {
+                            self.short_keys[slot] = Some(k);
+                            self.learning_slot = None;
+                            self.save_config();
+                        }
+                    }
+                }
+            }
+            return; // swallow all keys while learning
+        }
+
         let pressed = |key: egui::Key| {
             ctx.input(|i| {
                 i.events.iter().any(|e| matches!(
@@ -158,50 +333,61 @@ impl App {
             })
         };
 
-        #[derive(PartialEq)]
-        enum Act { Play, Rec, Od, Clear, Dep }
+        // Del is a fixed binding — it always clears the selected loop and can
+        // never be assigned to a shortcut slot (learn mode rejects it).
+        if pressed(egui::Key::Delete) {
+            self.backend.cmd(Cmd::ClearTrack { i: self.selected });
+        }
 
-        for (i, key) in [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if pressed(key) {
-                self.selected = i;
+        // Slot order matters: selection slots fire first so transport actions
+        // in the same frame see the updated selection. Keys are unique across
+        // slots (learn mode rejects duplicates), so at most one slot matches a
+        // physical key.
+        for i in 0..N_ACTIONS {
+            if let Some(k) = self.short_keys[i] {
+                if pressed(k) {
+                    self.fire_midi_action(MidiAction::ALL[i]);
+                }
             }
         }
+    }
 
-        let mut act: Option<Act> = None;
-        if pressed(egui::Key::Space) {
-            act = Some(Act::Play);
-        }
-        if act.is_none() && pressed(egui::Key::R) {
-            act = Some(Act::Rec);
-        }
-        if act.is_none() && pressed(egui::Key::O) {
-            act = Some(Act::Od);
-        }
-        if act.is_none() && pressed(egui::Key::C) {
-            act = Some(Act::Clear);
-        }
-        if act.is_none() && pressed(egui::Key::D) {
-            act = Some(Act::Dep);
-        }
-
-        match act {
-            Some(Act::Play) => self.backend.cmd(Cmd::TogglePlay { i: self.selected }),
-            Some(Act::Rec) => self.backend.cmd(Cmd::ToggleRecord { i: self.selected }),
-            Some(Act::Od) => self.backend.cmd(Cmd::ToggleOverdub { i: self.selected }),
-            Some(Act::Clear) => self.backend.cmd(Cmd::ClearTrack { i: self.selected }),
-            Some(Act::Dep) => {
+    /// Fire a bound action (MIDI trigger or keyboard shortcut). Selected-track
+    /// variants act on the selected loop; loop variants act on one specific
+    /// track; Dependent toggles ensemble mode.
+    fn fire_midi_action(&mut self, a: MidiAction) {
+        match a {
+            MidiAction::Select(i) => self.selected = i,
+            MidiAction::RecSelected => self.backend.cmd(Cmd::ToggleRecord { i: self.selected }),
+            MidiAction::OdSelected => self.backend.cmd(Cmd::ToggleOverdub { i: self.selected }),
+            MidiAction::ClearSelected => self.backend.cmd(Cmd::ClearTrack { i: self.selected }),
+            MidiAction::PlaySelected => self.backend.cmd(Cmd::TogglePlay { i: self.selected }),
+            MidiAction::RecLoop(i) => self.backend.cmd(Cmd::ToggleRecord { i }),
+            MidiAction::OdLoop(i) => self.backend.cmd(Cmd::ToggleOverdub { i }),
+            MidiAction::ClearLoop(i) => self.backend.cmd(Cmd::ClearTrack { i }),
+            MidiAction::PlayLoop(i) => self.backend.cmd(Cmd::TogglePlay { i }),
+            MidiAction::Dependent => {
                 self.dependent = !self.dependent;
                 self.backend.cmd(Cmd::SetDependent(self.dependent));
             }
-            None => {}
+        }
+    }
+
+    /// Persist shortcuts, MIDI bindings and the ensemble length to disk.
+    fn save_config(&self) {
+        let cfg = Config {
+            shortcuts: (0..N_ACTIONS)
+                .map(|i| self.short_keys[i].map(key_debug))
+                .collect(),
+            midi: MidiAction::ALL
+                .iter()
+                .zip(self.midi_binds.iter())
+                .filter_map(|(a, b)| b.map(|bind| MidiBinding { action: *a, bind: Some(bind) }))
+                .collect(),
+            root_loops: self.root_loops,
+        };
+        if let Err(e) = cfg.save() {
+            eprintln!("[simplooper] could not save config: {e}");
         }
     }
 
@@ -212,6 +398,8 @@ impl App {
                 self.client_name = Some(client_name.clone());
                 self.sample_rate = sample_rate;
                 self.status = "JACK ready — select ports, then Apply".into();
+                // Audio is up: apply the persisted ensemble length.
+                self.backend.cmd(Cmd::SetRootLoops(self.root_loops));
             }
             Evt::Ports { ins, outs } => {
                 self.avail_in = ins;
@@ -230,15 +418,24 @@ impl App {
             }
             Evt::Midi(raw) => {
                 if let Some(msg) = MidiMsg::parse(&raw.bytes) {
-                    // Bindable messages drive the bound REC/OD buttons.
+                    // Bindable messages drive every bound action (Settings →
+                    // MIDI Bindings); value/velocity are ignored.
                     if let Some(bind) = MidiBind::from_msg(&msg) {
-                        self.push_bind(bind);
-                        for i in 0..MAX_LOOPS {
-                            if self.rec_bind[i] == Some(bind) {
-                                self.backend.cmd(Cmd::ToggleRecord { i });
+                        // Live capture: a row in "listening" state takes the
+                        // first bindable message it sees, like key learning.
+                        if let Some(slot) = self.midi_learning_slot {
+                            if self.midi_binds[slot] != Some(bind) {
+                                self.midi_binds[slot] = Some(bind);
+                                self.save_config();
+                                self.status =
+                                    format!("bound {} → {}", MidiAction::ALL[slot].label(), bind.label());
                             }
-                            if self.od_bind[i] == Some(bind) {
-                                self.backend.cmd(Cmd::ToggleOverdub { i });
+                            self.midi_learning_slot = None;
+                        } else {
+                            for i in 0..24 {
+                                if self.midi_binds[i] == Some(bind) {
+                                    self.fire_midi_action(MidiAction::ALL[i]);
+                                }
                             }
                         }
                     }
@@ -268,10 +465,16 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        // Keep the update loop ticking while idle so backend events (MIDI,
-        // port changes) are drained promptly; eframe otherwise pauses frames
-        // when nothing has changed.
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Keep the update loop ticking so backend events (MIDI, port changes)
+        // are drained promptly; eframe otherwise pauses frames when nothing
+        // has changed. While a track plays we tick faster (~50 fps) so the
+        // playback bars move smoothly; idle stays at 10 fps to keep CPU low.
+        let any_playing = self.track_state.iter().any(|&s| s == TR_PLAY || s == TR_OD);
+        ctx.request_repaint_after(std::time::Duration::from_millis(if any_playing {
+            20
+        } else {
+            100
+        }));
 
         self.handle_shortcuts(ctx);
 
@@ -379,89 +582,50 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
 fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::left("settings")
         .resizable(true)
-        .default_size(370.0)
-        .min_size(280.0)
+        .default_size(410.0)
+        .min_size(330.0)
         .show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading(RichText::new("SETTINGS").strong());
 
-                // ---- audio ports -------------------------------------------------
+                // ---- MIDI + keyboard bindings ------------------------------------
                 ui.separator();
-                ui.label(RichText::new("AUDIO PORTS").strong());
-                port_list(
-                    ui,
-                    "INPUTS",
-                    "remote output ports (sources)",
-                    &app.avail_in,
-                    &mut app.sel_in,
-                    160.0,
+                ui.label(RichText::new("MIDI + KEYBOARD BINDINGS").strong());
+                ui.label(
+                    RichText::new(
+                        "Click a MIDI cell, then send a NOTE ON / CC / PROGRAM \
+                         CHANGE from your controller — the first matching message \
+                         becomes that binding (click again or Esc to cancel). A bound \
+                         action fires on every matching message (value/velocity \
+                         ignored). The key column works the same way: click, then \
+                         press the new key (Esc cancels); keys are ignored while a \
+                         text field has focus.",
+                    )
+                    .weak()
+                    .small(),
                 );
-                port_list(
-                    ui,
-                    "OUTPUTS",
-                    "remote input ports (sinks)",
-                    &app.avail_out,
-                    &mut app.sel_out,
-                    160.0,
-                );
+                ui.label(RichText::new("selected track").weak().small());
+                for a in MidiAction::ALL.iter().take(8) {
+                    bind_row(ui, app, *a);
+                }
+                // Fixed (unrebindable) binding: Del always clears the selected
+                // loop. Shown greyed out so it's clear but not clickable.
                 ui.horizontal(|ui| {
-                    if ui.button("Apply Selection").clicked() {
-                        let ins: Vec<String> = app.sel_in.iter().cloned().collect();
-                        let outs: Vec<String> = app.sel_out.iter().cloned().collect();
-                        app.backend.cmd(Cmd::Apply { ins, outs });
-                    }
-                    if ui.button("Stop").clicked() {
-                        app.backend.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
-                    }
-                    if ui.button("Refresh").clicked() {
-                        app.backend.cmd(Cmd::Refresh);
-                    }
+                    ui.set_min_width(150.0);
+                    ui.label(RichText::new("clear (selected) · fixed").weak());
+                    let btn = egui::Button::new(RichText::new("Del").monospace())
+                        .min_size(egui::vec2(44.0, 0.0));
+                    ui.add_enabled(false, btn).on_hover_text(
+                        "Fixed binding — Del always clears the selected loop and \
+                         cannot be reassigned.",
+                    );
                 });
-
-                // ---- MIDI bindings -------------------------------------------------
-                ui.separator();
-                ui.label(RichText::new("MIDI BINDINGS").strong());
-                ui.label(
-                    RichText::new(
-                        "Send a NOTE ON / CC / PROGRAM CHANGE from your controller; it \
-                         appears in the lists below. A bound button fires on every \
-                         matching message (value/velocity ignored).",
-                    )
-                    .weak()
-                    .small(),
-                );
-                for i in 0..MAX_LOOPS {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Loop {}", i + 1)).strong());
-                        bind_combo(ui, &mut app.rec_bind[i], &app.bind_history, "REC");
-                        bind_combo(ui, &mut app.od_bind[i], &app.bind_history, "OD");
-                    });
+                ui.label(RichText::new("direct loop actions").weak().small());
+                for a in MidiAction::ALL.iter().skip(8).take(16) {
+                    bind_row(ui, app, *a);
                 }
-
-                // ---- keyboard shortcuts --------------------------------------------
-                ui.separator();
-                ui.label(RichText::new("KEYBOARD SHORTCUTS").strong());
-                ui.label(
-                    RichText::new(
-                        "Keys 1–4 select a loop (highlighted); the transport keys act on \
-                         the selected one. Keys are ignored while a text field has focus.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                for (key, what) in [
-                    ("1–4", "select loop"),
-                    ("space", "play / stop the selected loop"),
-                    ("R", "record toggle (selected loop)"),
-                    ("O", "overdub toggle (selected loop)"),
-                    ("C", "clear the selected loop"),
-                    ("D", "toggle dependent mode"),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.monospace(key);
-                        ui.label(what);
-                    });
-                }
+                ui.label(RichText::new("global").weak().small());
+                bind_row(ui, app, MidiAction::Dependent);
 
                 // ---- easy quantize -------------------------------------------------
                 ui.separator();
@@ -517,23 +681,98 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                             ui.label(RichText::new(r).monospace().small());
                         });
                 }
+
+                // ---- audio ports -------------------------------------------------
+                // Last on purpose: the long port lists used to push every other
+                // section out of view. One flat list per direction, stacked
+                // inside the panel's own scroll area (nested scroll areas made
+                // the section titles scroll away from view; side-by-side
+                // columns were too narrow at the default panel width).
+                ui.separator();
+                ui.label(RichText::new("AUDIO PORTS").strong());
+                port_list(
+                    ui,
+                    "INPUTS",
+                    "remote output ports (sources)",
+                    &app.avail_in,
+                    &mut app.sel_in,
+                );
+                ui.add_space(8.0);
+                port_list(
+                    ui,
+                    "OUTPUTS",
+                    "remote input ports (sinks)",
+                    &app.avail_out,
+                    &mut app.sel_out,
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Apply Selection").clicked() {
+                        let ins: Vec<String> = app.sel_in.iter().cloned().collect();
+                        let outs: Vec<String> = app.sel_out.iter().cloned().collect();
+                        app.backend.cmd(Cmd::Apply { ins, outs });
+                    }
+                    if ui.button("Stop").clicked() {
+                        app.backend.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+                    }
+                    if ui.button("Refresh").clicked() {
+                        app.backend.cmd(Cmd::Refresh);
+                    }
+                });
             });
         });
-}
+    }
 
-/// Combo box for picking a MIDI binding (or none) for one button.
-fn bind_combo(ui: &mut egui::Ui, slot: &mut Option<MidiBind>, history: &[MidiBind], label: &str) {
-    egui::ComboBox::from_label(label)
-        .selected_text(match *slot {
-            Some(b) => b.label(),
-            None => "—".to_string(),
-        })
-        .show_ui(ui, |ui| {
-            ui.selectable_value(slot, None, "— none —");
-            for b in history {
-                ui.selectable_value(slot, Some(*b), b.label());
+/// One row of the bindings table: action label + MIDI capture button +
+/// keyboard button; persists on change. Both columns work like "press a key":
+/// click the cell to arm it, then send the trigger — the next matching input
+/// becomes the binding (click again or Esc cancels).
+fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
+    let idx = MidiAction::idx(a);
+    ui.horizontal(|ui| {
+        ui.set_min_width(150.0);
+        ui.label(RichText::new(a.label()).weak());
+
+        // MIDI binding: live capture (no dropdown — the controller is the menu).
+        let listening = app.midi_learning_slot == Some(idx);
+        let txt = if listening {
+            "listening…".to_string()
+        } else {
+            match app.midi_binds[idx] {
+                Some(b) => b.label(),
+                None => "—".to_string(),
             }
-        });
+        };
+        let mut btn = egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(150.0, 0.0));
+        if listening {
+            btn = btn.fill(Color32::from_rgb(60, 90, 120));
+        }
+        let resp = ui.add(btn).on_hover_text(
+            "Click to listen: the next NOTE ON / CC / PROGRAM CHANGE \
+             from your controller becomes this binding. Click again (or Esc) to cancel.",
+        );
+        if resp.clicked() {
+            app.midi_learning_slot = if listening { None } else { Some(idx) };
+        }
+
+        // Keyboard binding for the same action.
+        ui.add_space(4.0);
+        let learning = app.learning_slot == Some(idx);
+        let txt = if learning {
+            "press a key…".to_string()
+        } else {
+            match app.short_keys[idx] {
+                Some(k) => key_display(k),
+                None => "—".to_string(),
+            }
+        };
+        let mut btn = egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(44.0, 0.0));
+        if learning {
+            btn = btn.fill(Color32::from_rgb(60, 90, 120));
+        }
+        if ui.add(btn).clicked() {
+            app.learning_slot = Some(idx);
+        }
+    });
 }
 
 /// Central dashboard: mode checkbox + four loop tracks.
@@ -550,20 +789,49 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
             if dep.changed() {
                 app.backend.cmd(Cmd::SetDependent(app.dependent));
             }
+            // Ensemble length: how many times the longest loop repeats before
+            // everything restarts together.
+            ui.label(RichText::new("root loops:").weak());
+            let r_root = ui.add(egui::TextEdit::singleline(&mut app.q_root).desired_width(40.0));
+            app.in_text_edit = app.in_text_edit || r_root.has_focus();
+            if r_root.changed() {
+                if let Ok(n) = app.q_root.trim().parse::<u32>() {
+                    let n = n.clamp(1, 64);
+                    if n != app.root_loops {
+                        app.root_loops = n;
+                        app.backend.cmd(Cmd::SetRootLoops(n));
+                        app.save_config();
+                    }
+                }
+            }
             ui.separator();
             ui.label(
                 RichText::new("independent = each loop plays on its own clock").weak().small(),
             );
         });
         ui.label(
-            RichText::new("keys: 1–4 select · space play/stop · R rec · O od · C clear · D mode")
+            RichText::new("keys are rebindable in Settings · click a row to select its loop")
                 .weak()
                 .small(),
         );
         ui.add_space(10.0);
 
-        for i in 0..MAX_LOOPS {
-            track_row(ui, app, i);
+        // Dependent mode: show the root (longest) loop first, then the rest in
+        // numeric order; every waveform spans the full ensemble period.
+        let lens: [u32; MAX_LOOPS] = core::array::from_fn(|i| app.track_len[i]);
+        let lmax = lens.iter().copied().max().unwrap_or(0);
+        let mut order: Vec<usize> = (0..MAX_LOOPS).collect();
+        if app.dependent {
+            order.sort_by_key(|&i| ((lens[i] != lmax) as usize, i));
+        }
+        let dep_period = if app.dependent && lmax > 0 {
+            Some((lmax as u64 * app.root_loops as u64) as u32)
+        } else {
+            None
+        };
+
+        for &i in &order {
+            track_row(ui, app, i, dep_period);
             ui.add_space(8.0);
         }
     });
@@ -571,19 +839,19 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
 
 /// One loop track: label + waveform + REC/OD/play/clear buttons. The row the
 /// keyboard shortcuts target (keys 1–4) is highlighted with a frame.
-fn track_row(ui: &mut egui::Ui, app: &mut App, i: usize) {
+fn track_row(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Option<u32>) {
     if app.selected == i {
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 165, 205)))
             .inner_margin(4.0)
-            .show(ui, |ui| track_row_inner(ui, app, i));
+            .show(ui, |ui| track_row_inner(ui, app, i, dep_period));
     } else {
-        track_row_inner(ui, app, i);
+        track_row_inner(ui, app, i, dep_period);
     }
 }
 
-fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize) {
+fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Option<u32>) {
     let state = app.track_state[i];
     let len = app.track_len[i];
     let secs = if app.sample_rate > 0 {
@@ -598,6 +866,23 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize) {
         _ if len > 0 => ("ready", Color32::GRAY),
         _ => ("idle", Color32::GRAY),
     };
+
+    // Playback bar position (fraction 0..1 across the waveform), if playing.
+    let mut playhead: Option<f32> = None;
+    if state == TR_PLAY || state == TR_OD {
+        let eng = &app.backend.engine;
+        match dep_period {
+            Some(period) if period > 0 => {
+                // Dependent mode: position within the full ensemble period.
+                let mp = eng.master_pos() % period as u64;
+                playhead = Some(mp as f32 / period as f32);
+            }
+            _ if len > 0 => {
+                playhead = Some(eng.pos_of(i) as f32 / len as f32);
+            }
+            _ => {}
+        }
+    }
 
     ui.horizontal(|ui| {
         // Left: name + state.
@@ -616,7 +901,7 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize) {
         let wave_w = (ui.available_width() - 250.0).clamp(60.0, f32::INFINITY);
         let eng = app.backend.engine.clone();
         let data = eng.read_range(i, len);
-        draw_wave(ui, &mut app.wave[i], len, state, eng.generation(), data, wave_w);
+        draw_wave(ui, &mut app.wave[i], len, state, eng.generation(), data, wave_w, playhead, dep_period);
 
         // Right: transport buttons.
         let mut b_rec = egui::Button::new(RichText::new("● REC").monospace());
@@ -656,14 +941,17 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize) {
 
         let r_clr = ui
             .add(egui::Button::new(RichText::new("✕").monospace()))
-            .on_hover_text("Stop and erase this loop (C).");
+            .on_hover_text("Stop and erase this loop (C or Del).");
         if r_clr.clicked() {
             app.backend.cmd(Cmd::ClearTrack { i });
         }
     });
 }
 
-/// Draw a track's waveform (min/max columns over the recorded region).
+/// Draw a track's waveform, scaled to the track's own peak so quiet recordings
+/// are as legible as loud ones. Shows an optional playback bar and — in
+/// dependent mode — tiles the recording across the full ensemble period with
+/// separator bars at each repeat boundary (matching the modulo-wrap playback).
 fn draw_wave(
     ui: &mut egui::Ui,
     cache: &mut Option<WaveCache>,
@@ -672,6 +960,8 @@ fn draw_wave(
     gen: u64,
     data: &[f32],
     w: f32,
+    playhead: Option<f32>,
+    period: Option<u32>,
 ) {
     let h = 60.0f32;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w.max(40.0), h), Sense::hover());
@@ -697,18 +987,77 @@ fn draw_wave(
     );
 
     if len > 0 {
-        let cols = (rect.width() / 2.0) as usize;
-        let need = match cache {
-            Some(c) => c.len != len || c.gen != gen || c.cols != cols,
-            None => true,
-        };
-        if need {
-            *cache = Some(WaveCache { len, gen, cols, data: wave_cols(data, cols) });
+        // Per-track peak normalization: scale so the loudest point fills the
+        // box (bounded scan — at most ~2048 samples).
+        let n = len as usize;
+        let mut peak = 0f32;
+        let stride = (n / 2048).max(1);
+        for k in (0..n).step_by(stride) {
+            let v = data[k].abs();
+            if v > peak {
+                peak = v;
+            }
         }
-        if let Some(c) = cache {
-            let colw = rect.width() / c.cols.max(1) as f32;
-            let scale = rect.height() / 2.0 - 2.0;
-            for (k, [mn, mx]) in c.data.iter().enumerate() {
+        let scale = if peak > 1e-6 {
+            (rect.height() / 2.0 - 2.0) / peak
+        } else {
+            0.0
+        };
+
+        let period_samples = period.unwrap_or(len) as u64;
+        if period_samples <= n as u64 {
+            // Single copy: cached min/max columns over the recorded region.
+            let cols = (rect.width() / 2.0).max(1.0) as usize;
+            let need = match cache {
+                Some(c) => c.len != len || c.gen != gen || c.cols != cols,
+                None => true,
+            };
+            if need {
+                *cache = Some(WaveCache { len, gen, cols, data: wave_cols(data, cols) });
+            }
+            if let Some(c) = cache {
+                let colw = rect.width() / c.cols.max(1) as f32;
+                for (k, [mn, mx]) in c.data.iter().enumerate() {
+                    let top = (mid - mx * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
+                    let bot = (mid - mn * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
+                    let x = rect.min.x + k as f32 * colw;
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, top.min(bot)),
+                            egui::vec2(colw.max(1.0) - 0.5, (bot - top).max(1.0)),
+                        ),
+                        0.0,
+                        color,
+                    );
+                }
+            }
+        } else {
+            // Dependent stacked view: the recording repeats (tiles) across the
+            // ensemble period — the same wrap as playback (`p % len`). A
+            // separator bar marks every repeat boundary, including on the root
+            // track when it repeats (root loops > 1).
+            let n64 = n as u64;
+            let cols = (rect.width() / 2.0).max(1.0) as usize;
+            let colw = rect.width() / cols as f32;
+            for k in 0..cols {
+                let p0 = k as u64 * period_samples / cols as u64;
+                let p1 = ((k + 1) as u64 * period_samples / cols as u64).max(p0 + 1);
+                let mut mn = 0f32;
+                let mut mx = 0f32;
+                let stride = ((p1 - p0) / 8).max(1);
+                let mut k2 = p0;
+                while k2 < p1 {
+                    // Wrap within the recording: every pixel column maps to a
+                    // sample of the (repeating) loop, never to silence.
+                    let v = data[(k2 % n64) as usize];
+                    if v < mn {
+                        mn = v;
+                    }
+                    if v > mx {
+                        mx = v;
+                    }
+                    k2 += stride;
+                }
                 let top = (mid - mx * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
                 let bot = (mid - mn * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
                 let x = rect.min.x + k as f32 * colw;
@@ -721,6 +1070,17 @@ fn draw_wave(
                     color,
                 );
             }
+            // Separator bars at each repeat boundary m * len (m >= 1).
+            let mut m = 1u64;
+            while m * n64 < period_samples {
+                let p = m * n64;
+                let x = rect.min.x + p as f32 / period_samples as f32 * rect.width();
+                painter.line_segment(
+                    [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                    egui::Stroke::new(1.0, Color32::from_rgb(105, 112, 128)),
+                );
+                m += 1;
+            }
         }
     } else {
         painter.text(
@@ -732,7 +1092,20 @@ fn draw_wave(
         );
     }
 
-    resp.on_hover_text(format!("{} samples recorded", len));
+    // Playback bar.
+    if let Some(f) = playhead {
+        let x = rect.min.x + f.clamp(0.0, 1.0) * rect.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+            egui::Stroke::new(2.0, Color32::from_rgb(255, 214, 90)),
+        );
+    }
+
+    resp.on_hover_text(format!(
+        "{} samples recorded{}",
+        len,
+        period.map(|p| format!(" · ensemble of {p}")).unwrap_or_default()
+    ));
 }
 
 /// Min/max per column with bounded stride sampling (fast even for 60 s buffers).
@@ -764,44 +1137,41 @@ fn wave_cols(buf: &[f32], cols: usize) -> Vec<[f32; 2]> {
     out
 }
 
+/// Flat list of ports for one direction — no inner scroll area, so the whole
+/// settings panel scrolls as one and section titles stay visible.
 fn port_list(
     ui: &mut egui::Ui,
     title: &str,
     hint: &str,
     avail: &[PortInfo],
     sel: &mut HashSet<String>,
-    max_h: f32,
 ) {
     ui.label(RichText::new(format!("{}  ({})", title, avail.len())).strong());
     ui.label(RichText::new(hint).weak().small());
-    egui::ScrollArea::vertical()
-        .max_height(max_h)
-        .show(ui, |ui| {
-            if avail.is_empty() {
-                ui.label(RichText::new("no remote audio ports found").weak());
-                return;
+    if avail.is_empty() {
+        ui.label(RichText::new("no remote audio ports found").weak());
+        return;
+    }
+    let mut last_client = String::new();
+    for p in avail {
+        if p.client != last_client {
+            last_client = p.client.clone();
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("▸ {}", p.client)).strong());
+        }
+        let short = p.name.split(':').nth(1).unwrap_or(&p.name);
+        let mut checked = sel.contains(&p.name);
+        if ui.checkbox(&mut checked, short).clicked() {
+            if checked {
+                sel.insert(p.name.clone());
+            } else {
+                sel.remove(&p.name);
             }
-            let mut last_client = String::new();
-            for p in avail {
-                if p.client != last_client {
-                    last_client = p.client.clone();
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(format!("▸ {}", p.client)).strong());
-                }
-                let short = p.name.split(':').nth(1).unwrap_or(&p.name);
-                let mut checked = sel.contains(&p.name);
-                if ui.checkbox(&mut checked, short).clicked() {
-                    if checked {
-                        sel.insert(p.name.clone());
-                    } else {
-                        sel.remove(&p.name);
-                    }
-                }
-                ui.label(
-                    RichText::new(format!("  {}", p.name)).weak().small().monospace(),
-                );
-            }
-        });
+        }
+        ui.label(
+            RichText::new(format!("  {}", p.name)).weak().small().monospace(),
+        );
+    }
 }
 
 fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {

@@ -74,6 +74,10 @@ pub enum Cmd {
     ClearTrack { i: usize },
     /// true = dependent looping (ensemble clock), false = independent players.
     SetDependent(bool),
+    /// Dependent-mode ensemble length in units of the longest ("root") loop,
+    /// clamped to 1..=64. With N the ensemble period is N root loops; every
+    /// track repeats within it and everything restarts in sync at the end.
+    SetRootLoops(u32),
     /// Easy-quantize every loop against Loop 1's recorded length.
     Quantize { num: u32, den: u32, bars: u32, unit: crate::quantize::Unit },
     Quit,
@@ -179,6 +183,13 @@ pub struct LoopEngine {
     /// Bumped whenever the manager rewrites buffer contents (clear/quantize)
     /// so the GUI can invalidate its waveform caches.
     gen: AtomicU64,
+    /// Per-track read offset within [0, len) — published by the RT thread for
+    /// the GUI playback bars (independent mode).
+    pos: [AtomicU64; MAX_LOOPS],
+    /// Dependent-mode ensemble clock (samples) — shared playback-bar position.
+    master_pos: AtomicU64,
+    /// Dependent-mode ensemble length in units of the longest loop (>= 1).
+    root_loops: AtomicU32,
 }
 
 impl LoopEngine {
@@ -195,6 +206,9 @@ impl LoopEngine {
             len: core::array::from_fn(|_| AtomicU32::new(0)),
             mode: AtomicU8::new(0),
             gen: AtomicU64::new(0),
+            pos: core::array::from_fn(|_| AtomicU64::new(0)),
+            master_pos: AtomicU64::new(0),
+            root_loops: AtomicU32::new(1),
         })
     }
 
@@ -265,6 +279,23 @@ impl LoopEngine {
     /// Current content-generation counter (GUI cache invalidation).
     pub fn generation(&self) -> u64 {
         self.gen.load(Ordering::Relaxed)
+    }
+
+    // ---- GUI / test accessors -------------------------------------------
+
+    /// Per-track read offset within [0, len) — for the playback bar.
+    pub fn pos_of(&self, i: usize) -> u64 {
+        self.pos[i].load(Ordering::Relaxed)
+    }
+
+    /// Dependent-mode ensemble clock (samples).
+    pub fn master_pos(&self) -> u64 {
+        self.master_pos.load(Ordering::Relaxed)
+    }
+
+    /// Dependent-mode ensemble length in units of the longest loop (>= 1).
+    pub fn root_loops(&self) -> u32 {
+        self.root_loops.load(Ordering::Relaxed)
     }
 }
 
@@ -471,6 +502,9 @@ fn run(
                 engine.mode.store(if dep { 1 } else { 0 }, Ordering::Relaxed);
                 send_loop_state(&engine, &evt_tx);
             }
+            Ok(Cmd::SetRootLoops(n)) => {
+                engine.root_loops.store(n.clamp(1, 64), Ordering::Relaxed);
+            }
             Ok(Cmd::Quantize { num, den, bars, unit }) => {
                 if den == 0 || num == 0 || bars == 0 {
                     let _ = evt_tx.send(Evt::Error(
@@ -646,16 +680,32 @@ fn apply_layout(
     let _ = tx.send(Evt::Applied { ins: applied_in, outs: applied_out });
 }
 
-/// Enumerate remote audio ports and push them to the GUI.
+/// Enumerate remote audio ports, hiding those whose client belongs to a
+/// disabled device (see [`crate::ports`]), and push them to the GUI.
 fn send_ports(client: &Client, tx: &SyncSender<Evt>) {
+    let (ins, outs) = enumerate_visible_ports(client);
+    let _ = tx.send(Evt::Ports { ins, outs });
+}
+
+/// Like `send_ports`, but non-blocking (for JACK's notification thread).
+fn send_ports_try(client: &Client, tx: &SyncSender<Evt>) {
+    let (ins, outs) = enumerate_visible_ports(client);
+    let _ = tx.try_send(Evt::Ports { ins, outs });
+}
+
+/// Shared port enumeration: candidates = other clients' audio ports, minus
+/// any client that belongs to a disabled device.
+fn enumerate_visible_ports(client: &Client) -> (Vec<PortInfo>, Vec<PortInfo>) {
     let mine = client.name().to_string();
     let prefix = format!("{mine}:");
+    let hidden = hidden_clients_cached();
 
     // Candidate inputs = other clients' OUTPUT (source) audio ports.
     let ins: Vec<PortInfo> = client
         .ports(None, Some("audio"), PortFlags::IS_OUTPUT)
         .into_iter()
         .filter(|n| !n.starts_with(&prefix))
+        .filter(|n| port_visible(n, hidden.as_ref()))
         .map(|name| port_info(&name))
         .collect();
 
@@ -664,37 +714,45 @@ fn send_ports(client: &Client, tx: &SyncSender<Evt>) {
         .ports(None, Some("audio"), PortFlags::IS_INPUT)
         .into_iter()
         .filter(|n| !n.starts_with(&prefix))
+        .filter(|n| port_visible(n, hidden.as_ref()))
         .map(|name| port_info(&name))
         .collect();
 
-    let _ = tx.send(Evt::Ports { ins, outs });
+    (ins, outs)
+}
+
+/// True when a full port name (`client:port`) should be shown.
+fn port_visible(full_name: &str, hidden: Option<&std::collections::HashSet<String>>) -> bool {
+    match hidden {
+        Some(set) => !set.contains(full_name.split(':').next().unwrap_or("")),
+        None => true, // can't determine device state → show everything
+    }
+}
+
+/// Cached "hidden clients" set. The pactl/pw-cli lookups cost a few process
+/// spawns, so the result is cached for two seconds (device state rarely
+/// changes, and port lists refresh on registration events anyway).
+fn hidden_clients_cached() -> Option<std::collections::HashSet<String>> {
+    use std::time::{Duration, Instant};
+    static CACHE: std::sync::Mutex<Option<(Instant, Option<std::collections::HashSet<String>>)>> =
+        std::sync::Mutex::new(None);
+
+    // Fresh enough? (The lock is released at the end of this statement.)
+    if let Some((t, set)) = CACHE.lock().unwrap().as_ref() {
+        if t.elapsed() < Duration::from_secs(2) {
+            return set.clone();
+        }
+    }
+
+    // Compute outside the lock (it spawns processes), then store.
+    let fresh = crate::ports::hidden_clients();
+    *CACHE.lock().unwrap() = Some((Instant::now(), fresh.clone()));
+    fresh
 }
 
 fn port_info(full_name: &str) -> PortInfo {
     let client = full_name.split(':').next().unwrap_or("").to_string();
     PortInfo { name: full_name.to_string(), client }
-}
-
-/// Like `send_ports`, but non-blocking (for JACK's notification thread).
-fn send_ports_try(client: &Client, tx: &SyncSender<Evt>) {
-    let mine = client.name().to_string();
-    let prefix = format!("{mine}:");
-
-    let ins: Vec<PortInfo> = client
-        .ports(None, Some("audio"), PortFlags::IS_OUTPUT)
-        .into_iter()
-        .filter(|n| !n.starts_with(&prefix))
-        .map(|name| port_info(&name))
-        .collect();
-
-    let outs: Vec<PortInfo> = client
-        .ports(None, Some("audio"), PortFlags::IS_INPUT)
-        .into_iter()
-        .filter(|n| !n.starts_with(&prefix))
-        .map(|name| port_info(&name))
-        .collect();
-
-    let _ = tx.try_send(Evt::Ports { ins, outs });
 }
 
 /// Notification handler: keeps the GUI port list live and counts xruns.
@@ -835,8 +893,12 @@ impl ProcessHandler for Proc {
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
         let dependent = mode == 1;
-        // Dependent-mode master length: the longest PLAYING/overdubbing track
-        // (recording tracks don't count until they start playing).
+        // Dependent-mode ensemble: the longest PLAYING/overdubbing track is
+        // the "root" loop; the ensemble period is `root_loops` copies of it.
+        // Every track repeats continuously (p % len) across the period, so
+        // shorter recordings tile horizontally until everything restarts in
+        // sync together at the period boundary.
+        let root = self.engine.root_loops.load(Ordering::Relaxed).max(1) as u64;
         let mut lmax = 0u64;
         if dependent {
             for i in 0..MAX_LOOPS {
@@ -845,6 +907,11 @@ impl ProcessHandler for Proc {
                 }
             }
         }
+        let period = lmax * root;
+
+        // Per-track read offsets for the GUI playback bars, republished every
+        // 8 samples (RT-cheap; display resolution is far coarser than that).
+        let mut pos_now: [u64; MAX_LOOPS] = core::array::from_fn(|t| self.pos[t]);
 
         let mut peak_val: u32 = 0;
         for i in 0..n {
@@ -860,7 +927,7 @@ impl ProcessHandler for Proc {
             let mut play = 0.0f32;
             if any_loop_active {
                 // Ensemble position in dependent mode (before advancing).
-                let p = if lmax > 0 { self.master_pos % lmax } else { 0 };
+                let p = if period > 0 { self.master_pos % period } else { 0 };
                 for t in 0..MAX_LOOPS {
                     let st = st_now[t];
                     if st == TR_REC {
@@ -878,20 +945,40 @@ impl ProcessHandler for Proc {
                     } else if st == TR_PLAY || st == TR_OD {
                         let l = lens[t] as u64;
                         if l > 0 {
-                            let off = if dependent { p % l } else { self.pos[t] % l };
-                            play += self.engine.read(t, off as u32);
-                            if st == TR_OD {
-                                self.engine.write(t, off as u32, dry);
-                            }
-                            if !dependent {
+                            if dependent {
+                                // Repeat semantics: the recording tiles across
+                                // the whole ensemble period.
+                                let off = p % l;
+                                play += self.engine.read(t, off as u32);
+                                pos_now[t] = off;
+                                if st == TR_OD {
+                                    self.engine.write(t, off as u32, dry);
+                                }
+                            } else {
+                                let off = self.pos[t] % l;
+                                play += self.engine.read(t, off as u32);
+                                if st == TR_OD {
+                                    self.engine.write(t, off as u32, dry);
+                                }
+                                pos_now[t] = off;
                                 self.pos[t] += 1;
                             }
+                        } else {
+                            pos_now[t] = 0;
                         }
                     }
                 }
                 if dependent {
                     self.master_pos += 1;
                 }
+            }
+
+            // Publish playback positions ~every 8 samples.
+            if i & 7 == 7 {
+                for t in 0..MAX_LOOPS {
+                    self.engine.pos[t].store(pos_now[t], Ordering::Relaxed);
+                }
+                self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
             }
 
             let v = (dry + play) * g;
@@ -905,6 +992,11 @@ impl ProcessHandler for Proc {
                 }
             }
         }
+        // Publish final positions for this block.
+        for t in 0..MAX_LOOPS {
+            self.engine.pos[t].store(pos_now[t], Ordering::Relaxed);
+        }
+        self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
         self.peak.store(peak_val, Ordering::Relaxed);
 
         Control::Continue

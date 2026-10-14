@@ -206,7 +206,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// NOTE ON (note number), CC (controller number) and PC (program). The second
 /// data byte (velocity / CC value) is deliberately ignored so a pedal or knob
 /// fires regardless of its exact position.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MidiBind {
     /// 0 = NOTE ON, 1 = CC, 2 = PC.
     pub ty: u8,
@@ -242,6 +242,79 @@ impl MidiBind {
             0 => format!("NOTE {} ({}) ch{:02}", note_name(self.d1), self.d1, self.ch + 1),
             1 => format!("CC {} ({}) ch{:02}", self.d1, cc_name(self.d1), self.ch + 1),
             _ => format!("PC {} ch{:02}", self.d1, self.ch + 1),
+        }
+    }
+}
+
+/// A bindable *action* a MIDI trigger can fire. Mirrors the keyboard
+/// shortcuts (selected-track actions) plus direct per-loop actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MidiAction {
+    /// Select track `i` (0-based).
+    Select(usize),
+    /// Record / overdub / clear / play-stop the *selected* track.
+    RecSelected,
+    OdSelected,
+    ClearSelected,
+    PlaySelected,
+    /// Direct per-track actions (independent of selection).
+    RecLoop(usize),
+    OdLoop(usize),
+    ClearLoop(usize),
+    PlayLoop(usize),
+    /// Toggle dependent (ensemble) mode.
+    Dependent,
+}
+
+impl MidiAction {
+    /// Every bindable action, in UI order. `ALL[i]` is the action stored at
+    /// index `i` of the binding table.
+    pub const ALL: [MidiAction; 25] = [
+        MidiAction::Select(0),
+        MidiAction::Select(1),
+        MidiAction::Select(2),
+        MidiAction::Select(3),
+        MidiAction::RecSelected,
+        MidiAction::OdSelected,
+        MidiAction::ClearSelected,
+        MidiAction::PlaySelected,
+        MidiAction::RecLoop(0),
+        MidiAction::OdLoop(0),
+        MidiAction::ClearLoop(0),
+        MidiAction::PlayLoop(0),
+        MidiAction::RecLoop(1),
+        MidiAction::OdLoop(1),
+        MidiAction::ClearLoop(1),
+        MidiAction::PlayLoop(1),
+        MidiAction::RecLoop(2),
+        MidiAction::OdLoop(2),
+        MidiAction::ClearLoop(2),
+        MidiAction::PlayLoop(2),
+        MidiAction::RecLoop(3),
+        MidiAction::OdLoop(3),
+        MidiAction::ClearLoop(3),
+        MidiAction::PlayLoop(3),
+        MidiAction::Dependent,
+    ];
+
+    /// Position of `a` in [`MidiAction::ALL`] (binding-table index).
+    pub fn idx(a: MidiAction) -> usize {
+        Self::ALL.iter().position(|x| *x == a).unwrap_or(0)
+    }
+
+    /// Short label for the settings UI.
+    pub fn label(self) -> String {
+        match self {
+            MidiAction::Select(i) => format!("select loop {}", i + 1),
+            MidiAction::RecSelected => "record (selected)".into(),
+            MidiAction::OdSelected => "overdub (selected)".into(),
+            MidiAction::ClearSelected => "clear (selected)".into(),
+            MidiAction::PlaySelected => "play / stop (selected)".into(),
+            MidiAction::RecLoop(i) => format!("loop {}: record", i + 1),
+            MidiAction::OdLoop(i) => format!("loop {}: overdub", i + 1),
+            MidiAction::ClearLoop(i) => format!("loop {}: clear", i + 1),
+            MidiAction::PlayLoop(i) => format!("loop {}: play / stop", i + 1),
+            MidiAction::Dependent => "dependent mode".into(),
         }
     }
 }

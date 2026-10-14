@@ -5,9 +5,15 @@
 //!   loop engine).
 //! - [`midi`]: MIDI message parsing, display formatting and trigger bindings.
 //! - [`quantize`]: easy-quantization math (grid snap, zero crossing, seam).
+//! - [`config`]: persistent settings (shortcuts, MIDI bindings, root loops).
+//! - [`ports`]: enabled-device port filtering for the input/output pickers.
 //! - [`ui`]: the egui front-end (used by the binary).
 
 pub mod audio;
+pub mod config;
 pub mod midi;
+pub mod ports;
 pub mod quantize;
 pub mod ui;
+
+pub use midi::{MidiAction, MidiBind, MidiMsg};
