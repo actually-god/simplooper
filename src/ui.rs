@@ -29,12 +29,14 @@ struct MidiLine {
 }
 
 /// Cached min/max columns for one track's waveform (invalidated by length or
-/// content generation changes).
+/// content generation changes). `peak` is the exact loudest sample so the
+/// display can always be "maxed out" at full scale.
 struct WaveCache {
     len: u32,
     gen: u64,
     cols: usize,
     data: Vec<[f32; 2]>,
+    peak: f32,
 }
 
 /// Number of bindable actions — one keyboard slot per entry of
@@ -166,6 +168,9 @@ pub struct App {
     sel_in: HashSet<String>,
     sel_out: HashSet<String>,
     applied: Option<(usize, usize)>,
+    /// Last port selection actually applied via "Apply Selection"; persisted
+    /// with the config so it can be restored on the next launch.
+    applied_ports: Option<(Vec<String>, Vec<String>)>,
     gain: f32,
 
     // --- loop dashboard ---
@@ -232,6 +237,15 @@ impl App {
             }
         }
         let root_loops = cfg.root_loops.clamp(1, 64);
+        // Restore the last applied port selections so the user doesn't have to
+        // re-check the same ports on every launch.
+        let sel_in: HashSet<String> = cfg.ports_in.iter().cloned().collect();
+        let sel_out: HashSet<String> = cfg.ports_out.iter().cloned().collect();
+        let applied_ports = if cfg.ports_in.is_empty() && cfg.ports_out.is_empty() {
+            None
+        } else {
+            Some((cfg.ports_in, cfg.ports_out))
+        };
 
         Self {
             backend,
@@ -240,9 +254,10 @@ impl App {
             sample_rate: 0,
             avail_in: Vec::new(),
             avail_out: Vec::new(),
-            sel_in: HashSet::new(),
-            sel_out: HashSet::new(),
+            sel_in,
+            sel_out,
             applied: None,
+            applied_ports,
             gain: 1.0,
             show_settings: false,
             dependent: false,
@@ -303,10 +318,15 @@ impl App {
             if let Some(k) = key {
                 if k == egui::Key::Escape {
                     self.learning_slot = None; // cancel
+                    self.midi_learning_slot = None;
                 } else if k == egui::Key::Delete {
-                    // Del is a fixed binding (clears the selected loop); it can
-                    // never be assigned to a shortcut slot.
-                    self.status = "Del is reserved — it always clears the selected loop".into();
+                    // Del can't be a shortcut (it's the fixed "clear selected
+                    // loop" binding) — pressing it here removes this slot's
+                    // current binding instead, live.
+                    self.short_keys[slot] = None;
+                    self.learning_slot = None;
+                    self.save_config();
+                    self.status = "shortcut cleared".into();
                 } else {
                     match self.short_keys.iter().position(|s| *s == Some(k)) {
                         Some(s) if s != slot => {
@@ -322,6 +342,18 @@ impl App {
                 }
             }
             return; // swallow all keys while learning
+        }
+
+        // Esc also cancels an armed MIDI listener.
+        if self.midi_learning_slot.is_some()
+            && ctx.input(|i| {
+                i.events.iter().any(|e| matches!(
+                    e,
+                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }
+                ))
+            })
+        {
+            self.midi_learning_slot = None;
         }
 
         let pressed = |key: egui::Key| {
@@ -385,6 +417,9 @@ impl App {
                 .filter_map(|(a, b)| b.map(|bind| MidiBinding { action: *a, bind: Some(bind) }))
                 .collect(),
             root_loops: self.root_loops,
+            // Only selections that were actually applied get persisted.
+            ports_in: self.applied_ports.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
+            ports_out: self.applied_ports.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[simplooper] could not save config: {e}");
@@ -432,7 +467,7 @@ impl App {
                             }
                             self.midi_learning_slot = None;
                         } else {
-                            for i in 0..24 {
+                            for i in 0..N_ACTIONS {
                                 if self.midi_binds[i] == Some(bind) {
                                     self.fire_midi_action(MidiAction::ALL[i]);
                                 }
@@ -590,7 +625,17 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
 
                 // ---- MIDI + keyboard bindings ------------------------------------
                 ui.separator();
-                ui.label(RichText::new("MIDI + KEYBOARD BINDINGS").strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("MIDI + KEYBOARD BINDINGS").strong());
+                    if ui.button("Reset to Defaults").clicked() {
+                        for i in 0..N_ACTIONS {
+                            app.short_keys[i] = SHORTCUT_DEFAULTS[i];
+                            app.midi_binds[i] = None;
+                        }
+                        app.save_config();
+                        app.status = "bindings reset to defaults".into();
+                    }
+                });
                 ui.label(
                     RichText::new(
                         "Click a MIDI cell, then send a NOTE ON / CC / PROGRAM \
@@ -598,8 +643,8 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                          becomes that binding (click again or Esc to cancel). A bound \
                          action fires on every matching message (value/velocity \
                          ignored). The key column works the same way: click, then \
-                         press the new key (Esc cancels); keys are ignored while a \
-                         text field has focus.",
+                         press the new key (Esc cancels, Del clears the current \
+                         binding); keys are ignored while a text field has focus.",
                     )
                     .weak()
                     .small(),
@@ -626,61 +671,6 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
                 ui.label(RichText::new("global").weak().small());
                 bind_row(ui, app, MidiAction::Dependent);
-
-                // ---- easy quantize -------------------------------------------------
-                ui.separator();
-                ui.label(RichText::new("EASY QUANTIZE").strong());
-                ui.label(
-                    RichText::new(
-                        "Derives the grid from Loop 1's recorded length: \
-                         bar = len₁ ÷ bars, beat = bar ÷ numerator. Every loop is then \
-                         snapped to the nearest multiple of the chosen unit; the cut is \
-                         refined to a zero crossing and the seam crossfaded.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                ui.horizontal(|ui| {
-                    ui.label("time sig.");
-                    let r_num = ui.add(egui::TextEdit::singleline(&mut app.q_num).desired_width(40.0));
-                    ui.label("/");
-                    let r_den = ui.add(egui::TextEdit::singleline(&mut app.q_den).desired_width(40.0));
-                    app.in_text_edit = app.in_text_edit || (r_num.has_focus() || r_den.has_focus());
-                });
-                ui.horizontal(|ui| {
-                    ui.label("bars in loop 1:");
-                    let r_bars = ui.add(egui::TextEdit::singleline(&mut app.q_bars).desired_width(60.0));
-                    app.in_text_edit = app.in_text_edit || r_bars.has_focus();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("quantize to:");
-                    ui.radio_value(&mut app.q_unit_is_bar, false, "beat");
-                    ui.radio_value(&mut app.q_unit_is_bar, true, "bar");
-                });
-                if ui.button("Quantize all loops").clicked() {
-                    match (
-                        app.q_num.parse::<u32>(),
-                        app.q_den.parse::<u32>(),
-                        app.q_bars.parse::<u32>(),
-                    ) {
-                        (Ok(n), Ok(d), Ok(b)) if n >= 1 && d >= 1 && b >= 1 => {
-                            let unit = if app.q_unit_is_bar { Unit::Bar } else { Unit::Beat };
-                            app.backend.cmd(Cmd::Quantize { num: n, den: d, bars: b, unit });
-                        }
-                        _ => {
-                            app.status = "quantize: enter positive integers for time signature and bars".into();
-                        }
-                    }
-                }
-                if let Some(r) = &app.q_result {
-                    ui.add_space(4.0);
-                    egui::Frame::group(ui.style())
-                        .fill(Color32::from_rgb(35, 40, 50))
-                        .inner_margin(6.0)
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(r).monospace().small());
-                        });
-                }
 
                 // ---- audio ports -------------------------------------------------
                 // Last on purpose: the long port lists used to push every other
@@ -709,7 +699,11 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     if ui.button("Apply Selection").clicked() {
                         let ins: Vec<String> = app.sel_in.iter().cloned().collect();
                         let outs: Vec<String> = app.sel_out.iter().cloned().collect();
+                        // Remember the applied selection so it is restored on
+                        // the next launch (persisted with the other settings).
+                        app.applied_ports = Some((ins.clone(), outs.clone()));
                         app.backend.cmd(Cmd::Apply { ins, outs });
+                        app.save_config();
                     }
                     if ui.button("Stop").clicked() {
                         app.backend.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
@@ -809,6 +803,51 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                 RichText::new("independent = each loop plays on its own clock").weak().small(),
             );
         });
+        // ---- easy quantize (lives in the main window, not Settings) ----
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(35, 40, 50))
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("EASY QUANTIZE").strong()).on_hover_text(
+                        "Derives the grid from Loop 1's recorded length: \
+                         bar = len₁ ÷ bars, beat = bar ÷ numerator. Every loop is then \
+                         snapped to the nearest multiple of the chosen unit; the cut is \
+                         refined to a zero crossing and the seam crossfaded.",
+                    );
+                    ui.separator();
+                    ui.label("time sig.");
+                    let r_num = ui.add(egui::TextEdit::singleline(&mut app.q_num).desired_width(40.0));
+                    ui.label("/");
+                    let r_den = ui.add(egui::TextEdit::singleline(&mut app.q_den).desired_width(40.0));
+                    app.in_text_edit = app.in_text_edit || (r_num.has_focus() || r_den.has_focus());
+                    ui.label("bars in loop 1:");
+                    let r_bars = ui.add(egui::TextEdit::singleline(&mut app.q_bars).desired_width(60.0));
+                    app.in_text_edit = app.in_text_edit || r_bars.has_focus();
+                    ui.label("quantize to:");
+                    ui.radio_value(&mut app.q_unit_is_bar, false, "beat");
+                    ui.radio_value(&mut app.q_unit_is_bar, true, "bar");
+                    if ui.button("Quantize all loops").clicked() {
+                        match (
+                            app.q_num.parse::<u32>(),
+                            app.q_den.parse::<u32>(),
+                            app.q_bars.parse::<u32>(),
+                        ) {
+                            (Ok(n), Ok(d), Ok(b)) if n >= 1 && d >= 1 && b >= 1 => {
+                                let unit = if app.q_unit_is_bar { Unit::Bar } else { Unit::Beat };
+                                app.backend.cmd(Cmd::Quantize { num: n, den: d, bars: b, unit });
+                            }
+                            _ => {
+                                app.status = "quantize: enter positive integers for time signature and bars".into();
+                            }
+                        }
+                    }
+                });
+                if let Some(r) = &app.q_result {
+                    ui.label(RichText::new(r).monospace().small());
+                }
+            });
+
         ui.label(
             RichText::new("keys are rebindable in Settings · click a row to select its loop")
                 .weak()
@@ -987,34 +1026,34 @@ fn draw_wave(
     );
 
     if len > 0 {
-        // Per-track peak normalization: scale so the loudest point fills the
-        // box (bounded scan — at most ~2048 samples).
+        // Per-track peak normalization: the recording's exact loudest sample is
+        // "maxed out" at full scale, so quiet recordings are as legible as loud
+        // ones. Full scan, memoized in the cache (rebuilt only when length,
+        // content generation or width changes).
         let n = len as usize;
-        let mut peak = 0f32;
-        let stride = (n / 2048).max(1);
-        for k in (0..n).step_by(stride) {
-            let v = data[k].abs();
-            if v > peak {
-                peak = v;
+        let cols = (rect.width() / 2.0).max(1.0) as usize;
+        let need = match cache {
+            Some(c) => c.len != len || c.gen != gen || c.cols != cols,
+            None => true,
+        };
+        if need {
+            let mut peak = 0f32;
+            for &v in data.iter() {
+                let a = v.abs();
+                if a > peak {
+                    peak = a;
+                }
             }
+            *cache = Some(WaveCache { len, gen, cols, data: wave_cols(data, cols), peak });
         }
-        let scale = if peak > 1e-6 {
-            (rect.height() / 2.0 - 2.0) / peak
-        } else {
-            0.0
+        let scale = match cache {
+            Some(c) if c.peak > 1e-6 => (rect.height() / 2.0 - 2.0) / c.peak,
+            _ => 0.0,
         };
 
         let period_samples = period.unwrap_or(len) as u64;
         if period_samples <= n as u64 {
             // Single copy: cached min/max columns over the recorded region.
-            let cols = (rect.width() / 2.0).max(1.0) as usize;
-            let need = match cache {
-                Some(c) => c.len != len || c.gen != gen || c.cols != cols,
-                None => true,
-            };
-            if need {
-                *cache = Some(WaveCache { len, gen, cols, data: wave_cols(data, cols) });
-            }
             if let Some(c) = cache {
                 let colw = rect.width() / c.cols.max(1) as f32;
                 for (k, [mn, mx]) in c.data.iter().enumerate() {
@@ -1037,8 +1076,7 @@ fn draw_wave(
             // separator bar marks every repeat boundary, including on the root
             // track when it repeats (root loops > 1).
             let n64 = n as u64;
-            let cols = (rect.width() / 2.0).max(1.0) as usize;
-            let colw = rect.width() / cols as f32;
+            let colw = rect.width() / cols.max(1) as f32;
             for k in 0..cols {
                 let p0 = k as u64 * period_samples / cols as u64;
                 let p1 = ((k + 1) as u64 * period_samples / cols as u64).max(p0 + 1);

@@ -30,6 +30,12 @@ pub struct Config {
     /// Dependent-mode ensemble length in units of the longest loop (>= 1).
     #[serde(default = "default_root_loops")]
     pub root_loops: u32,
+    /// Last applied audio port selections — restored on the next launch so the
+    /// user doesn't have to re-check the same ports every time.
+    #[serde(default)]
+    pub ports_in: Vec<String>,
+    #[serde(default)]
+    pub ports_out: Vec<String>,
 }
 
 impl Default for Config {
@@ -40,6 +46,8 @@ impl Default for Config {
             // Must match serde's field default — the derived `Default` would
             // give 0, which the UI clamps but is not a valid ensemble length.
             root_loops: default_root_loops(),
+            ports_in: Vec::new(),
+            ports_out: Vec::new(),
         }
     }
 }
@@ -102,12 +110,16 @@ mod tests {
                 bind: Some(MidiBind { ty: 0, ch: 1, d1: 60 }),
             }],
             root_loops: 3,
+            ports_in: vec!["remote:out_1".into()],
+            ports_out: vec!["remote:in_1".into(), "remote:in_2".into()],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back.shortcuts, cfg.shortcuts);
         assert_eq!(back.midi, cfg.midi);
         assert_eq!(back.root_loops, 3);
+        assert_eq!(back.ports_in, cfg.ports_in);
+        assert_eq!(back.ports_out, cfg.ports_out);
     }
 
     #[test]
