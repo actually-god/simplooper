@@ -90,8 +90,7 @@ fn main() {
     let active = client.activate_async((), Src { out, sent: sent.clone() }).unwrap();
 
     eprintln!(
-        "midi_tester: {} -> {} ({} messages per cycle)",
-        format!("{src_name}:midi_out"),
+        "midi_tester: {src_name}:midi_out -> {} ({} messages per cycle)",
         target,
         MESSAGES.len()
     );

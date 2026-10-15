@@ -26,7 +26,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "simplooper",
         options,
-        Box::new(move |cc| Ok(Box::new(simplooper::ui::App::new(cc, backend)))),
+        Box::new(move |_cc| Ok(Box::new(simplooper::ui::App::new(backend)))),
     )
 }
 
@@ -40,8 +40,8 @@ fn load_icon() -> Option<std::sync::Arc<egui::IconData>> {
         .into_rgba8();
     Some(std::sync::Arc::new(egui::IconData {
         rgba: img.as_raw().to_vec(),
-        width: img.width() as u32,
-        height: img.height() as u32,
+        width: img.width(),
+        height: img.height(),
     }))
 }
 

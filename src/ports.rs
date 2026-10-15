@@ -148,10 +148,8 @@ fn split_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut cur = String::new();
     for line in text.lines() {
-        if line.trim_start().starts_with("id ") && line.contains(", type ") {
-            if !cur.is_empty() {
-                blocks.push(std::mem::take(&mut cur));
-            }
+        if line.trim_start().starts_with("id ") && line.contains(", type ") && !cur.is_empty() {
+            blocks.push(std::mem::take(&mut cur));
         }
         cur.push_str(line);
         cur.push('\n');

@@ -79,8 +79,15 @@ pub enum Cmd {
     /// repeats within the period and all tracks stop together at its end
     /// (changing N while playing restarts the ensemble).
     SetRootLoops(u32),
-    /// Easy-quantize every loop against Loop 1's recorded length.
-    Quantize { num: u32, den: u32, bars: u32, unit: crate::quantize::Unit },
+    /// Easy-quantize every loop against the chosen root loop's recorded length.
+    Quantize {
+        num: u32,
+        den: u32,
+        bars: u32,
+        unit: crate::quantize::Unit,
+        /// Which loop's recorded length defines the grid (0 = Loop 1).
+        root: usize,
+    },
     Quit,
 }
 
@@ -111,6 +118,8 @@ pub struct Backend {
     pub peak: Arc<AtomicU32>,
     /// Total xruns since start.
     pub xruns: Arc<AtomicU64>,
+    /// MIDI events dropped because the GUI event queue was full.
+    pub midi_drops: Arc<AtomicU64>,
     /// Shared loop engine (GUI reads buffers for waveform rendering).
     pub engine: Arc<LoopEngine>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -125,18 +134,24 @@ impl Backend {
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let peak = Arc::new(AtomicU32::new(0));
         let xruns = Arc::new(AtomicU64::new(0));
+        let midi_drops = Arc::new(AtomicU64::new(0));
         let engine = LoopEngine::new();
-        let (t_gain, t_peak, t_xruns, t_engine) =
-            (gain.clone(), peak.clone(), xruns.clone(), engine.clone());
+        let (t_gain, t_peak, t_xruns, t_midi_drops, t_engine) = (
+            gain.clone(),
+            peak.clone(),
+            xruns.clone(),
+            midi_drops.clone(),
+            engine.clone(),
+        );
 
         let thread = std::thread::Builder::new()
             .name("simplooper-audio".into())
             .spawn(move || {
-                run(cmd_rx, evt_tx, t_gain, t_peak, t_xruns, t_engine);
+                run(cmd_rx, evt_tx, t_gain, t_peak, t_xruns, t_midi_drops, t_engine);
             })
             .expect("failed to spawn audio thread");
 
-        Backend { cmd_tx, evt_rx, gain, peak, xruns, engine, thread: Some(thread) }
+        Backend { cmd_tx, evt_rx, gain, peak, xruns, midi_drops, engine, thread: Some(thread) }
     }
 
     /// Send a command, ignoring send errors (thread already gone).
@@ -196,9 +211,9 @@ pub struct LoopEngine {
 impl LoopEngine {
     pub fn new() -> Arc<Self> {
         let mut bufs = [std::ptr::null_mut::<f32>(); MAX_LOOPS];
-        for i in 0..MAX_LOOPS {
+        for buf in bufs.iter_mut() {
             let mut v = vec![0f32; LOOP_CAP as usize];
-            bufs[i] = v.as_mut_ptr();
+            *buf = v.as_mut_ptr();
             std::mem::forget(v); // ownership transfers to the engine
         }
         Arc::new(Self {
@@ -223,6 +238,23 @@ impl LoopEngine {
     #[inline]
     pub fn write(&self, i: usize, off: u32, v: f32) {
         unsafe { self.bufs[i].add(off as usize).write(v) };
+    }
+
+    /// Capture one dry-mixed sample into track i while recording. Returns
+    /// true once the buffer is full (caller should auto-stop the take). The
+    /// length counter never exceeds LOOP_CAP: the check happens before
+    /// advancing, so a loop that hits capacity mid-frame can't overshoot —
+    /// every consumer (UI waveform, playback reads) assumes len <= CAP.
+    #[inline]
+    pub fn rec_sample(&self, i: usize, v: f32) -> bool {
+        let off = self.len[i].load(Ordering::Relaxed) as u64;
+        if off < LOOP_CAP as u64 {
+            self.write(i, off as u32, v);
+            self.len[i].store((off + 1) as u32, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
     }
 
     // ---- manager access (track must be quiescent — see command docs) -----
@@ -259,14 +291,14 @@ impl LoopEngine {
     /// Returns the new lengths.
     pub fn quantize_all(&self, target: u32, sr: u32) -> [u32; MAX_LOOPS] {
         let mut out = [0u32; MAX_LOOPS];
-        for i in 0..MAX_LOOPS {
+        for (i, o) in out.iter_mut().enumerate() {
             let l = self.len[i].load(Ordering::Relaxed);
             if l == 0 {
                 continue;
             }
             let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
-            out[i] = crate::quantize::quantize_track(buf, l, target, LOOP_CAP, sr);
-            self.len[i].store(out[i], Ordering::Relaxed);
+            *o = crate::quantize::quantize_track(buf, l, target, LOOP_CAP, sr);
+            self.len[i].store(*o, Ordering::Relaxed);
         }
         self.gen.fetch_add(1, Ordering::Relaxed);
         out
@@ -354,6 +386,7 @@ fn run(
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
+    midi_drops: Arc<AtomicU64>,
     engine: Arc<LoopEngine>,
 ) {
     let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
@@ -417,6 +450,7 @@ fn run(
         mask_in: mask_in.clone(),
         mask_out: mask_out.clone(),
         tx: evt_tx.clone(),
+        midi_drops,
         gain: gain.clone(),
         peak: peak.clone(),
         engine: engine.clone(),
@@ -507,13 +541,13 @@ fn run(
             Ok(Cmd::SetRootLoops(n)) => {
                 engine.root_loops.store(n.clamp(1, 64), Ordering::Relaxed);
             }
-            Ok(Cmd::Quantize { num, den, bars, unit }) => {
+            Ok(Cmd::Quantize { num, den, bars, unit, root }) => {
                 if den == 0 || num == 0 || bars == 0 {
                     let _ = evt_tx.send(Evt::Error(
                         "quantize: numerator, denominator and bars must be at least 1".into(),
                     ));
                 } else {
-                    let len1 = engine.len_of(0);
+                    let len1 = engine.len_of(root.min(MAX_LOOPS - 1));
                     match crate::quantize::compute_target(len1, bars, num, unit) {
                         Ok((target, beat, bar)) => {
                             // Stop everything and let the audio thread quiesce
@@ -529,18 +563,19 @@ fn run(
                                 crate::quantize::Unit::Bar => "bar",
                             };
                             let mut parts: Vec<String> = Vec::new();
-                            for i in 0..MAX_LOOPS {
-                                if lens[i] > 0 {
+                            for (i, &l) in lens.iter().enumerate() {
+                                if l > 0 {
                                     parts.push(format!(
                                         "L{} → {} smp ({}×{unit_name})",
                                         i + 1,
-                                        lens[i],
-                                        (lens[i] as f64 / target as f64).round()
+                                        l,
+                                        (l as f64 / target as f64).round()
                                     ));
                                 }
                             }
                             let summary = format!(
-                                "{num}/{den}, {bars} bar(s): beat={} smp, bar={} smp, ≈{bpm:.1} BPM → {}",
+                                "{num}/{den}, {bars} bar(s), root loop {}: beat={} smp, bar={} smp, ≈{bpm:.1} BPM → {}",
+                                root + 1,
                                 beat.round(),
                                 bar.round(),
                                 if parts.is_empty() { "nothing to quantize".into() } else { parts.join(", ") }
@@ -586,6 +621,7 @@ fn connect_retry(client: &Client, src: &str, dst: &str) -> Result<(), jack::Erro
 
 /// Connect / disconnect external ports against the fixed slot pool, updating
 /// the RT-visible masks. Runs on the manager thread (may block/allocate).
+#[allow(clippy::too_many_arguments)] // one arg per slot-pool state piece; a wrapper struct is pure ceremony
 fn apply_layout(
     client: &Client,
     ins: &[String],
@@ -603,13 +639,13 @@ fn apply_layout(
     }
 
     let mut applied_in = 0usize;
-    for i in 0..MAX_SLOTS {
+    for (i, slot) in cur_in.iter_mut().enumerate() {
         let new_in = ins.get(i).cloned();
-        if cur_in[i] == new_in {
+        if *slot == new_in {
             continue; // unchanged: keep the existing connection
         }
         let pool_name = format!("{}:in{i}", client.name());
-        if cur_in[i].take().is_some() {
+        if slot.take().is_some() {
             // Stop reading before disconnecting, so RT never reads a slot that
             // is mid-teardown (unconnected input buffers hold stale data).
             mask_in.fetch_and(!(1u64 << i), Ordering::Relaxed);
@@ -627,7 +663,7 @@ fn apply_layout(
                 Ok(()) => {
                     // Only start reading once the connection exists.
                     mask_in.fetch_or(1u64 << i, Ordering::Relaxed);
-                    cur_in[i] = Some(src);
+                    *slot = Some(src);
                     applied_in += 1;
                 }
                 Err(e) => {
@@ -643,13 +679,13 @@ fn apply_layout(
     }
 
     let mut applied_out = 0usize;
-    for i in 0..MAX_SLOTS {
+    for (i, slot) in cur_out.iter_mut().enumerate() {
         let new_out = outs.get(i).cloned();
-        if cur_out[i] == new_out {
+        if *slot == new_out {
             continue;
         }
         let pool_name = format!("{}:out{i}", client.name());
-        if cur_out[i].take().is_some() {
+        if slot.take().is_some() {
             // Keep writing until the disconnect completes, then stop.
             if let Some(pool) = client.port_by_name(&pool_name) {
                 if let Err(e) = client.disconnect(&pool) {
@@ -665,7 +701,7 @@ fn apply_layout(
             match connect_retry(client, &pool_name, &dst) {
                 Ok(()) => {
                     mask_out.fetch_or(1u64 << i, Ordering::Relaxed);
-                    cur_out[i] = Some(dst);
+                    *slot = Some(dst);
                     applied_out += 1;
                 }
                 Err(e) => {
@@ -804,6 +840,7 @@ struct Proc {
     mask_in: Arc<AtomicU64>,
     mask_out: Arc<AtomicU64>,
     tx: SyncSender<Evt>,
+    midi_drops: Arc<AtomicU64>,
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
     engine: Arc<LoopEngine>,
@@ -822,10 +859,12 @@ impl ProcessHandler for Proc {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
         let n = ps.n_frames() as usize;
 
-        // MIDI: copy events out (bounded channel; drop if the GUI is slow).
+        // MIDI: copy events out (bounded channel; count drops if the GUI is slow).
         for e in self.midi_in.iter(ps) {
             let bytes = e.bytes.to_vec();
-            let _ = self.tx.try_send(Evt::Midi(RawMidiMsg { bytes }));
+            if self.tx.try_send(Evt::Midi(RawMidiMsg { bytes })).is_err() {
+                self.midi_drops.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         if n == 0 {
@@ -858,8 +897,8 @@ impl ProcessHandler for Proc {
             }
             self.prev_mode = mode;
         }
-        for i in 0..MAX_LOOPS {
-            let (prev, now) = (self.prev_state[i], st_now[i]);
+        for (i, &now) in st_now.iter().enumerate() {
+            let prev = self.prev_state[i];
             if prev == now {
                 continue;
             }
@@ -873,24 +912,22 @@ impl ProcessHandler for Proc {
 
         // Cache this cycle's input buffers (raw pointers are stable).
         let mut in_bufs: [*const f32; MAX_SLOTS] = [std::ptr::null(); MAX_SLOTS];
-        for s in 0..MAX_SLOTS {
+        for (s, b) in in_bufs.iter_mut().enumerate() {
             if in_mask & (1u64 << s) != 0 {
                 let p = self.ports.ins[s];
                 if !p.is_null() {
-                    in_bufs[s] = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
+                    *b = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
                 }
             }
         }
         // Cache output buffers too: the mix is computed once per sample and
         // written to every enabled slot.
         let mut out_bufs: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
-        for s in 0..MAX_SLOTS {
+        for (s, b) in out_bufs.iter_mut().enumerate() {
             if out_mask & (1u64 << s) != 0 {
                 let p = self.ports.outs[s];
                 if !p.is_null() {
-                    out_bufs[s] = unsafe {
-                        j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32
-                    };
+                    *b = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32 };
                 }
             }
         }
@@ -942,10 +979,7 @@ impl ProcessHandler for Proc {
                     let st = st_now[t];
                     if st == TR_REC {
                         // Contiguous capture from the start of the buffer.
-                        let off = self.engine.len[t].fetch_add(1, Ordering::Relaxed) as u64;
-                        if off < LOOP_CAP as u64 {
-                            self.engine.write(t, off as u32, dry);
-                        } else {
+                        if self.engine.rec_sample(t, dry) {
                             // Capacity reached: stop capturing into this loop,
                             // keep playing (the buffer is full of content).
                             self.engine.state[t].store(TR_PLAY, Ordering::Relaxed);
@@ -988,8 +1022,8 @@ impl ProcessHandler for Proc {
 
             // Publish playback positions ~every 8 samples.
             if i & 7 == 7 {
-                for t in 0..MAX_LOOPS {
-                    self.engine.pos[t].store(pos_now[t], Ordering::Relaxed);
+                for (t, &p) in pos_now.iter().enumerate() {
+                    self.engine.pos[t].store(p, Ordering::Relaxed);
                 }
                 self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
             }
@@ -999,9 +1033,9 @@ impl ProcessHandler for Proc {
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
             }
-            for s in 0..MAX_SLOTS {
-                if !out_bufs[s].is_null() {
-                    unsafe { *out_bufs[s].add(i) = v };
+            for b in out_bufs.iter() {
+                if !b.is_null() {
+                    unsafe { *b.add(i) = v };
                 }
             }
         }
@@ -1009,8 +1043,8 @@ impl ProcessHandler for Proc {
         // sync and restart the clock. (At most one block of samples can
         // overshoot the boundary — content is continuous, so no glitch.)
         if dependent && period > 0 && self.master_pos >= period {
-            for t in 0..MAX_LOOPS {
-                if st_now[t] == TR_PLAY || st_now[t] == TR_OD {
+            for (t, &st) in st_now.iter().enumerate() {
+                if st == TR_PLAY || st == TR_OD {
                     self.engine.state[t].store(TR_IDLE, Ordering::Relaxed);
                 }
             }
@@ -1019,8 +1053,8 @@ impl ProcessHandler for Proc {
             let _ = self.tx.try_send(Evt::LoopState { states, lens: lens_snap });
         }
         // Publish final positions for this block.
-        for t in 0..MAX_LOOPS {
-            self.engine.pos[t].store(pos_now[t], Ordering::Relaxed);
+        for (t, &p) in pos_now.iter().enumerate() {
+            self.engine.pos[t].store(p, Ordering::Relaxed);
         }
         self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
         self.peak.store(peak_val, Ordering::Relaxed);
@@ -1127,5 +1161,22 @@ mod tests {
         assert_eq!(e.len_of(2), 0);
         toggle_record(&e, 2); // REC with no content -> IDLE
         assert_eq!(e.state_of(2), TR_IDLE);
+    }
+
+    #[test]
+    fn rec_sample_never_overshoots_capacity() {
+        let e = LoopEngine::new();
+        // Fill exactly to capacity, one sample at a time (RT path).
+        for _ in 0..LOOP_CAP {
+            assert!(!e.rec_sample(0, 1.0));
+        }
+        assert_eq!(e.len_of(0), LOOP_CAP);
+        // Once full, further samples must report "full" and must not push the
+        // counter past LOOP_CAP (the old fetch_add could overshoot by up to a
+        // frame, which made the dependent tiled waveform index out of bounds).
+        for _ in 0..1024 {
+            assert!(e.rec_sample(0, 0.0));
+        }
+        assert_eq!(e.len_of(0), LOOP_CAP);
     }
 }
