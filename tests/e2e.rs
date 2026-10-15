@@ -235,6 +235,101 @@ fn e2e_midi_monitor() {
     let _ = active;
 }
 
+/// The exact pattern the user's SINCO MIDI 1 controller sends (seen on aseq
+/// port 32): Program Changes with values 1 and 2, cycling channels 0–3.
+const SINCO_MESSAGES: &[&[u8]] = &[
+    &[0xC0, 1], // PC  ch1  program 1
+    &[0xC1, 2], // PC  ch2  program 2
+    &[0xC2, 1], // PC  ch3  program 1
+    &[0xC3, 2], // PC  ch4  program 2
+];
+
+struct SincoSrcProc {
+    out: Port<MidiOut>,
+    step: u32,
+}
+
+impl ProcessHandler for SincoSrcProc {
+    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+        let msg = SINCO_MESSAGES[(self.step % SINCO_MESSAGES.len() as u32) as usize];
+        let _ = self.out.writer(ps).write(&RawMidi { time: 0, bytes: msg });
+        self.step += 1;
+        Control::Continue
+    }
+}
+
+// ------------------------------------------------------------------ midi ----
+
+/// Full capture → fire round trip through the real JACK MIDI path, emulating
+/// the SINCO MIDI 1 device. The armed binding cell must register the first PC
+/// (the "listening" box), and a repeated matching message must then fire the
+/// bound action — here "select loop 2", observable via `App::selected_loop`.
+#[test]
+fn e2e_midi_capture_and_fire_sinco() {
+    let Some((b, client_name, _sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    // Isolate the config file so App does not read/write the user's real one.
+    let dir = std::env::temp_dir().join(format!("simplooper-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+    // Arm the "select loop 2" slot: the next bindable MIDI message is captured.
+    let mut app = simplooper::ui::App::new(b);
+    app.arm_midi_slot(1);
+    app.drain_events();
+
+    // Source client emulating SINCO MIDI 1, wired to simplooper:midi_in.
+    let (client, _status) = Client::new("sinco_emu", ClientOptions::NO_START_SERVER)
+        .expect("no JACK server");
+    let midi_out = client.register_port("midi_out", MidiOut::default()).unwrap();
+    let src_name = client.name().to_string();
+    client
+        .connect_ports_by_name(
+            &format!("{src_name}:midi_out"),
+            &format!("{client_name}:midi_in"),
+        )
+        .expect("connect to simplooper:midi_in");
+    let active = client
+        .activate_async((), SincoSrcProc { out: midi_out, step: 0 })
+        .unwrap();
+
+    // Pump App events until the first PC is captured and a repeated PC fires.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        app.drain_events();
+        if app.midi_bind_at(1).is_some() && app.selected_loop() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The armed slot must have captured a message from the device's pattern.
+    // Which of the four PCs arrives first depends on JACK graph scheduling, so
+    // accept any PC with value 1 or 2 on channels 0–3 — exactly what the SINCO
+    // MIDI 1 sends.
+    let expected: &[simplooper::midi::MidiBind] = &[
+        simplooper::midi::MidiBind { ty: 2, ch: 0, d1: 1 },
+        simplooper::midi::MidiBind { ty: 2, ch: 1, d1: 2 },
+        simplooper::midi::MidiBind { ty: 2, ch: 2, d1: 1 },
+        simplooper::midi::MidiBind { ty: 2, ch: 3, d1: 2 },
+    ];
+    let captured = app.midi_bind_at(1);
+    assert!(
+        expected.contains(&captured.unwrap_or(simplooper::midi::MidiBind { ty: 0, ch: 99, d1: 99 })),
+        "armed slot must capture one of the SINCO PC patterns, got {captured:?}"
+    );
+    assert_eq!(
+        app.selected_loop(),
+        1,
+        "a repeated matching PC must fire the bound action (select loop 2)"
+    );
+
+    app.backend().cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    let _ = active;
+}
+
 // --------------------------------------------------- loop engine (record, --
 // playback, overdub, quantize, independent vs dependent looping) --
 
@@ -263,22 +358,20 @@ impl ProcessHandler for LoopSrcProc {
         let prng = self.mode.load(Ordering::Relaxed) == 1;
         let c = f32::from_bits(self.const_val.load(Ordering::Relaxed));
         if prng {
-            for i in 0..n {
+            for s in out.iter_mut() {
                 self.seed ^= self.seed << 13;
                 self.seed ^= self.seed >> 17;
                 self.seed ^= self.seed << 5;
-                out[i] = if self.seed & 1 == 0 { 0.2 } else { -0.2 };
+                *s = if self.seed & 1 == 0 { 0.2 } else { -0.2 };
             }
         } else {
-            for i in 0..n {
-                out[i] = c;
-            }
+            out.fill(c);
         }
         let sink = self.sink.as_slice(ps);
         let base = self.widx.load(Ordering::Relaxed) as usize;
-        for i in 0..n {
+        for (i, s) in sink.iter().enumerate() {
             self.ring[(base + i) % self.ring.len()]
-                .store(sink[i].to_bits(), Ordering::Relaxed);
+                .store(s.to_bits(), Ordering::Relaxed);
         }
         self.widx.fetch_add(n as u64, Ordering::Relaxed);
         Control::Continue
@@ -494,7 +587,7 @@ fn e2e_loop_engine() {
     let len_before = b.engine.len_of(0);
     let (target, beat, _bar) = compute_target(len_before, 1, 4, Unit::Beat).unwrap();
     assert!(target > 0 && beat > 0.0);
-    b.cmd(Cmd::Quantize { num: 4, den: 4, bars: 1, unit: Unit::Beat });
+    b.cmd(Cmd::Quantize { num: 4, den: 4, bars: 1, unit: Unit::Beat, root: 0 });
     assert!(
         wait_for(
             &b,

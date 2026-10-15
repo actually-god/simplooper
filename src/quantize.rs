@@ -106,9 +106,7 @@ pub fn quantize_track(buf: &mut [f32], len: u32, target: u32, cap: u32, sr: u32)
 
     if cut > len {
         // Pad with silence up to the new length.
-        for k in (len as usize)..(cut as usize) {
-            buf[k] = 0.0;
-        }
+        buf[len as usize..cut as usize].fill(0.0);
     }
     // Truncation needs no data move: playback only ever reads [0, cut).
     seam_crossfade(buf, cut, (sr / 50).min(cut / 4)); // ~20 ms seam blend
@@ -181,8 +179,8 @@ mod tests {
         let sr = 48_000u32;
         let mut buf = vec![0f32; 200_000];
         // Fill with a sine so the cut point is never trivially silent.
-        for i in 0..150_000 {
-            buf[i] = (i as f64 * std::f64::consts::PI * 2.0 * 440.0 / sr as f64).sin() as f32;
+        for (i, s) in buf.iter_mut().enumerate().take(150_000) {
+            *s = (i as f64 * std::f64::consts::PI * 2.0 * 440.0 / sr as f64).sin() as f32;
         }
         let len = 144_100u32; // 3.002 s — just off the 12 kHz grid point (12×)
         let target = 12_000u32; // "beat"

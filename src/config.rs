@@ -36,6 +36,9 @@ pub struct Config {
     pub ports_in: Vec<String>,
     #[serde(default)]
     pub ports_out: Vec<String>,
+    /// GUI zoom factor (egui `zoom_factor`): 1.0 = default UI size, >1 larger.
+    #[serde(default = "default_gui_scale")]
+    pub gui_scale: f32,
 }
 
 impl Default for Config {
@@ -48,12 +51,17 @@ impl Default for Config {
             root_loops: default_root_loops(),
             ports_in: Vec::new(),
             ports_out: Vec::new(),
+            gui_scale: default_gui_scale(),
         }
     }
 }
 
 fn default_root_loops() -> u32 {
     1
+}
+
+fn default_gui_scale() -> f32 {
+    1.0
 }
 
 impl Config {
@@ -112,12 +120,14 @@ mod tests {
             root_loops: 3,
             ports_in: vec!["remote:out_1".into()],
             ports_out: vec!["remote:in_1".into(), "remote:in_2".into()],
+            gui_scale: 1.25,
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back.shortcuts, cfg.shortcuts);
         assert_eq!(back.midi, cfg.midi);
         assert_eq!(back.root_loops, 3);
+        assert!((back.gui_scale - 1.25).abs() < f32::EPSILON);
         assert_eq!(back.ports_in, cfg.ports_in);
         assert_eq!(back.ports_out, cfg.ports_out);
     }

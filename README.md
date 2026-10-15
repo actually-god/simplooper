@@ -12,25 +12,34 @@ independent/dependent loop modes, and an easy quantize tool.
 - **Dashboard** — the main window is a grid of four track rows, each showing
   the recorded waveform plus REC / OD / PLAY / CLEAR buttons.
 - **Settings menu** — the three-bar (hamburger) button in the top-left opens
-  the settings panel: input/output port selection, master gain, per-track MIDI
-  bindings, and the easy quantize tool.
-- **MIDI binding** — any track's REC or OD button can be bound to a Note On,
-  CC, or Program Change (channel + note/controller/program). Bindings are
-  picked from live-detected messages in the MIDI monitor; velocity/CC value is
-  ignored so pedals and knobs fire anywhere.
+  the settings panel: input/output port selection, master gain, and per-action
+  MIDI + keyboard bindings. Port selections are persisted between sessions and
+  automatically re-applied when JACK comes up, so audio flows on launch without
+  re-selecting.
+- **MIDI binding** — every action (loop select, record/overdub/clear/play-stop
+  on the selected loop, direct per-loop controls, dependent toggle) can be
+  bound to a live-captured Note On/Off, CC, or Program Change (channel +
+  note/controller/program). Bindings are recorded by clicking the cell and
+  sending a message; velocity/CC value is ignored so pedals and knobs fire
+  anywhere. All bindings persist between sessions.
 - **Keyboard shortcuts** — keys `1`–`4` select a loop (the selected row is
   highlighted); `space` play/stop, `R` record, `O` overdub, `C` clear act on
-  the selected loop; `D` toggles dependent mode. Keys are ignored while a text
-  field has focus, and key auto-repeat never re-fires an action.
+  the selected loop; `D` toggles dependent mode; `Del` always clears the
+  selected loop (fixed, not rebindable). Every shortcut can be reassigned in
+  Settings. Keys are ignored while a text field has focus, and key auto-repeat
+  never re-fires an action.
 - **Loop modes** — a checkbox in the dashboard switches between:
   - *independent*: each track plays on its own clock (four independent players);
-  - *dependent*: the longest track defines the loop; shorter tracks wrap on top
-    of it until it finishes, then the whole ensemble repeats. A tooltip warns
-    to quantize first or you'll hear skips at the loop points.
-- **Easy quantize** — enter Loop 1's time signature (numerator/denominator),
-  how many bars Loop 1 spans, and "quantize to beat/bar"; every recorded loop
-  is snapped to that grid (nearest multiple → zero-crossing refinement within
-  ±5 ms → short equal-power crossfade at the seam).
+  - *dependent*: the longest track defines the master; shorter tracks wrap on
+    top of it (modulo tiling), and the whole ensemble restarts together for a
+    finite number of "root loops" (settable in the main window, default 10)
+    before stopping in sync. A tooltip warns to quantize first or you'll hear
+    skips at the loop points.
+- **Easy quantize** — lives in the main window (below the mode row): enter
+  Loop 1's time signature (numerator/denominator), how many bars Loop 1 spans,
+  and "quantize to beat/bar"; every recorded loop is snapped to that grid
+  (nearest multiple → zero-crossing refinement within ±5 ms → short
+  equal-power crossfade at the seam).
 - **MIDI monitor** — a permanent `simplooper:midi_in` JACK MIDI port; every
   incoming event is parsed and shown in the bottom panel and on stdout.
 - **Live mix passthrough** — selected inputs are summed × master gain into
@@ -62,7 +71,8 @@ cargo build --release
 1. Wait for `JACK ready` in the top bar (client name + sample rate).
 2. Click the **hamburger** (top-left) to open settings; under **INPUTS** tick
    the remote output ports you want to loop (they are summed), under
-   **OUTPUTS** tick your speakers/monitor mix, then **Apply Selection**.
+   **OUTPUTS** tick your speakers/monitor mix, then **Apply Selection**. Your
+   selection is saved and re-applied automatically on the next launch.
 3. On each track row: **REC** captures a fresh loop (auto-stops at ~60 s and
    starts playing), **OD** overdubs live input onto the existing loop,
    **PLAY** toggles playback, **CLEAR** zeros the buffer.
@@ -72,10 +82,15 @@ cargo build --release
 ### MIDI binding
 
 Send events into `simplooper:midi_in` (hardware via PipeWire, or
-`cargo run --example midi_tester`). In settings → **MIDI bindings**, open the
-combo next to a track's REC or OD and pick one of the recently detected
-messages — that message now toggles the button. Note On/CC/PC are bindable;
-the second data byte (velocity / CC value) is ignored.
+`cargo run --example midi_tester`). In settings → **MIDI bindings**, click the
+cell next to any action — it turns blue and shows *listening…* — then send a
+Note On/Off, CC, or Program Change; the first matching message becomes the
+binding (the second data byte — velocity / CC value — is ignored, so pedals and
+knobs fire anywhere). Click the cell again or press `Esc` to cancel without
+changing anything, click a bound cell's *Del* to clear it, and **Reset to
+defaults** restores the factory key bindings. The fixed row at the bottom of
+the table documents that `Del` always clears the selected loop and is never
+rebindable.
 
 ### Keyboard shortcuts
 
@@ -90,17 +105,20 @@ selected one:
 | `O` | overdub toggle |
 | `C` | clear the selected loop |
 | `D` | toggle independent/dependent mode |
+| `Del` | clear the selected loop (fixed — not rebindable) |
 
-The keys are ignored while a quantize text field has focus, so you can type
-numbers without switching loops.
+Every key in the table can be reassigned in settings → **MIDI bindings**
+(click the key cell, press the new key). The keys are ignored while a text
+field has focus, so you can type numbers without switching loops.
 
 ### Easy quantize
 
-In settings → **Easy quantize**: set the time signature numerator/denominator,
-the number of bars Loop 1 spans, and whether to snap each loop to a *beat* or
-a *bar*. **Quantize all loops** snaps every recorded track to that grid. The
-cut is refined to the nearest zero crossing (±5 ms) and the seam gets a short
-equal-power crossfade so clicks are avoided.
+In the main window (below the mode row) → **Easy quantize**: set the time
+signature numerator/denominator, the number of bars Loop 1 spans, and whether
+to snap each loop to a *beat* or a *bar*. **Quantize all loops** snaps every
+recorded track to that grid. The cut is refined to the nearest zero crossing
+(±5 ms) and the seam gets a short equal-power crossfade so clicks are
+avoided.
 
 ## Architecture
 
@@ -118,8 +136,9 @@ src/
 - `Backend::start()` spawns the **audio manager thread**, which owns the
   `jack::Client` (`NO_START`). GUI ↔ audio communication is two bounded
   channels: commands (`Refresh`, `Apply{ins,outs}`, `Quit`, `ToggleRecord`,
-  `ToggleOverdub`, `TogglePlay`, `ClearTrack`, `SetDependent`, `Quantize`) and
-  events (`Ready`, `Ports`, `Applied`, `Midi`, `Xrun`, `LoopState`, errors).
+  `ToggleOverdub`, `TogglePlay`, `ClearTrack`, `SetDependent`, `Quantize`,
+  `SetRootLoops`) and events (`Ready`, `Ports`, `Applied`, `Midi`, `Xrun`,
+  `LoopState`, errors).
 - The client is **never deactivated**: a fixed pool of 16 in / 16 out ports
   is created once; `Apply` only (dis)connects them. This avoids a jack-crate
   bug where notification callbacks survive `clear_callbacks` after deactivation.
@@ -131,8 +150,10 @@ src/
   counter are shared with the manager thread via atomics; the GUI invalidates
   waveform caches on generation bumps.
 - **Dependent mode** uses a single ensemble clock: track *t* reads at position
-  `master_pos % len[t]`, so shorter tracks wrap while the longest (the "loop")
-  runs to completion before everything repeats together.
+  `master_pos % len[t]`, so shorter tracks wrap (modulo tiling) while the
+  longest ("root") loop runs to completion; after a configurable number of
+  root loops (default 10, settable in the main window) the whole ensemble
+  stops in sync.
 
 ## Packaging (Arch / AUR)
 
@@ -198,7 +219,7 @@ run it before submitting to the AUR or after any PKGBUILD change.
 
 - [x] Per-loop recording: 4 simultaneous loops with record/overdub/play/clear
 - [x] Loop slots UI: waveform dashboard, per-slot controls
-- [x] Action mapping: MIDI note/CC/PC → per-track REC/OD buttons
+- [x] Action mapping: MIDI note/CC/PC → any action (live-captured bindings)
 - [x] Quantize to grid (beat/bar) with zero-crossing refinement
 - [ ] Per-slot send/return levels, mute/solo
 - [x] Keyboard shortcuts for loop actions

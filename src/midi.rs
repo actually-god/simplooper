@@ -33,7 +33,7 @@ impl MidiMsg {
             return Some(MidiMsg::SystemCommon { data: bytes.to_vec() });
         }
 
-        let channel = (b0 & 0x0F) as u8;
+        let channel = b0 & 0x0F;
         let kind = b0 >> 4;
         let b1 = *bytes.get(1)?;
         let b2 = bytes.get(2).copied().unwrap_or(0);
