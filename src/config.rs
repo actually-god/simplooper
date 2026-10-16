@@ -39,6 +39,19 @@ pub struct Config {
     /// GUI zoom factor (egui `zoom_factor`): 1.0 = default UI size, >1 larger.
     #[serde(default = "default_gui_scale")]
     pub gui_scale: f32,
+    /// Input/output latency compensation in milliseconds: the whole output
+    /// mix (monitoring + loops + metronome) is delayed by this much.
+    #[serde(default)]
+    pub latency_ms: f32,
+    /// Metronome tempo in BPM.
+    #[serde(default = "default_metro_bpm")]
+    pub metro_bpm: u32,
+    /// Metronome subdivision as clicks per beat (1 = quarter, 2 = eighth, ...).
+    #[serde(default = "default_metro_sub")]
+    pub metro_sub: u32,
+    /// Easy quantize: snap to the metronome grid instead of the root loop.
+    #[serde(default)]
+    pub q_metro: bool,
 }
 
 impl Default for Config {
@@ -52,6 +65,10 @@ impl Default for Config {
             ports_in: Vec::new(),
             ports_out: Vec::new(),
             gui_scale: default_gui_scale(),
+            latency_ms: 0.0,
+            metro_bpm: default_metro_bpm(),
+            metro_sub: default_metro_sub(),
+            q_metro: false,
         }
     }
 }
@@ -62,6 +79,14 @@ fn default_root_loops() -> u32 {
 
 fn default_gui_scale() -> f32 {
     1.0
+}
+
+fn default_metro_bpm() -> u32 {
+    120
+}
+
+fn default_metro_sub() -> u32 {
+    1
 }
 
 impl Config {
@@ -121,6 +146,10 @@ mod tests {
             ports_in: vec!["remote:out_1".into()],
             ports_out: vec!["remote:in_1".into(), "remote:in_2".into()],
             gui_scale: 1.25,
+            latency_ms: 12.5,
+            metro_bpm: 96,
+            metro_sub: 3,
+            q_metro: true,
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -128,6 +157,10 @@ mod tests {
         assert_eq!(back.midi, cfg.midi);
         assert_eq!(back.root_loops, 3);
         assert!((back.gui_scale - 1.25).abs() < f32::EPSILON);
+        assert!((back.latency_ms - 12.5).abs() < f32::EPSILON);
+        assert_eq!(back.metro_bpm, 96);
+        assert_eq!(back.metro_sub, 3);
+        assert!(back.q_metro);
         assert_eq!(back.ports_in, cfg.ports_in);
         assert_eq!(back.ports_out, cfg.ports_out);
     }

@@ -250,13 +250,17 @@ impl MidiBind {
 /// shortcuts (selected-track actions) plus direct per-loop actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MidiAction {
-    /// Select track `i` (0-based).
-    Select(usize),
     /// Record / overdub / clear / play-stop the *selected* track.
     RecSelected,
     OdSelected,
     ClearSelected,
     PlaySelected,
+    /// Import a recording file into the selected loop (opens file dialog).
+    ImportSelected,
+    /// Open the export prompt (one loop or whole project).
+    Export,
+    /// Select track `i` (0-based).
+    Select(usize),
     /// Direct per-track actions (independent of selection).
     RecLoop(usize),
     OdLoop(usize),
@@ -264,20 +268,47 @@ pub enum MidiAction {
     PlayLoop(usize),
     /// Toggle dependent (ensemble) mode.
     Dependent,
+    /// Toggle the metronome (click goes to the outputs only, never recorded).
+    Metronome,
+    /// Select the next loop (wraps around).
+    SelectNext,
+    /// Select the previous loop (wraps around).
+    SelectPrev,
 }
 
 impl MidiAction {
     /// Every bindable action, in UI order. `ALL[i]` is the action stored at
-    /// index `i` of the binding table.
-    pub const ALL: [MidiAction; 25] = [
-        MidiAction::Select(0),
-        MidiAction::Select(1),
-        MidiAction::Select(2),
-        MidiAction::Select(3),
+    /// index `i` of the binding table: global actions first, then one
+    /// `Select` per loop, then record/overdub/clear/play for each of the 16
+    /// loops (the settings panel shows these through a loop dropdown), then
+    /// dependent mode, metronome, and next/previous selection. New actions
+    /// must be APPENDED (the persisted `shortcuts` vector is positional).
+    pub const ALL: [MidiAction; 90] = [
         MidiAction::RecSelected,
         MidiAction::OdSelected,
         MidiAction::ClearSelected,
         MidiAction::PlaySelected,
+        MidiAction::ImportSelected,
+        MidiAction::Export,
+        // Select(0..15): pick a loop by MIDI.
+        MidiAction::Select(0),
+        MidiAction::Select(1),
+        MidiAction::Select(2),
+        MidiAction::Select(3),
+        MidiAction::Select(4),
+        MidiAction::Select(5),
+        MidiAction::Select(6),
+        MidiAction::Select(7),
+        MidiAction::Select(8),
+        MidiAction::Select(9),
+        MidiAction::Select(10),
+        MidiAction::Select(11),
+        MidiAction::Select(12),
+        MidiAction::Select(13),
+        MidiAction::Select(14),
+        MidiAction::Select(15),
+        // Per-loop direct actions: for each of the 16 loops, record /
+        // overdub / clear / play-stop — independent of selection.
         MidiAction::RecLoop(0),
         MidiAction::OdLoop(0),
         MidiAction::ClearLoop(0),
@@ -294,7 +325,58 @@ impl MidiAction {
         MidiAction::OdLoop(3),
         MidiAction::ClearLoop(3),
         MidiAction::PlayLoop(3),
+        MidiAction::RecLoop(4),
+        MidiAction::OdLoop(4),
+        MidiAction::ClearLoop(4),
+        MidiAction::PlayLoop(4),
+        MidiAction::RecLoop(5),
+        MidiAction::OdLoop(5),
+        MidiAction::ClearLoop(5),
+        MidiAction::PlayLoop(5),
+        MidiAction::RecLoop(6),
+        MidiAction::OdLoop(6),
+        MidiAction::ClearLoop(6),
+        MidiAction::PlayLoop(6),
+        MidiAction::RecLoop(7),
+        MidiAction::OdLoop(7),
+        MidiAction::ClearLoop(7),
+        MidiAction::PlayLoop(7),
+        MidiAction::RecLoop(8),
+        MidiAction::OdLoop(8),
+        MidiAction::ClearLoop(8),
+        MidiAction::PlayLoop(8),
+        MidiAction::RecLoop(9),
+        MidiAction::OdLoop(9),
+        MidiAction::ClearLoop(9),
+        MidiAction::PlayLoop(9),
+        MidiAction::RecLoop(10),
+        MidiAction::OdLoop(10),
+        MidiAction::ClearLoop(10),
+        MidiAction::PlayLoop(10),
+        MidiAction::RecLoop(11),
+        MidiAction::OdLoop(11),
+        MidiAction::ClearLoop(11),
+        MidiAction::PlayLoop(11),
+        MidiAction::RecLoop(12),
+        MidiAction::OdLoop(12),
+        MidiAction::ClearLoop(12),
+        MidiAction::PlayLoop(12),
+        MidiAction::RecLoop(13),
+        MidiAction::OdLoop(13),
+        MidiAction::ClearLoop(13),
+        MidiAction::PlayLoop(13),
+        MidiAction::RecLoop(14),
+        MidiAction::OdLoop(14),
+        MidiAction::ClearLoop(14),
+        MidiAction::PlayLoop(14),
+        MidiAction::RecLoop(15),
+        MidiAction::OdLoop(15),
+        MidiAction::ClearLoop(15),
+        MidiAction::PlayLoop(15),
         MidiAction::Dependent,
+        MidiAction::Metronome,
+        MidiAction::SelectNext,
+        MidiAction::SelectPrev,
     ];
 
     /// Position of `a` in [`MidiAction::ALL`] (binding-table index).
@@ -305,19 +387,27 @@ impl MidiAction {
     /// Short label for the settings UI.
     pub fn label(self) -> String {
         match self {
-            MidiAction::Select(i) => format!("select loop {}", i + 1),
             MidiAction::RecSelected => "record (selected)".into(),
             MidiAction::OdSelected => "overdub (selected)".into(),
             MidiAction::ClearSelected => "clear (selected)".into(),
             MidiAction::PlaySelected => "play / stop (selected)".into(),
+            MidiAction::ImportSelected => "import (selected)".into(),
+            MidiAction::Export => "export".into(),
+            MidiAction::Select(i) => format!("select loop {}", i + 1),
             MidiAction::RecLoop(i) => format!("loop {}: record", i + 1),
             MidiAction::OdLoop(i) => format!("loop {}: overdub", i + 1),
             MidiAction::ClearLoop(i) => format!("loop {}: clear", i + 1),
             MidiAction::PlayLoop(i) => format!("loop {}: play / stop", i + 1),
             MidiAction::Dependent => "dependent mode".into(),
+            MidiAction::Metronome => "metronome on / off".into(),
+            MidiAction::SelectNext => "select next loop".into(),
+            MidiAction::SelectPrev => "select previous loop".into(),
         }
     }
 }
+
+/// Number of bindable actions — `MidiAction::ALL.len()`.
+pub const N_ACTIONS: usize = MidiAction::ALL.len();
 
 #[cfg(test)]
 mod tests {
