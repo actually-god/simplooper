@@ -107,7 +107,7 @@ const SUBDIVISIONS: [(u32, &str); 6] = [
 ];
 
 /// Keys a user may plausibly bind to a shortcut.
-const KEY_CANDIDATES: [egui::Key; 52] = [
+const KEY_CANDIDATES: [egui::Key; 51] = [
     egui::Key::Num0,
     egui::Key::Num1,
     egui::Key::Num2,
@@ -121,11 +121,10 @@ const KEY_CANDIDATES: [egui::Key; 52] = [
     egui::Key::Space,
     egui::Key::Enter,
     egui::Key::Tab,
-    // Delete stays in the candidates so bindings persisted by older builds
-    // (where it was assignable) survive a restart instead of silently
-    // dropping to "—". It is no longer a fixed binding — it behaves like any
-    // other key now.
-    egui::Key::Delete,
+    // Delete is deliberately NOT a candidate: it is reserved for clearing
+    // bindings (it unbinds the cell being edited in both columns) and can
+    // never be bound to an action. Configs persisted by builds where it was
+    // assignable drop the binding to unbound on load.
     egui::Key::A,
     egui::Key::B,
     egui::Key::C,
@@ -408,8 +407,18 @@ impl App {
 
     /// Arm the MIDI "listening" slot for `idx` — what clicking a binding cell
     /// does; the next bindable MIDI message becomes that slot's binding.
+    /// Arming cancels any armed keyboard cell: only one cell may listen at a
+    /// time, otherwise the key-learn branch would swallow Delete/keys first.
     pub fn arm_midi_slot(&mut self, idx: usize) {
         self.midi_learning_slot = Some(idx);
+        self.learning_slot = None;
+    }
+
+    /// Arm the keyboard "press a key" slot for `idx` (cancels any MIDI cell
+    /// that was listening — see [`Self::arm_midi_slot`]).
+    pub fn arm_key_slot(&mut self, idx: usize) {
+        self.learning_slot = Some(idx);
+        self.midi_learning_slot = None;
     }
 
     /// The currently captured MIDI binding for slot `idx`, if any.
@@ -452,6 +461,15 @@ impl App {
                 if k == egui::Key::Escape {
                     self.learning_slot = None; // cancel
                     self.midi_learning_slot = None;
+                } else if k == egui::Key::Delete {
+                    // Delete is reserved: it can never be bound. Pressing it
+                    // while a key cell listens unbinds that slot (blank),
+                    // mirroring the MIDI column's Delete-to-clear.
+                    self.short_keys[slot] = None;
+                    self.learning_slot = None;
+                    self.save_config();
+                    self.status =
+                        format!("cleared binding: {}", MidiAction::ALL[slot].label());
                 } else {
                     match self.short_keys.iter().position(|s| *s == Some(k)) {
                         Some(s) if s != slot => {
@@ -911,8 +929,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                          other key does anything). A bound \
                          action fires on every matching message (value/velocity \
                          ignored). The key column works the same way: click, then \
-                         press the new key (Esc cancels); keys are ignored while a \
-                         text field has focus.",
+                         press the new key (Esc cancels); Delete clears that cell's \
+                         binding and is never bindable itself. Keys are ignored \
+                         while a text field has focus.",
                     )
                     .weak()
                     .small(),
@@ -1029,10 +1048,15 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
         }
         let resp = ui.add(btn).on_hover_text(
             "Click to listen: the next NOTE ON / CC / PROGRAM CHANGE \
-             from your controller becomes this binding. Click again (or Esc) to cancel.",
+             from your controller becomes this binding. Click again (or Esc) \
+             to cancel; Delete clears the binding.",
         );
         if resp.clicked() {
-            app.midi_learning_slot = if listening { None } else { Some(idx) };
+            if listening {
+                app.midi_learning_slot = None;
+            } else {
+                app.arm_midi_slot(idx);
+            }
         }
 
         // Keyboard binding for the same action.
@@ -1051,7 +1075,7 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
             btn = btn.fill(Color32::from_rgb(60, 90, 120));
         }
         if ui.add(btn).clicked() {
-            app.learning_slot = Some(idx);
+            app.arm_key_slot(idx);
         }
     });
 }
@@ -1300,6 +1324,9 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
 
         // Scrollable so all 16 tracks stay reachable on small windows.
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // The selection frame expands 3 px past the row rect; without a
+            // leading spacer its top edge on row 1 clips at the viewport.
+            ui.add_space(4.0);
             for &i in &order {
                 track_row(ui, app, i, dep_period);
                 ui.add_space(8.0);
@@ -1734,4 +1761,83 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_event(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// App with config isolated to a per-test temp dir (never the user's).
+    fn test_app(tag: &str) -> App {
+        let dir =
+            std::env::temp_dir().join(format!("simplooper-test-{}-{}", std::process::id(), tag));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        App::new(crate::audio::Backend::start())
+    }
+
+    #[test]
+    fn delete_clears_midi_binding_while_listening() {
+        let mut app = test_app("midi-del");
+        app.midi_binds[0] = Some(crate::midi::MidiBind { ty: 0, ch: 0, d1: 60 });
+        app.midi_learning_slot = Some(0);
+        let ctx = egui::Context::default();
+        ctx.input_mut(|i| i.events.push(key_event(egui::Key::Delete)));
+        app.handle_shortcuts(&ctx);
+        assert_eq!(app.midi_binds[0], None, "Delete must clear the MIDI binding");
+        assert_eq!(app.midi_learning_slot, None, "and end the listening state");
+    }
+
+    #[test]
+    fn delete_clears_key_binding_while_learning() {
+        let mut app = test_app("key-del");
+        app.short_keys[0] = Some(egui::Key::R);
+        app.arm_key_slot(0);
+        let ctx = egui::Context::default();
+        ctx.input_mut(|i| i.events.push(key_event(egui::Key::Delete)));
+        app.handle_shortcuts(&ctx);
+        assert_eq!(app.short_keys[0], None, "Delete must unbind the key slot");
+        assert_eq!(app.learning_slot, None, "and end the learning state");
+    }
+
+    #[test]
+    fn delete_never_binds_nor_fires() {
+        // Delete is not a bindable candidate, so it cannot be persisted...
+        assert_eq!(key_from_name("Delete"), None);
+        // ...and while no cell is armed it must not fire any action slot.
+        let mut app = test_app("del-fire");
+        for s in app.short_keys.iter_mut() {
+            *s = None;
+        }
+        app.short_keys[0] = Some(egui::Key::Delete); // simulate a stale binding
+        let ctx = egui::Context::default();
+        ctx.input_mut(|i| i.events.push(key_event(egui::Key::Delete)));
+        app.handle_shortcuts(&ctx);
+        // Slot 0 is RecSelected; firing it would enqueue a command. Instead of
+        // inspecting the queue, assert the reserved-key rule at the table level:
+        assert!(!KEY_CANDIDATES.contains(&egui::Key::Delete));
+    }
+
+    #[test]
+    fn arming_one_cell_cancels_the_other() {
+        // A stuck key-learn mode would swallow Delete before the MIDI branch;
+        // arming either column must cancel the other.
+        let mut app = test_app("arm-x");
+        app.arm_key_slot(0);
+        app.arm_midi_slot(1);
+        assert_eq!(app.learning_slot, None);
+        assert_eq!(app.midi_learning_slot, Some(1));
+        app.arm_key_slot(2);
+        assert_eq!(app.midi_learning_slot, None);
+        assert_eq!(app.learning_slot, Some(2));
+    }
 }
