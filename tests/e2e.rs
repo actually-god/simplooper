@@ -275,9 +275,11 @@ fn e2e_midi_capture_and_fire_sinco() {
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("XDG_CONFIG_HOME", &dir);
 
-    // Arm the "select loop 2" slot: the next bindable MIDI message is captured.
+    // Arm the "select loop 2" slot (Select(1) = table index 7 in the 87-slot
+    // layout: 0-5 globals, 6..=19 are Select(0)..Select(15)). The next
+    // bindable MIDI message is captured.
     let mut app = simplooper::ui::App::new(b);
-    app.arm_midi_slot(1);
+    app.arm_midi_slot(7);
     app.drain_events();
 
     // Source client emulating SINCO MIDI 1, wired to simplooper:midi_in.
@@ -299,7 +301,7 @@ fn e2e_midi_capture_and_fire_sinco() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         app.drain_events();
-        if app.midi_bind_at(1).is_some() && app.selected_loop() == 1 {
+        if app.midi_bind_at(7).is_some() && app.selected_loop() == 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -315,7 +317,7 @@ fn e2e_midi_capture_and_fire_sinco() {
         simplooper::midi::MidiBind { ty: 2, ch: 2, d1: 1 },
         simplooper::midi::MidiBind { ty: 2, ch: 3, d1: 2 },
     ];
-    let captured = app.midi_bind_at(1);
+    let captured = app.midi_bind_at(7);
     assert!(
         expected.contains(&captured.unwrap_or(simplooper::midi::MidiBind { ty: 0, ch: 99, d1: 99 })),
         "armed slot must capture one of the SINCO PC patterns, got {captured:?}"
@@ -548,7 +550,9 @@ fn e2e_loop_engine() {
         "playback of the recorded constant with silent input",
     );
 
-    // --- Phase 3: overdub -0.1 until the buffer is fully overwritten -------
+    // --- Phase 3: additive overdub -0.1 on top of the +0.25 take -----------
+    // Overdub must never replace or re-amp the original content: after a full
+    // pass the buffer holds 0.25 + (-0.1) = 0.15 everywhere.
     const_val.store((-0.1f32).to_bits(), Ordering::Relaxed);
     b.cmd(Cmd::ToggleOverdub { i: 0 });
     assert!(
@@ -562,9 +566,9 @@ fn e2e_loop_engine() {
     );
     let od_time = Duration::from_millis(len0 as u64 * 1000 / sr as u64 + 800);
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m + 0.2).abs() < 0.03).unwrap_or(false),
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.05).abs() < 0.03).unwrap_or(false),
         od_time,
-        "overdub to fully overwrite the take (sink -> -0.2)",
+        "additive overdub: sink -> dry(-0.1) + mixed take(0.15) = 0.05",
     );
     b.cmd(Cmd::ToggleOverdub { i: 0 }); // back to PLAY
     assert!(
@@ -578,16 +582,16 @@ fn e2e_loop_engine() {
     );
     const_val.store(0.0f32.to_bits(), Ordering::Relaxed);
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m + 0.1).abs() < 0.03).unwrap_or(false),
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.15).abs() < 0.03).unwrap_or(false),
         Duration::from_secs(2),
-        "overdubbed content (-0.1) playing back",
+        "overdubbed content (0.25 + -0.1 = 0.15) playing back at original level",
     );
 
     // --- Phase 4: easy-quantize against track 0's own length ---------------
     let len_before = b.engine.len_of(0);
     let (target, beat, _bar) = compute_target(len_before, 1, 4, Unit::Beat).unwrap();
     assert!(target > 0 && beat > 0.0);
-    b.cmd(Cmd::Quantize { num: 4, den: 4, bars: 1, unit: Unit::Beat, root: 0 });
+    b.cmd(Cmd::Quantize { num: 4, den: 4, bars: 1, unit: Unit::Beat, root: 0, metro: false, bpm: 120 });
     assert!(
         wait_for(
             &b,
@@ -672,9 +676,9 @@ fn e2e_loop_engine() {
         "independent: unexpected correlation at lmax (acf {c} vs {a})"
     );
 
-    // --- Phase 6: dependent mode — finite ensemble of N root loops ---------
-    // Stop both tracks first so the run is bracketed by silence at the sink
-    // (the input is silent too), letting us measure its exact span.
+    // --- Phase 6: dependent mode — endless ensemble of N root loops --------
+    // Stop both tracks first so the run starts from silence at the sink
+    // (the input is silent too), letting us measure the run cleanly.
     b.cmd(Cmd::TogglePlay { i: 0 });
     b.cmd(Cmd::TogglePlay { i: 1 });
     wait_until(
@@ -683,7 +687,7 @@ fn e2e_loop_engine() {
         "silence before the dependent run",
     );
 
-    b.cmd(Cmd::SetRootLoops(8)); // ensemble plays exactly 8 root loops
+    b.cmd(Cmd::SetRootLoops(8)); // ensemble period = 8 root loops
     b.cmd(Cmd::SetDependent(true));
     b.cmd(Cmd::TogglePlay { i: 0 });
     b.cmd(Cmd::TogglePlay { i: 1 });
@@ -697,29 +701,24 @@ fn e2e_loop_engine() {
         "tracks did not start in dependent mode"
     );
 
-    // Finite ensemble: after exactly N root loops the whole ensemble stops
-    // in sync — no endless repeat.
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states.iter().all(|&s| s == TR_IDLE)),
-            Duration::from_secs(8)
-        )
-        .is_some(),
-        "ensemble did not stop after N root loops"
+    // Continuous wrap: the ensemble must NOT stop at the end of the N root
+    // loops — it loops forever. Sleep well past two full ensemble periods and
+    // assert both tracks are still playing.
+    let period = lmax * 8;
+    std::thread::sleep(Duration::from_millis(period * 2 * 1000 / sr as u64 + 2000));
+    assert_eq!(
+        b.engine.state_of(0),
+        TR_PLAY,
+        "ensemble stopped at the end of the root loops (must loop forever)"
     );
-    std::thread::sleep(Duration::from_millis(100)); // let the tail drain into the ring
+    assert_eq!(b.engine.state_of(1), TR_PLAY, "ensemble stopped mid-run");
 
-    // The run must last exactly N × lmax samples (the root loop repeated N
-    // times) with no silent gaps inside — "extra silence should never be a
-    // symptom of dependent mode". Chunk-gate the capture: the input is silent,
-    // so any activity at the sink is ensemble playback. The window may include
-    // the tail of phase 5's independent playback at its very start; the run is
-    // the LAST active region, bounded by silence on the left.
+    // Capture ~2 ensemble periods already sitting in the ring (the sleep above
+    // guaranteed they exist) and prove the wrap is seamless: no silent chunk
+    // anywhere, the mix repeats exactly with the ensemble period (continuous
+    // wrap), and the shorter loop keeps tiling.
+    let need = (period as usize * 2 + 20_000).min(ring_n - 1);
     let end = widx.load(Ordering::Relaxed);
-    // The run lasts N × lmax samples; size the window from the live lengths
-    // (quantize jitter makes lmax vary between runs) plus settle margin.
-    let need = (lmax as usize * 8 + 20_000).min(ring_n - 1);
     let x: Vec<f32> = (0..need)
         .map(|i| {
             f32::from_bits(
@@ -732,42 +731,36 @@ fn e2e_loop_engine() {
     let rms = |c: &[f32]| {
         (c.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / c.len() as f64).sqrt()
     };
-    let act: Vec<bool> = (0..x.len() / chunk)
-        .map(|k| rms(&x[k * chunk..(k + 1) * chunk]) > 0.05)
-        .collect();
-    let e = act
-        .iter()
-        .rposition(|&a| a)
-        .expect("dependent: no signal captured");
-    let mut s = e;
-    while s > 0 && act[s - 1] {
-        s -= 1;
+    for k in 0..x.len() / chunk {
+        assert!(
+            rms(&x[k * chunk..(k + 1) * chunk]) > 0.05,
+            "silent gap inside the dependent run at chunk {k} — ensemble stalled?"
+        );
     }
+    let v = var(&x);
+    assert!(v > 0.01, "no signal in run (var {v})");
+    let ap = acf_norm(&x, period as usize);
     assert!(
-        s > 0 && !act[s - 1],
-        "dependent: run not bounded by silence on the left (window too small?)"
-    );
-    // Contiguity of [s, e] is guaranteed by construction: every chunk between
-    // the run's first and last active chunk is active — no silent gaps.
-    let first = s * chunk;
-    let last = (e + 1) * chunk;
-    let span = (last - first) as i64;
-    let expected = lmax as i64 * 8;
-    assert!(
-        (span - expected).abs() <= 2000,
-        "ensemble lasted {span} samples, expected ~{expected} (8 × lmax)"
+        ap > 0.5 * v,
+        "dependent: mix does not repeat with the ensemble period (acf {ap} vs var {v})"
     );
 
     // Shorter loops must repeat (tile) across the ensemble — not play once
     // and go silent until the root ends. Track 1's contribution is strictly
     // periodic with its own length under modulo-wrap playback.
-    let xa = &x[first..last];
-    let v = var(xa);
-    assert!(v > 0.01, "no signal in run (var {v})");
-    let d1 = acf_norm(xa, len1 as usize);
+    let d1 = acf_norm(&x, len1 as usize);
     assert!(
         d1 > 0.5 * v,
         "dependent: shorter loop not repeating (acf at len1 {d1} vs var {v})"
+    );
+
+    // Stop the ensemble before clearing.
+    b.cmd(Cmd::TogglePlay { i: 0 });
+    b.cmd(Cmd::TogglePlay { i: 1 });
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        Duration::from_secs(2),
+        "silence after the dependent run",
     );
 
     // --- Phase 7: clear ------------------------------------------------------

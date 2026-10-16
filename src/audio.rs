@@ -31,7 +31,7 @@ const MIDI_PORT_SHORT: &str = "midi_in";
 pub const MAX_SLOTS: usize = 16;
 
 /// Number of simultaneous loops (tracks).
-pub const MAX_LOOPS: usize = 4;
+pub const MAX_LOOPS: usize = 16;
 /// Per-track recording capacity: ~60 s @ 48 kHz (~30 s @ 96 kHz).
 pub const LOOP_CAP: u32 = 2_880_000;
 
@@ -72,14 +72,45 @@ pub enum Cmd {
     TogglePlay { i: usize },
     /// Stop and erase a loop track.
     ClearTrack { i: usize },
+    /// Replace track i's recording with `data` (decoded, engine-rate mono
+    /// samples; anything beyond the capacity is truncated). The track stops
+    /// first — importing replaces whatever was recorded before.
+    ImportTrack { i: usize, data: Vec<f32> },
+    /// Write one loop's recording to `path` in format `fmt`. Runs on the
+    /// manager thread (the GUI stays responsive; a Notice/Error event reports
+    /// the outcome).
+    ExportTrack {
+        i: usize,
+        path: std::path::PathBuf,
+        fmt: crate::audio_io::ExportFormat,
+    },
+    /// Render and write the whole dependent-mode ensemble (every loop at
+    /// position 0 for `root_loops` periods of the longest loop) to `path`.
+    /// Dependent mode is forced on before rendering — that is the only mode
+    /// in which a coherent whole-project export exists.
+    ExportProject {
+        path: std::path::PathBuf,
+        fmt: crate::audio_io::ExportFormat,
+    },
     /// true = dependent looping (finite ensemble clock), false = independent players.
     SetDependent(bool),
     /// Dependent-mode ensemble length in units of the longest ("root") loop,
-    /// clamped to 1..=64. The ensemble plays exactly N root loops: every track
-    /// repeats within the period and all tracks stop together at its end
-    /// (changing N while playing restarts the ensemble).
+    /// clamped to 1..=64. The ensemble period is N root loops: every track
+    /// repeats within the period, and the clock wraps at the period end so
+    /// the loops keep playing forever (changing N while playing restarts the
+    /// ensemble from there).
     SetRootLoops(u32),
-    /// Easy-quantize every loop against the chosen root loop's recorded length.
+    /// Delay the whole output mix (monitoring + loops + metronome) by `ms`
+    /// milliseconds to compensate for input/output latency. Clamped to
+    /// 0..=1000 ms.
+    SetLatency { ms: f32 },
+    /// Metronome: on/off, tempo in BPM, subdivision in clicks per beat
+    /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...). The click
+    /// goes to every selected output but is never recorded into a loop.
+    SetMetro { on: bool, bpm: u32, sub: u32 },
+    /// Easy-quantize every loop against the chosen root loop's recorded length
+    /// (or, with `metro = true`, against the metronome grid: beat = 60/bpm
+    /// seconds, bar = beat x `num`; `bars` is then unused).
     Quantize {
         num: u32,
         den: u32,
@@ -87,6 +118,10 @@ pub enum Cmd {
         unit: crate::quantize::Unit,
         /// Which loop's recorded length defines the grid (0 = Loop 1).
         root: usize,
+        /// true = quantize to the metronome tempo instead of the root loop.
+        metro: bool,
+        /// Metronome tempo in BPM (used only when `metro` is set).
+        bpm: u32,
     },
     Quit,
 }
@@ -104,6 +139,12 @@ pub enum Evt {
     /// A quantize pass finished; `summary` describes the grid and results.
     Quantized { summary: String },
     Midi(RawMidiMsg),
+    /// Remote MIDI source ports currently wired into `simplooper:midi_in`
+    /// (auto-connected; refreshed on port/client registration events).
+    MidiSources(Vec<String>),
+    /// A non-error status message worth showing in the top bar (e.g. a
+    /// finished export).
+    Notice(String),
     Xrun,
     Error(String),
 }
@@ -206,6 +247,12 @@ pub struct LoopEngine {
     master_pos: AtomicU64,
     /// Dependent-mode ensemble length in units of the longest loop (>= 1).
     root_loops: AtomicU32,
+    /// Output delay in samples (latency compensation; 0 = off).
+    latency: AtomicU32,
+    /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat.
+    metro_on: AtomicU8,
+    metro_bpm: AtomicU32,
+    metro_sub: AtomicU32,
 }
 
 impl LoopEngine {
@@ -225,6 +272,10 @@ impl LoopEngine {
             pos: core::array::from_fn(|_| AtomicU64::new(0)),
             master_pos: AtomicU64::new(0),
             root_loops: AtomicU32::new(1),
+            latency: AtomicU32::new(0),
+            metro_on: AtomicU8::new(0),
+            metro_bpm: AtomicU32::new(120),
+            metro_sub: AtomicU32::new(1),
         })
     }
 
@@ -278,6 +329,64 @@ impl LoopEngine {
         self.gen.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Stop track i and replace its recording with `data` (engine-rate mono
+    /// samples, truncated to capacity). Safe from the manager thread: IDLE is
+    /// stored first so RT stops reading before the buffer is rewritten.
+    pub fn import_track(&self, i: usize, data: &[f32]) {
+        self.state[i].store(TR_IDLE, Ordering::Relaxed);
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
+        let n = data.len().min(LOOP_CAP as usize);
+        buf[..n].copy_from_slice(&data[..n]);
+        buf[n..].fill(0.0f32);
+        self.pos[i].store(0, Ordering::Relaxed);
+        self.len[i].store(n as u32, Ordering::Relaxed);
+        self.gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Render the full dependent-mode ensemble — every track at position 0,
+    /// for `root_loops` periods of the longest loop — to mono f32 samples.
+    /// Used for whole-project export; None when no track has content.
+    pub fn render_ensemble(&self, root_loops: usize) -> Option<Vec<f32>> {
+        let lens = self.lens();
+        let max_len = lens.iter().max().copied().unwrap_or(0);
+        if max_len == 0 {
+            return None;
+        }
+        let periods = (root_loops.max(1) as u32 * max_len) as u64;
+        let mut out: Vec<f32> = vec![0.0f32; periods as usize];
+        for (t, &l32) in lens.iter().enumerate() {
+            let l = l32 as u64;
+            if l == 0 {
+                continue;
+            }
+            let buf = unsafe { std::slice::from_raw_parts(self.bufs[t], LOOP_CAP as usize) };
+            for p in 0..(periods / max_len as u64) {
+                let base = p * max_len as u64;
+                let start = (base % l) as usize;
+                let end = ((base + max_len as u64) % l) as usize;
+                if end > start {
+                    for k in 0..(end - start) {
+                        out[(base + k as u64) as usize] += buf[start + k];
+                    }
+                } else {
+                    let first = (l - start as u64) as usize;
+                    for k in 0..first {
+                        out[(base + k as u64) as usize] += buf[start + k];
+                    }
+                    for k in 0..end {
+                        out[(base + first as u64 + k as u64) as usize] += buf[k];
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Snapshot of all track lengths (samples).
+    pub fn lens(&self) -> [u32; MAX_LOOPS] {
+        core::array::from_fn(|i| self.len[i].load(Ordering::Relaxed))
+    }
+
     /// Zero the buffer and arm a fresh capture on track i.
     pub fn start_rec(&self, i: usize) {
         self.state[i].store(TR_IDLE, Ordering::Relaxed);
@@ -329,6 +438,20 @@ impl LoopEngine {
     /// Dependent-mode ensemble length in units of the longest loop (>= 1).
     pub fn root_loops(&self) -> u32 {
         self.root_loops.load(Ordering::Relaxed)
+    }
+
+    /// Output delay in samples (0 = latency compensation off).
+    pub fn latency_samples(&self) -> u32 {
+        self.latency.load(Ordering::Relaxed)
+    }
+
+    /// Metronome state: (on, bpm, clicks per beat).
+    pub fn metro(&self) -> (bool, u32, u32) {
+        (
+            self.metro_on.load(Ordering::Relaxed) != 0,
+            self.metro_bpm.load(Ordering::Relaxed),
+            self.metro_sub.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -444,6 +567,10 @@ fn run(
     let mask_in = Arc::new(AtomicU64::new(0));
     let mask_out = Arc::new(AtomicU64::new(0));
     let notif = Notif { tx: evt_tx.clone(), xruns: xruns.clone() };
+    // Sample rate is queryable before activation; the metronome and the
+    // latency delay line are sized from it.
+    let sr = client.sample_rate();
+    let delay_n = (sr.max(1) as usize).next_power_of_two();
     let proc = Proc {
         midi_in: midi_port,
         ports: RawPorts { ins: ins_raw, outs: outs_raw },
@@ -459,6 +586,14 @@ fn run(
         master_pos: 0,
         prev_mode: 0,
         prev_root: 1,
+        sr,
+        delay: vec![0.0f32; delay_n],
+        didx: 0,
+        metro_next: 0,
+        metro_start: -1,
+        metro_accent: false,
+        metro_cnt: 0,
+        sample_no: 0,
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -481,12 +616,17 @@ fn run(
     let _ = evt_tx.send(Evt::Ready { client_name: client_name.clone(), sample_rate });
     send_ports(active.as_client(), &evt_tx);
 
+    // Remote MIDI sources currently wired into our midi_in port. Devices often
+    // reappear on a fresh port name every connect, so this set is re-derived
+    // periodically and on registration events (see rescan_midi_sources).
+    let mut midi_sources: Vec<String> = Vec::new();
+
     // What each slot is currently connected to (manager-thread state only).
     let mut cur_in: Vec<Option<String>> = vec![None; MAX_SLOTS];
     let mut cur_out: Vec<Option<String>> = vec![None; MAX_SLOTS];
 
     loop {
-        match cmd_rx.recv() {
+        match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Cmd::Refresh) => send_ports(active.as_client(), &evt_tx),
             Ok(Cmd::Apply { ins, outs }) => {
                 apply_layout(
@@ -534,6 +674,60 @@ fn run(
                 engine.clear(i);
                 send_loop_state(&engine, &evt_tx);
             }
+            Ok(Cmd::ImportTrack { i, data }) => {
+                // The import dialog + decode already ran on the GUI thread;
+                // this is just the buffer swap (track is quiesced by import).
+                engine.import_track(i.min(MAX_LOOPS - 1), &data);
+                send_loop_state(&engine, &evt_tx);
+            }
+            Ok(Cmd::ExportTrack { i, path, fmt }) => {
+                let i = i.min(MAX_LOOPS - 1);
+                let n = engine.len_of(i);
+                if n == 0 {
+                    let _ = evt_tx.send(Evt::Error(format!(
+                        "export: loop {} has no recording",
+                        i + 1
+                    )));
+                } else {
+                    let samples = engine.read_range(i, n).to_vec();
+                    match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
+                        Ok(()) => {
+                            let _ = evt_tx.send(Evt::Notice(format!(
+                                "exported loop {} → {}",
+                                i + 1,
+                                path.display()
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
+                        }
+                    }
+                }
+            }
+            Ok(Cmd::ExportProject { path, fmt }) => {
+                // Whole-project export only exists in dependent mode — force
+                // it on before rendering (the GUI checkbox mirrors this).
+                engine.mode.store(1, Ordering::Relaxed);
+                match engine.render_ensemble(engine.root_loops() as usize) {
+                    Some(samples) => match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
+                        Ok(()) => {
+                            let _ = evt_tx.send(Evt::Notice(format!(
+                                "exported ensemble ({} samples) → {}",
+                                samples.len(),
+                                path.display()
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
+                        }
+                    },
+                    None => {
+                        let _ = evt_tx.send(Evt::Error(
+                            "export: no recorded audio in any loop".into(),
+                        ));
+                    }
+                }
+            }
             Ok(Cmd::SetDependent(dep)) => {
                 engine.mode.store(if dep { 1 } else { 0 }, Ordering::Relaxed);
                 send_loop_state(&engine, &evt_tx);
@@ -541,56 +735,99 @@ fn run(
             Ok(Cmd::SetRootLoops(n)) => {
                 engine.root_loops.store(n.clamp(1, 64), Ordering::Relaxed);
             }
-            Ok(Cmd::Quantize { num, den, bars, unit, root }) => {
-                if den == 0 || num == 0 || bars == 0 {
-                    let _ = evt_tx.send(Evt::Error(
-                        "quantize: numerator, denominator and bars must be at least 1".into(),
-                    ));
+            Ok(Cmd::SetLatency { ms }) => {
+                let ms = ms.clamp(0.0, 1000.0);
+                engine
+                    .latency
+                    .store((ms * sample_rate as f32 / 1000.0).round() as u32, Ordering::Relaxed);
+            }
+            Ok(Cmd::SetMetro { on, bpm, sub }) => {
+                engine.metro_on.store(on as u8, Ordering::Relaxed);
+                engine.metro_bpm.store(bpm.clamp(20, 300), Ordering::Relaxed);
+                engine.metro_sub.store(sub.clamp(1, 16), Ordering::Relaxed);
+            }
+            Ok(Cmd::Quantize { num, den, bars, unit, root, metro, bpm }) => {
+                // Grid source: the metronome tempo, or the root loop's
+                // recorded length (`bars` is unused in metronome mode).
+                let grid = if metro {
+                    if bpm == 0 || num == 0 {
+                        Err("quantize to metronome: tempo and numerator must be at least 1".into())
+                    } else {
+                        let beat = 60.0 * sample_rate as f64 / bpm as f64;
+                        let bar = beat * num as f64;
+                        let target_f = match unit {
+                            crate::quantize::Unit::Beat => beat,
+                            crate::quantize::Unit::Bar => bar,
+                        };
+                        if target_f < 0.5 {
+                            Err("grid too fine: raise the tempo or the numerator".into())
+                        } else {
+                            Ok(((target_f + 0.5) as u32, beat, bar))
+                        }
+                    }
+                } else if den == 0 || num == 0 || bars == 0 {
+                    Err("quantize: numerator, denominator and bars must be at least 1".into())
                 } else {
                     let len1 = engine.len_of(root.min(MAX_LOOPS - 1));
-                    match crate::quantize::compute_target(len1, bars, num, unit) {
-                        Ok((target, beat, bar)) => {
-                            // Stop everything and let the audio thread quiesce
-                            // before buffers are rewritten in place.
-                            for i in 0..MAX_LOOPS {
-                                engine.state[i].store(TR_IDLE, Ordering::Relaxed);
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                            let lens = engine.quantize_all(target, sample_rate);
-                            let bpm = 60.0 / (beat / sample_rate as f64);
-                            let unit_name = match unit {
-                                crate::quantize::Unit::Beat => "beat",
-                                crate::quantize::Unit::Bar => "bar",
-                            };
-                            let mut parts: Vec<String> = Vec::new();
-                            for (i, &l) in lens.iter().enumerate() {
-                                if l > 0 {
-                                    parts.push(format!(
-                                        "L{} → {} smp ({}×{unit_name})",
-                                        i + 1,
-                                        l,
-                                        (l as f64 / target as f64).round()
-                                    ));
-                                }
-                            }
-                            let summary = format!(
-                                "{num}/{den}, {bars} bar(s), root loop {}: beat={} smp, bar={} smp, ≈{bpm:.1} BPM → {}",
-                                root + 1,
-                                beat.round(),
-                                bar.round(),
-                                if parts.is_empty() { "nothing to quantize".into() } else { parts.join(", ") }
-                            );
-                            eprintln!("[simplooper] quantize: {summary}");
-                            let _ = evt_tx.send(Evt::Quantized { summary });
-                            send_loop_state(&engine, &evt_tx);
+                    crate::quantize::compute_target(len1, bars, num, unit)
+                };
+                match grid {
+                    Ok((target, beat, bar)) => {
+                        // Stop everything and let the audio thread quiesce
+                        // before buffers are rewritten in place.
+                        for i in 0..MAX_LOOPS {
+                            engine.state[i].store(TR_IDLE, Ordering::Relaxed);
                         }
-                        Err(e) => {
-                            let _ = evt_tx.send(Evt::Error(format!("quantize: {e}")));
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        let lens = engine.quantize_all(target, sample_rate);
+                        let eff_bpm = 60.0 / (beat / sample_rate as f64);
+                        let unit_name = match unit {
+                            crate::quantize::Unit::Beat => "beat",
+                            crate::quantize::Unit::Bar => "bar",
+                        };
+                        let mut parts: Vec<String> = Vec::new();
+                        for (i, &l) in lens.iter().enumerate() {
+                            if l > 0 {
+                                parts.push(format!(
+                                    "L{} → {} smp ({}×{unit_name})",
+                                    i + 1,
+                                    l,
+                                    (l as f64 / target as f64).round()
+                                ));
+                            }
                         }
+                        let grid_desc = if metro {
+                            format!("metronome {bpm} BPM, {num}/{den}")
+                        } else {
+                            format!(
+                                "{num}/{den}, {bars} bar(s), root loop {}, ≈{eff_bpm:.1} BPM",
+                                root + 1
+                            )
+                        };
+                        let summary = format!(
+                            "{grid_desc}: beat={} smp, bar={} smp → {}",
+                            beat.round(),
+                            bar.round(),
+                            if parts.is_empty() { "nothing to quantize".into() } else { parts.join(", ") }
+                        );
+                        eprintln!("[simplooper] quantize: {summary}");
+                        let _ = evt_tx.send(Evt::Quantized { summary });
+                        send_loop_state(&engine, &evt_tx);
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(Evt::Error(format!("quantize: {e}")));
                     }
                 }
             }
-            Ok(Cmd::Quit) | Err(_) => break,
+            Ok(Cmd::Quit) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No command pending: re-derive the MIDI source set. This is
+                // what makes bindings work when a device (re)appears on a new
+                // port name — e.g. hardware that gets a fresh ALSA/JACK port
+                // number on every connect instead of a fixed one.
+                rescan_midi_sources(active.as_client(), &evt_tx, &mut midi_sources);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -731,6 +968,51 @@ fn send_ports_try(client: &Client, tx: &SyncSender<Evt>) {
     let _ = tx.try_send(Evt::Ports { ins, outs });
 }
 
+/// Re-derive which remote MIDI source ports feed `simplooper:midi_in` and
+/// make the actual connections. Devices often get a brand-new port name on
+/// every connect (and may use any channel), so a single manually-made link
+/// is not enough: we wire *every* remote MIDI source port into our input,
+/// drop links whose source vanished, and report the live set to the GUI.
+/// Runs on the manager thread only (connects may block). Returns true if the
+/// connected set changed.
+fn rescan_midi_sources(client: &Client, tx: &SyncSender<Evt>, known: &mut Vec<String>) -> bool {
+    let mine = client.name().to_string();
+    let prefix = format!("{mine}:");
+    let dst = format!("{prefix}midi_in");
+
+    // Remote MIDI source ports (any client, any channel — channels are
+    // irrelevant for transport-level binding; the device picks its own).
+    let found: Vec<String> = client
+        .ports(None, Some("midi"), PortFlags::IS_OUTPUT)
+        .into_iter()
+        .filter(|n| !n.starts_with(&prefix))
+        .collect();
+
+    // Nothing to do if the set is unchanged (connect_retry would still work,
+    // but skipping avoids pointless connect calls every 250 ms).
+    if found == *known {
+        return false;
+    }
+
+    // Drop links whose source port no longer exists.
+    for name in known.iter() {
+        if !found.contains(name) {
+            let _ = client.disconnect_ports_by_name(name, &dst);
+        }
+    }
+    // (Re)connect everything currently present. connect_retry absorbs the
+    // PipeWire-JACK "freshly activated" delay for ports that just appeared.
+    for name in found.iter() {
+        if let Err(e) = connect_retry(client, name, &dst) {
+            eprintln!("[simplooper] MIDI link {name} → {dst}: {e}");
+        }
+    }
+    *known = found.clone();
+    eprintln!("[simplooper] MIDI sources: {}", if known.is_empty() { "none".into() } else { known.join(", ") });
+    let _ = tx.try_send(Evt::MidiSources(known.clone()));
+    true
+}
+
 /// Shared port enumeration: candidates = other clients' audio ports, minus
 /// any client that belongs to a disabled device.
 fn enumerate_visible_ports(client: &Client) -> (Vec<PortInfo>, Vec<PortInfo>) {
@@ -853,6 +1135,19 @@ struct Proc {
     prev_mode: u8,
     /// Last root-loops value seen; a change restarts the ensemble.
     prev_root: u32,
+    /// Engine sample rate (for metronome / latency math).
+    sr: u32,
+    /// Latency-compensation delay line (power-of-two size, ring index).
+    delay: Vec<f32>,
+    didx: usize,
+    /// Metronome clock: absolute sample of the next click, start sample of
+    /// the click currently sounding (-1 = idle), accent flag, click counter.
+    metro_next: u64,
+    metro_start: i64,
+    metro_accent: bool,
+    metro_cnt: u64,
+    /// Absolute sample counter (metronome timeline).
+    sample_no: u64,
 }
 
 impl ProcessHandler for Proc {
@@ -933,12 +1228,24 @@ impl ProcessHandler for Proc {
         }
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        // Metronome parameters for this cycle (click is added to the output
+        // mix only — never to `dry`, so it can never be recorded into a loop).
+        let (metro_on, metro_bpm, metro_sub) = self.engine.metro();
+        let metro_bpm = metro_bpm.max(1);
+        let metro_sub = metro_sub.max(1);
+        let metro_interval =
+            (self.sr as f64 * 60.0 / (metro_bpm as f64 * metro_sub as f64)).max(1.0) as u64;
+        let metro_dur = (self.sr / 40).max(2); // 25 ms click
+        let metro_decay = self.sr as f32 * 0.012;
+        // Latency-compensation delay (samples, clamped to the line size).
+        let dn = self.delay.len();
+        let dly = (self.engine.latency.load(Ordering::Relaxed) as usize).min(dn - 1);
         let dependent = mode == 1;
         // Dependent-mode ensemble: the longest PLAYING/overdubbing track is
         // the "root" loop; the ensemble period is `root_loops` copies of it.
         // Every track repeats continuously (p % len) across the period, so
-        // shorter recordings tile horizontally until everything stops in sync
-        // together at the period boundary — no gaps, ever.
+        // shorter recordings tile horizontally, and at the period end the
+        // clock wraps — the ensemble loops forever, no gaps, ever.
         let root = self.engine.root_loops.load(Ordering::Relaxed).max(1);
         if root != self.prev_root {
             // Ensemble length changed: restart so it plays exactly N fresh
@@ -996,13 +1303,18 @@ impl ProcessHandler for Proc {
                                 play += self.engine.read(t, off as u32);
                                 pos_now[t] = off;
                                 if st == TR_OD {
-                                    self.engine.write(t, off as u32, dry);
+                                    // Additive overdub: layer the live input
+                                    // on top of the existing recording at its
+                                    // original level — never replace it.
+                                    let old = self.engine.read(t, off as u32);
+                                    self.engine.write(t, off as u32, old + dry);
                                 }
                             } else {
                                 let off = self.pos[t] % l;
                                 play += self.engine.read(t, off as u32);
                                 if st == TR_OD {
-                                    self.engine.write(t, off as u32, dry);
+                                    let old = self.engine.read(t, off as u32);
+                                    self.engine.write(t, off as u32, old + dry);
                                 }
                                 pos_now[t] = off;
                                 self.pos[t] += 1;
@@ -1028,29 +1340,66 @@ impl ProcessHandler for Proc {
                 self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
             }
 
-            let v = (dry + play) * g;
-            let av = v.abs();
+            // Metronome click (added to the output mix only — `dry` never
+            // sees it, so it can never be recorded into a loop).
+            let mut click = 0.0f32;
+            if metro_on {
+                if self.sample_no >= self.metro_next {
+                    self.metro_start = self.sample_no as i64;
+                    // Accent every 4 beats (first click of each 4-beat bar).
+                    self.metro_accent =
+                        self.metro_cnt.is_multiple_of(4 * metro_sub as u64);
+                    self.metro_cnt += 1;
+                    self.metro_next += metro_interval;
+                    if self.metro_next <= self.sample_no {
+                        // Tempo change outran the schedule: resync.
+                        self.metro_next = self.sample_no + metro_interval;
+                    }
+                }
+                if self.metro_start >= 0 {
+                    let k = self.sample_no as i64 - self.metro_start;
+                    if k >= 0 && (k as u32) < metro_dur {
+                        let kf = k as f32;
+                        let f = if self.metro_accent { 1760.0f32 } else { 1175.0 };
+                        let amp = if self.metro_accent { 0.5f32 } else { 0.35 };
+                        click = (kf * std::f32::consts::TAU * f / self.sr as f32).sin()
+                            * (-kf / metro_decay).exp()
+                            * amp;
+                    } else {
+                        self.metro_start = -1;
+                    }
+                }
+            }
+            self.sample_no += 1;
+
+            let v = (dry + play + click) * g;
+            // Latency compensation: delay the whole output mix by `dly`
+            // samples (the line is always fed so re-enabling never gaps).
+            let out = if dly > 0 {
+                let s = self.delay[(self.didx + dn - dly) & (dn - 1)];
+                self.delay[self.didx] = v;
+                self.didx = (self.didx + 1) & (dn - 1);
+                s
+            } else {
+                self.delay[self.didx] = v;
+                self.didx = (self.didx + 1) & (dn - 1);
+                v
+            };
+            let av = out.abs();
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
             }
             for b in out_bufs.iter() {
                 if !b.is_null() {
-                    unsafe { *b.add(i) = v };
+                    unsafe { *b.add(i) = out };
                 }
             }
         }
-        // Finite ensemble: at the period end, stop every playing track in
-        // sync and restart the clock. (At most one block of samples can
+        // Continuous ensemble: at the period end the clock simply wraps and
+        // every track keeps looping. (At most one block of samples can
         // overshoot the boundary — content is continuous, so no glitch.)
         if dependent && period > 0 && self.master_pos >= period {
-            for (t, &st) in st_now.iter().enumerate() {
-                if st == TR_PLAY || st == TR_OD {
-                    self.engine.state[t].store(TR_IDLE, Ordering::Relaxed);
-                }
-            }
             self.master_pos = 0;
-            let (states, lens_snap) = loop_state(&self.engine);
-            let _ = self.tx.try_send(Evt::LoopState { states, lens: lens_snap });
         }
         // Publish final positions for this block.
         for (t, &p) in pos_now.iter().enumerate() {

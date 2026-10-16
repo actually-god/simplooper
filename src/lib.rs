@@ -10,6 +10,7 @@
 //! - [`ui`]: the egui front-end (used by the binary).
 
 pub mod audio;
+pub mod audio_io;
 pub mod config;
 pub mod midi;
 pub mod ports;

@@ -44,33 +44,66 @@ struct WaveCache {
 pub const N_ACTIONS: usize = MidiAction::ALL.len();
 
 /// Default keyboard bindings, one per entry of `MidiAction::ALL` (same order);
-/// `None` = no default binding.
+/// `None` = no default binding. Order: selected-track + file ops (6), select
+/// loop 1–16, per-loop record/overdub/clear/play × 16 loops, dependent mode,
+/// metronome, select next / previous loop.
 const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = [
+    // Global (selected-track + file operations).
+    Some(egui::Key::R),      // record (selected)
+    Some(egui::Key::O),      // overdub (selected)
+    Some(egui::Key::C),      // clear (selected)
+    Some(egui::Key::Space),  // play / stop (selected)
+    Some(egui::Key::I),      // import recording into selected loop
+    Some(egui::Key::E),      // export prompt
+    // Select loop 1–4 keep their historical defaults; 5–16 start unbound.
     Some(egui::Key::Num1),
     Some(egui::Key::Num2),
     Some(egui::Key::Num3),
     Some(egui::Key::Num4),
-    Some(egui::Key::R),
-    Some(egui::Key::O),
-    Some(egui::Key::C),
-    Some(egui::Key::Space),
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(egui::Key::D),
+    None, // Select(4)
+    None, // Select(5)
+    None, // Select(6)
+    None, // Select(7)
+    None, // Select(8)
+    None, // Select(9)
+    None, // Select(10)
+    None, // Select(11)
+    None, // Select(12)
+    None, // Select(13)
+    None, // Select(14)
+    None, // Select(15)
+    // Per-loop actions (record/overdub/clear/play × 16 loops): unbound by
+    // default — the user binds them in Settings → "Per loop bindings".
+    None, None, None, None, // Loop 1: rec / od / clear / play
+    None, None, None, None, // Loop 2
+    None, None, None, None, // Loop 3
+    None, None, None, None, // Loop 4
+    None, None, None, None, // Loop 5
+    None, None, None, None, // Loop 6
+    None, None, None, None, // Loop 7
+    None, None, None, None, // Loop 8
+    None, None, None, None, // Loop 9
+    None, None, None, None, // Loop 10
+    None, None, None, None, // Loop 11
+    None, None, None, None, // Loop 12
+    None, None, None, None, // Loop 13
+    None, None, None, None, // Loop 14
+    None, None, None, None, // Loop 15
+    None, None, None, None, // Loop 16
+    Some(egui::Key::D), // dependent mode
+    Some(egui::Key::M), // metronome on / off
+    None,               // select next loop
+    None,               // select previous loop
+];
+
+/// Metronome subdivisions: (clicks per beat, display name).
+const SUBDIVISIONS: [(u32, &str); 6] = [
+    (1, "quarter note"),
+    (2, "eighth note"),
+    (3, "triplet"),
+    (4, "sixteenth note"),
+    (6, "triplet eighths"),
+    (8, "thirty-second note"),
 ];
 
 /// Keys a user may plausibly bind to a shortcut.
@@ -200,6 +233,19 @@ pub struct App {
     q_bars: String,
     q_unit_is_bar: bool,
     q_result: Option<String>,
+    /// Quantize against the metronome grid instead of the root loop.
+    q_metro: bool,
+
+    // --- metronome ---
+    metro_on: bool,
+    /// Tempo in BPM (text field; parsed on apply).
+    metro_bpm: String,
+    /// Index into [`SUBDIVISIONS`].
+    metro_sub: usize,
+
+    // --- latency compensation ---
+    /// Output delay in ms (text field; applied via its own button).
+    latency_ms: String,
 
     // --- MIDI bindings: one slot per entry of MidiAction::ALL (25) ---
     midi_binds: [Option<MidiBind>; N_ACTIONS],
@@ -210,6 +256,18 @@ pub struct App {
     learning_slot: Option<usize>,
     /// MIDI slot currently capturing the next NOTE ON / CC / PC message, if any.
     midi_learning_slot: Option<usize>,
+    /// Remote MIDI source ports currently linked into simplooper:midi_in
+    /// (auto-detected; shown in the MIDI monitor).
+    midi_sources: Vec<String>,
+    /// True while the export prompt dialog is open.
+    show_export: bool,
+    /// Which loop the "Per loop bindings" dropdown points at (0-based).
+    bind_loop_sel: usize,
+    /// Export dialog state: whole-project toggle, destination path, format
+    /// index into `ExportFormat::ALL`.
+    export_whole: bool,
+    export_path: String,
+    export_fmt: usize,
 
     // --- dependent-mode ensemble length (in units of the longest loop) ---
     root_loops: u32,
@@ -226,17 +284,35 @@ impl App {
         // Load persisted settings (shortcuts, MIDI binds, root loops).
         let cfg = Config::load();
         let mut short_keys = core::array::from_fn(|i| SHORTCUT_DEFAULTS[i]);
-        // Old configs stored 9 slots in the legacy order (select 1–4, play/stop,
-        // record, overdub, clear, dependent); remap them onto the per-action
-        // table. Newer configs store one entry per MidiAction::ALL slot.
-        const OLD_TO_NEW: [usize; 9] = [0, 1, 2, 3, 7, 4, 5, 6, N_ACTIONS - 1];
-        if cfg.shortcuts.len() == 9 {
-            for (old, name) in cfg.shortcuts.iter().enumerate() {
-                short_keys[OLD_TO_NEW[old]] = name.as_deref().and_then(key_from_name);
+        // Legacy 9-slot order (select 1–4, play/stop, record, overdub, clear,
+        // dependent); remap onto the per-action table. Newer configs store one
+        // entry per MidiAction::ALL slot; v0.1.x stored the 25-slot layout
+        // (select 1–4, selected rec/od/clear/play, per-loop × 4 loops, dep).
+        const OLD9_TO_NEW: [usize; 9] = [6, 7, 8, 9, 3, 0, 1, 2, N_ACTIONS - 1];
+        let legacy25_to_new = |i: usize| match i {
+            0..=3 => 6 + i,          // Select(0..3)
+            4 => 0,                  // RecSelected
+            5 => 1,                  // OdSelected
+            6 => 2,                  // ClearSelected
+            7 => 3,                  // PlaySelected
+            8..=23 => 20 + (i - 8),  // per-loop actions for loops 0–3
+            _ => N_ACTIONS - 1,      // Dependent
+        };
+        match cfg.shortcuts.len() {
+            9 => {
+                for (old, name) in cfg.shortcuts.iter().enumerate() {
+                    short_keys[OLD9_TO_NEW[old]] = name.as_deref().and_then(key_from_name);
+                }
             }
-        } else {
-            for (i, name) in cfg.shortcuts.iter().enumerate().take(N_ACTIONS) {
-                short_keys[i] = name.as_deref().and_then(key_from_name);
+            25 => {
+                for (old, name) in cfg.shortcuts.iter().enumerate() {
+                    short_keys[legacy25_to_new(old)] = name.as_deref().and_then(key_from_name);
+                }
+            }
+            _ => {
+                for (i, name) in cfg.shortcuts.iter().enumerate().take(N_ACTIONS) {
+                    short_keys[i] = name.as_deref().and_then(key_from_name);
+                }
             }
         }
         let mut midi_binds = [None; N_ACTIONS];
@@ -282,10 +358,28 @@ impl App {
             q_bars: "2".into(),
             q_unit_is_bar: false,
             q_result: None,
+            q_metro: cfg.q_metro,
+            metro_on: false,
+            metro_bpm: cfg.metro_bpm.to_string(),
+            metro_sub: SUBDIVISIONS
+                .iter()
+                .position(|(c, _)| *c == cfg.metro_sub)
+                .unwrap_or(0),
+            latency_ms: if cfg.latency_ms == 0.0 {
+                "0".into()
+            } else {
+                format!("{}", cfg.latency_ms)
+            },
             midi_binds,
             short_keys,
             learning_slot: None,
             midi_learning_slot: None,
+            midi_sources: Vec::new(),
+            show_export: false,
+            bind_loop_sel: 0,
+            export_whole: false,
+            export_path: String::new(),
+            export_fmt: 0,
             root_loops,
             q_root: root_loops.to_string(),
             last_midi: None,
@@ -375,16 +469,28 @@ impl App {
             return; // swallow all keys while learning
         }
 
-        // Esc also cancels an armed MIDI listener.
-        if self.midi_learning_slot.is_some()
-            && ctx.input(|i| {
-                i.events.iter().any(|e| matches!(
-                    e,
-                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }
-                ))
-            })
-        {
-            self.midi_learning_slot = None;
+        // While a MIDI binding cell is listening, only Delete (clear the
+        // binding) and Escape (cancel) are valid — every other key is
+        // swallowed so it can neither fire an action nor rebind anything.
+        if let Some(slot) = self.midi_learning_slot {
+            let key = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(k) = key {
+                if k == egui::Key::Escape {
+                    self.midi_learning_slot = None;
+                } else if k == egui::Key::Delete {
+                    self.midi_binds[slot] = None;
+                    self.midi_learning_slot = None;
+                    self.save_config();
+                    self.status =
+                        format!("cleared MIDI binding: {}", MidiAction::ALL[slot].label());
+                }
+            }
+            return; // swallow all keys while a MIDI cell is listening
         }
 
         let pressed = |key: egui::Key| {
@@ -419,6 +525,8 @@ impl App {
             MidiAction::OdSelected => self.backend.cmd(Cmd::ToggleOverdub { i: self.selected }),
             MidiAction::ClearSelected => self.backend.cmd(Cmd::ClearTrack { i: self.selected }),
             MidiAction::PlaySelected => self.backend.cmd(Cmd::TogglePlay { i: self.selected }),
+            MidiAction::ImportSelected => self.import_loop(self.selected),
+            MidiAction::Export => self.show_export = true,
             MidiAction::RecLoop(i) => self.backend.cmd(Cmd::ToggleRecord { i }),
             MidiAction::OdLoop(i) => self.backend.cmd(Cmd::ToggleOverdub { i }),
             MidiAction::ClearLoop(i) => self.backend.cmd(Cmd::ClearTrack { i }),
@@ -427,7 +535,27 @@ impl App {
                 self.dependent = !self.dependent;
                 self.backend.cmd(Cmd::SetDependent(self.dependent));
             }
+            MidiAction::Metronome => {
+                self.metro_on = !self.metro_on;
+                self.send_metro();
+            }
+            MidiAction::SelectNext => self.selected = (self.selected + 1) % MAX_LOOPS,
+            MidiAction::SelectPrev => {
+                self.selected = (self.selected + MAX_LOOPS - 1) % MAX_LOOPS;
+            }
         }
+    }
+
+    /// Push the metronome state (toggle / tempo / subdivision) to the audio
+    /// thread and persist it. Tempo text that fails to parse keeps 120 BPM.
+    fn send_metro(&mut self) {
+        let bpm = self.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300);
+        self.backend.cmd(Cmd::SetMetro {
+            on: self.metro_on,
+            bpm,
+            sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
+        });
+        self.save_config();
     }
 
     /// Persist shortcuts, MIDI bindings and the ensemble length to disk.
@@ -443,6 +571,10 @@ impl App {
                 .collect(),
             root_loops: self.root_loops,
             gui_scale: self.gui_scale,
+            latency_ms: self.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0),
+            metro_bpm: self.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300),
+            metro_sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
+            q_metro: self.q_metro,
             // Only selections that were actually applied get persisted.
             ports_in: self.applied_ports.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
             ports_out: self.applied_ports.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
@@ -459,8 +591,11 @@ impl App {
                 self.client_name = Some(client_name.clone());
                 self.sample_rate = sample_rate;
                 self.status = "JACK ready — select ports, then Apply".into();
-                // Audio is up: apply the persisted ensemble length.
+                // Audio is up: apply the persisted ensemble length, latency
+                // compensation and metronome settings.
                 self.backend.cmd(Cmd::SetRootLoops(self.root_loops));
+                self.backend.cmd(Cmd::SetLatency { ms: self.latency_ms.trim().parse().unwrap_or(0.0) });
+                self.send_metro();
                 // Re-apply the port bindings persisted from the previous
                 // session so audio flows on launch without re-clicking
                 // "Apply Selection" (missing ports just fail to connect and
@@ -527,9 +662,66 @@ impl App {
                     }
                 }
             }
+            Evt::MidiSources(names) => {
+                self.midi_sources = names;
+            }
+            Evt::Notice(msg) => self.status = msg,
             Evt::Xrun => {}
             Evt::Error(e) => self.status = e,
         }
+    }
+
+    /// Import a recording into loop `i`: system file picker, then decode +
+    /// resample to engine rate on the GUI thread (fast enough for typical
+    /// takes), then hand the samples to the audio thread.
+    fn import_loop(&mut self, i: usize) {
+        if self.sample_rate == 0 {
+            self.status = "import: wait for JACK to be ready".into();
+            return;
+        }
+        let path = rfd::FileDialog::new()
+            .set_title("Import recording")
+            .add_filter(
+                "Audio",
+                &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif", "au", "wma"],
+            )
+            .pick_file();
+        let Some(p) = path else { return };
+        match crate::audio_io::decode_to_mono(&p, self.sample_rate) {
+            Ok(data) => {
+                self.backend.cmd(Cmd::ImportTrack { i, data });
+                self.status = format!(
+                    "imported {} → loop {}",
+                    p.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    i + 1
+                );
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Run the export configured in the dialog (see `export_window`).
+    fn do_export(&mut self) {
+        let path = std::path::PathBuf::from(self.export_path.trim());
+        if path.as_os_str().is_empty() {
+            self.status = "export: choose a destination first".into();
+            return;
+        }
+        let fmt = crate::audio_io::ExportFormat::ALL[self.export_fmt];
+        if self.export_whole {
+            // Whole-project export only exists in dependent mode — force it on.
+            if !self.dependent {
+                self.dependent = true;
+                self.backend.cmd(Cmd::SetDependent(true));
+                self.save_config();
+            }
+            self.backend.cmd(Cmd::ExportProject { path, fmt });
+        } else {
+            self.backend.cmd(Cmd::ExportTrack { i: self.selected, path, fmt });
+        }
+        self.show_export = false;
     }
 }
 
@@ -579,6 +771,9 @@ impl eframe::App for App {
         }
         midi_monitor(ui, self);
         central_panels(ui, self);
+        if self.show_export {
+            export_window(ui, self);
+        }
     }
 }
 
@@ -672,6 +867,26 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 });
                 ui.label(RichText::new("Scales the whole interface; applied live.").weak().small());
 
+                // ---- latency compensation ------------------------------------------
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("latency (ms):");
+                    let r = ui.add(egui::TextEdit::singleline(&mut app.latency_ms).desired_width(60.0));
+                    app.in_text_edit = app.in_text_edit || r.has_focus();
+                    if ui.button("Apply").clicked() {
+                        let ms = app.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0);
+                        app.latency_ms = format!("{ms}");
+                        app.backend.cmd(Cmd::SetLatency { ms });
+                        app.save_config();
+                        app.status = format!("latency compensation: {ms} ms");
+                    }
+                });
+                ui.label(
+                    RichText::new("Delays all output (monitoring, loops, metronome) to compensate for input/output latency.")
+                        .weak()
+                        .small(),
+                );
+
                 // ---- MIDI + keyboard bindings ------------------------------------
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -691,7 +906,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     RichText::new(
                         "Click a MIDI cell, then send a NOTE ON / CC / PROGRAM \
                          CHANGE from your controller — the first matching message \
-                         becomes that binding (click again or Esc to cancel). A bound \
+                         becomes that binding (click again or Esc to cancel; while \
+                         a MIDI cell listens, Delete clears its binding and no \
+                         other key does anything). A bound \
                          action fires on every matching message (value/velocity \
                          ignored). The key column works the same way: click, then \
                          press the new key (Esc cancels); keys are ignored while a \
@@ -700,16 +917,47 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     .weak()
                     .small(),
                 );
-                ui.label(RichText::new("selected track").weak().small());
-                for a in MidiAction::ALL.iter().take(8) {
-                    bind_row(ui, app, *a);
-                }
-                ui.label(RichText::new("direct loop actions").weak().small());
-                for a in MidiAction::ALL.iter().skip(8).take(16) {
-                    bind_row(ui, app, *a);
-                }
+                // Global: selected-track transport + file ops + mode. The old
+                // "selected track" section lives here now; per-loop actions are
+                // bound through the dropdown below instead of 64 rows.
                 ui.label(RichText::new("global").weak().small());
-                bind_row(ui, app, MidiAction::Dependent);
+                for a in [
+                    MidiAction::RecSelected,
+                    MidiAction::OdSelected,
+                    MidiAction::ClearSelected,
+                    MidiAction::PlaySelected,
+                    MidiAction::ImportSelected,
+                    MidiAction::Export,
+                    MidiAction::Dependent,
+                    MidiAction::Metronome,
+                    MidiAction::SelectNext,
+                    MidiAction::SelectPrev,
+                ] {
+                    bind_row(ui, app, a);
+                }
+                ui.label(RichText::new("per loop bindings").weak().small());
+                ui.horizontal(|ui| {
+                    ui.label("Loop");
+                    egui::ComboBox::from_id_salt("bind_loop_sel")
+                        .selected_text(format!("{}", app.bind_loop_sel + 1))
+                        .show_ui(ui, |ui| {
+                            for n in 0..MAX_LOOPS {
+                                ui.selectable_value(&mut app.bind_loop_sel, n, format!("{}", n + 1));
+                            }
+                        });
+                });
+                // The five rows below re-target the dropdown's loop; changing
+                // the selection swaps which slots they edit (labels update too).
+                for off in 0..5usize {
+                    let a = match off {
+                        0 => MidiAction::RecLoop(app.bind_loop_sel),
+                        1 => MidiAction::OdLoop(app.bind_loop_sel),
+                        2 => MidiAction::ClearLoop(app.bind_loop_sel),
+                        3 => MidiAction::PlayLoop(app.bind_loop_sel),
+                        _ => MidiAction::Select(app.bind_loop_sel),
+                    };
+                    bind_row(ui, app, a);
+                }
 
                 // ---- audio ports -------------------------------------------------
                 // Last on purpose: the long port lists used to push every other
@@ -809,6 +1057,81 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
 }
 
 /// Central dashboard: mode checkbox + four loop tracks.
+/// Export prompt (Export button / bound key): pick one loop or the whole
+/// project, plus destination file and format. Whole-project export forces
+/// dependent mode on before running — it only exists there.
+fn export_window(ui: &mut egui::Ui, app: &mut App) {
+    // Local copy so the closure can borrow `app` while `.open()` holds the
+    // window's open-state; written back after show.
+    let mut open = app.show_export;
+    let mut cancelled = false;
+    let mut done = false;
+    egui::Window::new(RichText::new("EXPORT").strong())
+        .open(&mut open)
+        .min_width(430.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new("What to export:").strong());
+            ui.radio_value(
+                &mut app.export_whole,
+                false,
+                format!("Loop {} (selected)", app.selected + 1),
+            );
+            ui.radio_value(&mut app.export_whole, true, "Whole project");
+            if app.export_whole {
+                ui.label(
+                    RichText::new(
+                        "⚠ Whole-project export only works in dependent mode — it will \
+                         be enabled automatically before exporting.",
+                    )
+                    .color(Color32::YELLOW),
+                );
+            }
+            ui.add_space(6.0);
+            ui.label("Destination:");
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut app.export_path).desired_width(290.0));
+                app.in_text_edit = app.in_text_edit || r.has_focus();
+                if ui.button("Browse…").clicked() {
+                    let fmt = crate::audio_io::ExportFormat::ALL[app.export_fmt];
+                    let name = if app.export_whole {
+                        format!("simplooper-project.{}", fmt.extension())
+                    } else {
+                        format!("simplooper-loop-{}.{}", app.selected + 1, fmt.extension())
+                    };
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title("Export destination")
+                        .set_file_name(name)
+                        .save_file()
+                    {
+                        app.export_path = p.to_string_lossy().into_owned();
+                    }
+                }
+            });
+            ui.label("Format:");
+            egui::ComboBox::from_id_salt("export_fmt")
+                .selected_text(crate::audio_io::ExportFormat::ALL[app.export_fmt].label())
+                .show_ui(ui, |ui| {
+                    for (k, f) in crate::audio_io::ExportFormat::ALL.iter().enumerate() {
+                        ui.selectable_value(&mut app.export_fmt, k, f.label());
+                    }
+                });
+            if crate::audio_io::ExportFormat::ALL[app.export_fmt].needs_ffmpeg() {
+                ui.label(RichText::new("MP3 / OGG encoding needs ffmpeg on PATH.").weak().small());
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+                if ui.button("Export").clicked() {
+                    app.do_export();
+                    done = true;
+                }
+            });
+        });
+    app.show_export = open && !cancelled && !done;
+}
+
 fn central_panels(ui: &mut egui::Ui, app: &mut App) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -838,6 +1161,9 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                 }
             }
             ui.separator();
+            if ui.button("Export").clicked() {
+                app.show_export = true;
+            }
             ui.label(
                 RichText::new("independent = each loop plays on its own clock").weak().small(),
             );
@@ -866,7 +1192,7 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                         .selected_text(format!("{}", app.q_root_loop + 1))
                         .show_ui(ui, |ui| {
                             for n in 0..MAX_LOOPS {
-                                ui.selectable_value(&mut app.q_root_loop, n, format!("{n}"));
+                                ui.selectable_value(&mut app.q_root_loop, n, format!("{}", n + 1));
                             }
                         });
                     ui.label(":");
@@ -875,6 +1201,14 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                     ui.label("quantize to:");
                     ui.radio_value(&mut app.q_unit_is_bar, false, "beat");
                     ui.radio_value(&mut app.q_unit_is_bar, true, "bar");
+                    let qm = ui.checkbox(&mut app.q_metro, "quantize to metronome").on_hover_text(
+                        "Use the metronome's tempo (below) plus the time signature above \
+                         as the grid instead of the root loop's length. 'bars in loop' \
+                         is unused in this mode.",
+                    );
+                    if qm.changed() {
+                        app.save_config();
+                    }
                     if ui.button("Quantize all loops").clicked() {
                         match (
                             app.q_num.parse::<u32>(),
@@ -889,6 +1223,8 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                                     bars: b,
                                     unit,
                                     root: app.q_root_loop,
+                                    metro: app.q_metro,
+                                    bpm: app.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300),
                                 });
                             }
                             _ => {
@@ -900,6 +1236,41 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                 if let Some(r) = &app.q_result {
                     ui.label(RichText::new(r).monospace().small());
                 }
+            });
+
+        // ---- metronome (click goes to outputs only — never recorded) ----
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(35, 40, 50))
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let m = ui.checkbox(&mut app.metro_on, "METRONOME").on_hover_text(
+                        "Click track: audible on all selected outputs but never \
+                         recorded into a loop. Toggle also on M (rebindable in \
+                         Settings).",
+                    );
+                    if m.changed() {
+                        app.send_metro();
+                    }
+                    ui.separator();
+                    ui.label("tempo");
+                    let r_bpm = ui.add(egui::TextEdit::singleline(&mut app.metro_bpm).desired_width(50.0));
+                    app.in_text_edit = app.in_text_edit || r_bpm.has_focus();
+                    if r_bpm.changed() && app.metro_bpm.trim().parse::<u32>().is_ok() {
+                        app.send_metro();
+                    }
+                    ui.label("BPM · subdivision");
+                    let sub = egui::ComboBox::from_id_salt("metro_sub")
+                        .selected_text(SUBDIVISIONS[app.metro_sub.min(SUBDIVISIONS.len() - 1)].1)
+                        .show_ui(ui, |ui| {
+                            for (n, (_, name)) in SUBDIVISIONS.iter().enumerate() {
+                                ui.selectable_value(&mut app.metro_sub, n, *name);
+                            }
+                        });
+                    if sub.response.changed() {
+                        app.send_metro();
+                    }
+                });
             });
 
         ui.label(
@@ -927,26 +1298,35 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
             None
         };
 
-        for &i in &order {
-            track_row(ui, app, i, dep_period);
-            ui.add_space(8.0);
-        }
+        // Scrollable so all 16 tracks stay reachable on small windows.
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for &i in &order {
+                track_row(ui, app, i, dep_period);
+                ui.add_space(8.0);
+            }
+        });
     });
 }
 
 /// One loop track: label + waveform + REC/OD/play/clear buttons. The row the
 /// keyboard shortcuts target (keys 1–4) is highlighted with a frame.
 fn track_row(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Option<u32>) {
-    // The selection is drawn as a bounding box around the row — no frame, no
-    // inner margin — so the waveform and buttons keep their exact size whether
-    // the loop is selected or not (the old framed version shrank the content).
-    let (_, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 96.0), Sense::hover());
+    // Lay the row out first, then stroke a bounding box around exactly the
+    // rect the content occupies: the blue box hugs the selected loop's own
+    // waveform and buttons — no separate widget, no extra vertical gap
+    // (a pre-allocated frame used to render as an empty box above the row).
+    let inner = ui.vertical(|ui| {
+        track_row_inner(ui, app, i, dep_period);
+    });
     if app.selected == i {
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(110, 165, 205));
-        ui.painter()
-            .rect_stroke(response.rect, 2.0, stroke, egui::StrokeKind::Middle);
+        ui.painter().rect_stroke(
+            inner.response.rect.expand(3.0),
+            2.0,
+            stroke,
+            egui::StrokeKind::Middle,
+        );
     }
-    track_row_inner(ui, app, i, dep_period);
 }
 
 fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Option<u32>) {
@@ -998,10 +1378,14 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         });
 
         // Middle: waveform of the recorded audio (reserve room for buttons).
-        let wave_w = (ui.available_width() - 250.0).clamp(60.0, f32::INFINITY);
+        // Clicking it selects this loop (the row's only click target).
+        let wave_w = (ui.available_width() - 330.0).clamp(60.0, f32::INFINITY);
         let eng = app.backend.engine.clone();
         let data = eng.read_range(i, len);
-        draw_wave(ui, &mut app.wave[i], len, state, eng.generation(), data, wave_w, playhead, dep_period);
+        let wave_resp = draw_wave(ui, &mut app.wave[i], len, state, eng.generation(), data, wave_w, playhead, dep_period);
+        if wave_resp.clicked() {
+            app.selected = i;
+        }
 
         // Right: transport buttons.
         let mut b_rec = egui::Button::new(RichText::new("● REC").monospace());
@@ -1045,6 +1429,13 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         if r_clr.clicked() {
             app.backend.cmd(Cmd::ClearTrack { i });
         }
+
+        let r_imp = ui
+            .add(egui::Button::new(RichText::new("⇩ IMP").monospace()))
+            .on_hover_text("Import a recording into this loop (I).");
+        if r_imp.clicked() {
+            app.import_loop(i);
+        }
     });
 }
 
@@ -1063,9 +1454,9 @@ fn draw_wave(
     w: f32,
     playhead: Option<f32>,
     period: Option<u32>,
-) {
+) -> egui::Response {
     let h = 60.0f32;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w.max(40.0), h), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w.max(40.0), h), Sense::click());
     let painter = ui.painter();
 
     let color = match state {
@@ -1202,10 +1593,10 @@ fn draw_wave(
     }
 
     resp.on_hover_text(format!(
-        "{} samples recorded{}",
+        "{} samples recorded{} — click to select this loop",
         len,
         period.map(|p| format!(" · ensemble of {p}")).unwrap_or_default()
-    ));
+    ))
 }
 
 /// Min/max per column with bounded stride sampling (fast even for 60 s buffers).
@@ -1308,13 +1699,22 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                 ui.label(RichText::new("waiting for MIDI input…").weak());
                 ui.label(
                     RichText::new(
-                        "the audio thread reads the JACK port simplooper:midi_in — \
-                         link your device to it (e.g. pw-link 'your-midi-port' \
-                         'simplooper:midi_in') and send a message",
+                        "the audio thread reads the JACK port simplooper:midi_in and \
+                         listens on every channel — link your device to it (e.g. \
+                         pw-link 'your-midi-port' 'simplooper:midi_in') and send a \
+                         message; new source ports appear below automatically",
                     )
                     .weak()
                     .small(),
                 );
+            }
+
+            if !app.midi_sources.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("sources linked to simplooper:midi_in").weak().small());
+                for s in &app.midi_sources {
+                    ui.label(RichText::new(format!("  {s}")).weak().small().monospace());
+                }
             }
 
             egui::ScrollArea::vertical()
