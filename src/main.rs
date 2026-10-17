@@ -1,6 +1,6 @@
 //! simplooper — a minimalist live audio looper for Linux (JACK / PipeWire).
 //!
-//! Four simultaneous loops with record/overdub/playback/clear, waveform
+//! Sixteen simultaneous loops with record/overdub/playback/clear, waveform
 //! dashboard, MIDI action mapping plus keyboard shortcuts, easy quantize,
 //! independent/dependent loop modes, live mix passthrough and a MIDI monitor.
 

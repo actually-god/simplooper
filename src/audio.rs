@@ -232,7 +232,7 @@ impl Drop for Backend {
     }
 }
 
-/// The loop engine: four pre-allocated recording buffers plus atomic
+/// The loop engine: sixteen pre-allocated recording buffers plus atomic
 /// per-track state/length, shared between the manager thread (commands) and
 /// the realtime handler (capture/playback).
 ///
@@ -718,6 +718,7 @@ fn run(
         peak: peak.clone(),
         engine: engine.clone(),
         prev_state: [TR_IDLE; MAX_LOOPS],
+        rec_full: 0,
         pos: [0u64; MAX_LOOPS],
         master_pos: 0,
         prev_mode: 0,
@@ -1314,6 +1315,10 @@ struct Proc {
     engine: Arc<LoopEngine>,
     // RT-local loop state (audio thread only).
     prev_state: [u8; MAX_LOOPS],
+    /// Tracks that hit LOOP_CAP while recording: suppresses the auto-stop
+    /// state store + LoopState event from re-firing on every remaining sample
+    /// of the block. Cleared on the track's next state edge.
+    rec_full: u16,
     /// Independent-mode play position per track.
     pos: [u64; MAX_LOOPS],
     /// Dependent-mode ensemble clock (samples since the ensemble started).
@@ -1375,7 +1380,17 @@ impl ProcessHandler for Proc {
             self.engine.len[i].load(Ordering::Relaxed)
         });
         let mode = self.engine.mode.load(Ordering::Relaxed);
-        let any_loop_active = st_now.iter().any(|&s| s != TR_IDLE);
+        // Compact list of the non-IDLE tracks: the sample loop iterates only
+        // these instead of all MAX_LOOPS slots per sample.
+        let mut active: [u8; MAX_LOOPS] = [0u8; MAX_LOOPS];
+        let mut nact = 0usize;
+        for (t, &s) in st_now.iter().enumerate() {
+            if s != TR_IDLE {
+                active[nact] = t as u8;
+                nact += 1;
+            }
+        }
+        let any_loop_active = nact > 0;
 
         if in_mask == 0 && out_mask == 0 && !any_loop_active {
             return Control::Continue; // nothing connected: idle
@@ -1395,6 +1410,8 @@ impl ProcessHandler for Proc {
             if prev == now {
                 continue;
             }
+            // Any state change re-arms the capacity auto-stop for this track.
+            self.rec_full &= !(1u16 << i);
             // A fresh start from IDLE/REC restarts the position; OD entered
             // from PLAY keeps playing where it left off.
             if (now == TR_PLAY || now == TR_OD) && prev != TR_PLAY && prev != TR_OD {
@@ -1403,27 +1420,34 @@ impl ProcessHandler for Proc {
             self.prev_state[i] = now;
         }
 
-        // Cache this cycle's input buffers (raw pointers are stable).
+        // Cache this cycle's input buffers (raw pointers are stable). Only
+        // the connected slots are kept, compacted to the front, so the sample
+        // loop iterates the live ones with no per-sample null checks.
         let mut in_bufs: [*const f32; MAX_SLOTS] = [std::ptr::null(); MAX_SLOTS];
-        for (s, b) in in_bufs.iter_mut().enumerate() {
+        let mut nin = 0usize;
+        for s in 0..MAX_SLOTS {
             if in_mask & (1u64 << s) != 0 {
                 let p = self.ports.ins[s];
                 if !p.is_null() {
-                    *b = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
+                    in_bufs[nin] = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
+                    nin += 1;
                 }
             }
         }
         // Cache output buffers too: the mix is computed once per sample and
         // written to every enabled slot.
         let mut out_bufs: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
-        for (s, b) in out_bufs.iter_mut().enumerate() {
+        let mut nout = 0usize;
+        for s in 0..MAX_SLOTS {
             if out_mask & (1u64 << s) != 0 {
                 let p = self.ports.outs[s];
                 if !p.is_null() {
-                    *b = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32 };
+                    out_bufs[nout] = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32 };
+                    nout += 1;
                 }
             }
         }
+        let (ins, outs) = (&in_bufs[..nin], &out_bufs[..nout]);
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
         // Metronome parameters for this cycle (click is added to the output
@@ -1465,9 +1489,10 @@ impl ProcessHandler for Proc {
         }
         let mut lmax = 0u64;
         if dependent {
-            for i in 0..MAX_LOOPS {
-                if st_now[i] == TR_PLAY || st_now[i] == TR_OD {
-                    lmax = lmax.max(lens[i] as u64);
+            for &ti in &active[..nact] {
+                let t = ti as usize;
+                if st_now[t] == TR_PLAY || st_now[t] == TR_OD {
+                    lmax = lmax.max(lens[t] as u64);
                 }
             }
         }
@@ -1481,10 +1506,8 @@ impl ProcessHandler for Proc {
         for i in 0..n {
             // Dry mix of the connected inputs.
             let mut dry = 0.0f32;
-            for b in &in_bufs {
-                if !b.is_null() {
-                    dry += unsafe { *b.add(i) };
-                }
+            for b in ins {
+                dry += unsafe { *b.add(i) };
             }
 
             // Loop engine step, shared by all output slots.
@@ -1492,13 +1515,17 @@ impl ProcessHandler for Proc {
             if any_loop_active {
                 // Ensemble position in dependent mode (before advancing).
                 let p = if period > 0 { self.master_pos % period } else { 0 };
-                for t in 0..MAX_LOOPS {
+                for &ti in &active[..nact] {
+                    let t = ti as usize;
                     let st = st_now[t];
                     if st == TR_REC {
                         // Contiguous capture from the start of the buffer.
-                        if self.engine.rec_sample(t, dry) {
+                        if self.engine.rec_sample(t, dry) && self.rec_full & (1u16 << t) == 0 {
                             // Capacity reached: stop capturing into this loop,
                             // keep playing (the buffer is full of content).
+                            // The bit guard keeps the remaining samples of
+                            // this block from re-firing the store + event.
+                            self.rec_full |= 1u16 << t;
                             self.engine.state[t].store(TR_PLAY, Ordering::Relaxed);
                             let (states, lens_snap) = loop_state(&self.engine);
                             let _ = self.tx.try_send(Evt::LoopState { states, lens: lens_snap });
@@ -1510,20 +1537,22 @@ impl ProcessHandler for Proc {
                                 // Repeat semantics: the recording tiles across
                                 // the whole ensemble period.
                                 let off = p % l;
-                                play += self.engine.read(t, off as u32);
-                                pos_now[t] = off;
+                                // One read serves playback and the overdub mix
+                                // (OD sums live input onto the take in place).
+                                let old = self.engine.read(t, off as u32);
+                                play += old;
                                 if st == TR_OD {
                                     // Additive overdub: layer the live input
                                     // on top of the existing recording at its
                                     // original level — never replace it.
-                                    let old = self.engine.read(t, off as u32);
                                     self.engine.write(t, off as u32, old + dry);
                                 }
+                                pos_now[t] = off;
                             } else {
                                 let off = self.pos[t] % l;
-                                play += self.engine.read(t, off as u32);
+                                let old = self.engine.read(t, off as u32);
+                                play += old;
                                 if st == TR_OD {
-                                    let old = self.engine.read(t, off as u32);
                                     self.engine.write(t, off as u32, old + dry);
                                 }
                                 pos_now[t] = off;
@@ -1633,10 +1662,8 @@ impl ProcessHandler for Proc {
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
             }
-            for b in out_bufs.iter() {
-                if !b.is_null() {
-                    unsafe { *b.add(i) = out };
-                }
+            for b in outs {
+                unsafe { *b.add(i) = out };
             }
         }
         // Continuous ensemble: at the period end the clock simply wraps and

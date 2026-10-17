@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Simplooper
-Comment=Lightweight JACK step looper with MIDI and keyboard control
+Comment=Lightweight JACK audio looper with MIDI and keyboard control
 Exec=simplooper
 Icon=simplooper
 Terminal=false

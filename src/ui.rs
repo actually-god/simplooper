@@ -3,7 +3,7 @@
 //! Layout:
 //! - top bar: hamburger (settings), status, xruns, peak meter, master gain
 //! - left side panel (optional): audio ports, MIDI + keyboard bindings, easy quantize
-//! - central: independent/dependent mode checkbox + four loop tracks, each
+//! - central: independent/dependent mode checkbox + sixteen loop tracks, each
 //!   with a waveform of the recorded audio and REC / OD / play / clear buttons
 //! - bottom: MIDI monitor
 
@@ -28,13 +28,18 @@ struct MidiLine {
     raw_hex: String,
 }
 
-/// Cached min/max columns for one track's waveform (invalidated by length or
-/// content generation changes). `peak` is the exact loudest sample so the
-/// display can always be "maxed out" at full scale.
+/// Cached min/max columns for one track's waveform (invalidated by length,
+/// content generation, width or ensemble-period changes — the dependent-mode
+/// tiled view is cached too, so no per-frame buffer scans while playing).
+/// `peak` is the loudest sampled sample (stride-sampled like the columns, so
+/// rebuilding stays cheap even while a 60 s take records), letting the
+/// display normalize "maxed out" recordings to full scale.
 struct WaveCache {
     len: u32,
     gen: u64,
     cols: usize,
+    /// Ensemble period the columns were tiled over (0 = single copy).
+    period: u64,
     data: Vec<[f32; 2]>,
     peak: f32,
 }
@@ -522,14 +527,19 @@ impl App {
             return; // swallow all keys while a MIDI cell is listening
         }
 
-        let pressed = |key: egui::Key| {
-            ctx.input(|i| {
-                i.events.iter().any(|e| matches!(
-                    e,
-                    egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key
-                ))
-            })
-        };
+        // Collect this frame's key presses in ONE input pass (the old
+        // per-slot closure locked the input state up to N_ACTIONS times per
+        // frame). Press edges come from the event list so auto-repeat never
+        // re-fires an action.
+        let pressed_keys: Vec<egui::Key> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        });
 
         // Slot order matters: selection slots fire first so transport actions
         // in the same frame see the updated selection. Keys are unique across
@@ -537,7 +547,7 @@ impl App {
         // physical key.
         for i in 0..N_ACTIONS {
             if let Some(k) = self.short_keys[i] {
-                if pressed(k) {
+                if pressed_keys.contains(&k) {
                     self.fire_midi_action(MidiAction::ALL[i]);
                 }
             }
@@ -719,10 +729,7 @@ impl App {
         }
         let path = rfd::FileDialog::new()
             .set_title("Import recording")
-            .add_filter(
-                "Audio",
-                &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif", "au", "wma"],
-            )
+            .add_filter("Audio", crate::audio_io::IMPORT_EXTENSIONS)
             .pick_file();
         let Some(p) = path else { return };
         match crate::audio_io::decode_to_mono(&p, self.sample_rate) {
@@ -1102,7 +1109,7 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
     });
 }
 
-/// Central dashboard: mode checkbox + four loop tracks.
+/// Central dashboard: mode checkbox + the loop track rows.
 /// Export prompt (Export button / bound key): pick one loop or the whole
 /// project, plus destination file and format. Whole-project export forces
 /// dependent mode on before running — it only exists there.
@@ -1578,76 +1585,44 @@ fn draw_wave(
     );
 
     if len > 0 {
-        // Per-track peak normalization: the recording's exact loudest sample is
-        // "maxed out" at full scale, so quiet recordings are as legible as loud
-        // ones. Full scan, memoized in the cache (rebuilt only when length,
-        // content generation or width changes).
+        // Per-track peak normalization: the (stride-sampled) loudest sample is
+        // "maxed out" at full scale, so quiet recordings are as legible as
+        // loud ones. Columns and peak are memoized together and rebuilt only
+        // when length, content generation, width or the ensemble period
+        // change — while playing (50 fps) this path is pure rendering.
         let n = len as usize;
         let cols = (rect.width() / 2.0).max(1.0) as usize;
+        let period_samples = period.unwrap_or(len) as u64;
         let need = match cache {
-            Some(c) => c.len != len || c.gen != gen || c.cols != cols,
+            Some(c) => c.len != len || c.gen != gen || c.cols != cols || c.period != period_samples,
             None => true,
         };
         if need {
+            let stride = (n / (cols * 8)).max(1);
             let mut peak = 0f32;
-            for &v in data.iter() {
+            for &v in data.iter().step_by(stride) {
                 let a = v.abs();
                 if a > peak {
                     peak = a;
                 }
             }
-            *cache = Some(WaveCache { len, gen, cols, data: wave_cols(data, cols), peak });
+            let data_cols = if period_samples <= n as u64 {
+                wave_cols(data, cols)
+            } else {
+                wave_cols_tiled(data, cols, period_samples)
+            };
+            *cache = Some(WaveCache { len, gen, cols, period: period_samples, data: data_cols, peak });
         }
         let scale = match cache {
             Some(c) if c.peak > 1e-6 => (rect.height() / 2.0 - 2.0) / c.peak,
             _ => 0.0,
         };
 
-        let period_samples = period.unwrap_or(len) as u64;
-        if period_samples <= n as u64 {
-            // Single copy: cached min/max columns over the recorded region.
-            if let Some(c) = cache {
-                let colw = rect.width() / c.cols.max(1) as f32;
-                for (k, [mn, mx]) in c.data.iter().enumerate() {
-                    let top = (mid - mx * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
-                    let bot = (mid - mn * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
-                    let x = rect.min.x + k as f32 * colw;
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(x, top.min(bot)),
-                            egui::vec2(colw.max(1.0) - 0.5, (bot - top).max(1.0)),
-                        ),
-                        0.0,
-                        color,
-                    );
-                }
-            }
-        } else {
-            // Dependent stacked view: the recording repeats (tiles) across the
-            // ensemble period — the same wrap as playback (`p % len`). A
-            // separator bar marks every repeat boundary, including on the root
-            // track when it repeats (root loops > 1).
-            let n64 = n as u64;
-            let colw = rect.width() / cols.max(1) as f32;
-            for k in 0..cols {
-                let p0 = k as u64 * period_samples / cols as u64;
-                let p1 = ((k + 1) as u64 * period_samples / cols as u64).max(p0 + 1);
-                let mut mn = 0f32;
-                let mut mx = 0f32;
-                let stride = ((p1 - p0) / 8).max(1);
-                let mut k2 = p0;
-                while k2 < p1 {
-                    // Wrap within the recording: every pixel column maps to a
-                    // sample of the (repeating) loop, never to silence.
-                    let v = data[(k2 % n64) as usize];
-                    if v < mn {
-                        mn = v;
-                    }
-                    if v > mx {
-                        mx = v;
-                    }
-                    k2 += stride;
-                }
+        // Cached min/max columns — single copy, or the recording tiled across
+        // the ensemble period (the same wrap as playback, `p % len`).
+        if let Some(c) = cache {
+            let colw = rect.width() / c.cols.max(1) as f32;
+            for (k, [mn, mx]) in c.data.iter().enumerate() {
                 let top = (mid - mx * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
                 let bot = (mid - mn * scale).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
                 let x = rect.min.x + k as f32 * colw;
@@ -1660,7 +1635,12 @@ fn draw_wave(
                     color,
                 );
             }
-            // Separator bars at each repeat boundary m * len (m >= 1).
+        }
+        if period_samples > n as u64 {
+            // Dependent stacked view: separator bars at every repeat boundary
+            // m * len (m >= 1), including on the root track when it repeats
+            // (root loops > 1).
+            let n64 = n as u64;
             let mut m = 1u64;
             while m * n64 < period_samples {
                 let p = m * n64;
@@ -1714,6 +1694,39 @@ fn wave_cols(buf: &[f32], cols: usize) -> Vec<[f32; 2]> {
         let mut k = lo;
         while k < hi {
             let v = buf[k];
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+            k += stride;
+        }
+        *col = [mn, mx];
+    }
+    out
+}
+
+/// Min/max per column for the dependent-mode tiled view: each column covers a
+/// window of the ensemble period, sampled modulo the recording length — every
+/// pixel column maps to a sample of the (repeating) loop, never to silence.
+/// Same bounded stride sampling as [`wave_cols`], so the whole tiled view is
+/// computed once per cache rebuild instead of once per frame.
+fn wave_cols_tiled(buf: &[f32], cols: usize, period: u64) -> Vec<[f32; 2]> {
+    let n = buf.len() as u64;
+    if n == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<[f32; 2]> = vec![[0.0, 0.0]; cols];
+    for (c, col) in out.iter_mut().enumerate() {
+        let p0 = c as u64 * period / cols as u64;
+        let p1 = ((c + 1) as u64 * period / cols as u64).max(p0 + 1);
+        let mut mn = 0f32;
+        let mut mx = 0f32;
+        let stride = ((p1 - p0) / 8).max(1);
+        let mut k = p0;
+        while k < p1 {
+            let v = buf[(k % n) as usize];
             if v < mn {
                 mn = v;
             }

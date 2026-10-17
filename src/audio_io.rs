@@ -1,9 +1,9 @@
 //! Audio file import/export for loop recordings.
 //!
-//! Import decodes the common formats (WAV, MP3, OGG, FLAC, M4A) with symphonia,
-//! downmixes to mono and resamples to the engine rate with rubato. Export writes
-//! WAV and FLAC natively; MP3/OGG are encoded through a system `ffmpeg` when one
-//! is installed.
+//! Import decodes the formats listed in [`IMPORT_EXTENSIONS`] with symphonia
+//! (WAV, MP3, OGG, FLAC, M4A/AAC, AIFF), downmixes to mono and resamples to
+//! the engine rate with rubato. Export writes WAV and FLAC natively; MP3/OGG
+//! are encoded through a system `ffmpeg` when one is installed.
 
 use std::fs::File;
 use std::path::Path;
@@ -20,8 +20,12 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// File extensions offered in the import dialog (symphonia decoders).
-pub const IMPORT_EXTENSIONS: &[&str] = &["wav", "mp3", "ogg", "flac", "m4a"];
+/// File extensions offered in the import dialog — exactly the formats the
+/// enabled symphonia decoders handle (see Cargo.toml features). The dialog
+/// filter and the probe hint both come from this list, so a format is never
+/// offered unless it can actually be decoded.
+pub const IMPORT_EXTENSIONS: &[&str] =
+    &["wav", "mp3", "ogg", "oga", "flac", "m4a", "aac", "aiff", "aif"];
 
 /// Export formats. WAV/FLAC are pure-Rust; MP3/OGG need a system ffmpeg.
 #[derive(Clone, Copy, PartialEq)]
@@ -101,13 +105,17 @@ pub fn decode_to_mono(path: &Path, target_rate: u32) -> Result<Vec<f32>, String>
         buf.convert(&mut dest);
         let n_chans = dest.spec().channels.count();
         let frames = dest.frames() as usize;
+        // Hoist the channel plane slices out of the frame loop and turn the
+        // per-sample divide into one reciprocal multiply.
+        let chans: Vec<&[f32]> = (0..n_chans).map(|c| dest.chan(c)).collect();
+        let inv = 1.0 / n_chans as f32;
         mono.reserve(mono.len() + frames);
         for f in 0..frames {
             let mut acc = 0.0f32;
-            for ch in 0..n_chans {
-                acc += dest.chan(ch)[f];
+            for ch in &chans {
+                acc += ch[f];
             }
-            mono.push(acc / n_chans as f32);
+            mono.push(acc * inv);
         }
     }
 
