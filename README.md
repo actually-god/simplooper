@@ -18,18 +18,23 @@ binding, independent/dependent loop modes, and an easy quantize tool.
   resurrected.
 - **Dashboard** — the main window is a scrollable stack of sixteen track rows,
   each showing the recorded waveform plus REC / OD / PLAY / CLEAR / IMPORT
-  buttons.
+  buttons. Every row also carries per-loop **volume** and **gain** sliders
+  with live dB readouts (volume: 0 = −∞ … 127 = 0 dB; gain: 80 = 0 dB,
+  127 = +10 dB) trimming that loop's playback — recorded audio itself is
+  never re-leveled.
 - **Settings menu** — the three-bar (hamburger) button in the top-left opens
-  the settings panel: input/output port selection, master gain, and per-action
-  MIDI + keyboard bindings. Port selections are persisted between sessions and
-  automatically re-applied when JACK comes up, so audio flows on launch without
-  re-selecting.
+  the settings panel: input/output port selection, master gain, latency
+  compensation, and per-action MIDI + keyboard bindings. Port selections are
+  persisted between sessions and automatically re-applied when JACK comes up,
+  so audio flows on launch without re-selecting.
 - **MIDI binding** — every action (loop select, record/overdub/clear/play-stop
   on the selected loop, direct per-loop controls, dependent toggle) can be
   bound to a live-captured Note On/Off, CC, or Program Change (channel +
   note/controller/program). Bindings are recorded by clicking the cell and
   sending a message; velocity/CC value is ignored so pedals and knobs fire
-  anywhere. All bindings persist between sessions.
+  anywhere — except the per-loop *volume (knob)* / *gain (knob)* bindings,
+  which read the message value (0–127: 0 = off/−∞, 127 = max). All bindings
+  persist between sessions.
 - **Keyboard shortcuts** — keys `1`–`4` select a loop (the selected row is
   highlighted); `space` play/stop, `R` record, `O` overdub, `C` clear act on
   the selected loop; `D` toggles dependent mode; `M` toggles the metronome;
@@ -53,6 +58,11 @@ binding, independent/dependent loop modes, and an easy quantize tool.
   incoming event is parsed and shown in the bottom panel and on stdout.
 - **Live mix passthrough** — selected inputs are summed × master gain into
   selected outputs, independent of the loop engine.
+- **Latency compensation** — the settings panel's *latency (ms)* delays the
+  INCOMING signal (recording + monitoring) so your playing lands on the
+  already-recorded loop grid; the output mix (loops, metronome, monitors)
+  stays exactly on grid. Use it to cancel the fixed input delay of an
+  interface/DAW chain without shifting the loops themselves.
 
 ## Requirements
 
@@ -95,7 +105,9 @@ Send events into `simplooper:midi_in` (hardware via PipeWire, or
 cell next to any action — it turns blue and shows *listening…* — then send a
 Note On/Off, CC, or Program Change; the first matching message becomes the
 binding (the second data byte — velocity / CC value — is ignored, so pedals and
-knobs fire anywhere). Click the cell again or press `Esc` to cancel without
+knobs fire anywhere; the per-loop *volume (knob)* / *gain (knob)* bindings are
+the exception — they act on the value, 0 = silence/−∞ up to 127 = max).
+Click the cell again or press `Esc` to cancel without
 changing anything; while a cell is listening, `Del` clears that binding.
 **Reset to defaults** restores the factory key bindings.
 

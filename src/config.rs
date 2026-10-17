@@ -39,10 +39,19 @@ pub struct Config {
     /// GUI zoom factor (egui `zoom_factor`): 1.0 = default UI size, >1 larger.
     #[serde(default = "default_gui_scale")]
     pub gui_scale: f32,
-    /// Input/output latency compensation in milliseconds: the whole output
-    /// mix (monitoring + loops + metronome) is delayed by this much.
+    /// Input latency compensation in milliseconds: the incoming signal is
+    /// delayed by this much before recording/monitoring, so the dry path
+    /// lines up with already-recorded loops; the output mix stays on grid.
     #[serde(default)]
     pub latency_ms: f32,
+    /// Per-loop playback volume, MIDI-knob style (0..=127; 0 = -inf, 127 =
+    /// 0 dB). Missing entries fall back to 127.
+    #[serde(default)]
+    pub trk_vol: Vec<u8>,
+    /// Per-loop gain trim, MIDI-knob style (0..=127; 0 = -inf, 80 = 0 dB,
+    /// 127 = +10 dB). Missing entries fall back to 80 (unity).
+    #[serde(default)]
+    pub trk_gain: Vec<u8>,
     /// Metronome tempo in BPM.
     #[serde(default = "default_metro_bpm")]
     pub metro_bpm: u32,
@@ -70,6 +79,8 @@ impl Default for Config {
             ports_out: Vec::new(),
             gui_scale: default_gui_scale(),
             latency_ms: 0.0,
+            trk_vol: Vec::new(),
+            trk_gain: Vec::new(),
             metro_bpm: default_metro_bpm(),
             metro_sub: default_metro_sub(),
             metro_num: default_metro_num(),
@@ -160,6 +171,8 @@ mod tests {
             metro_sub: 3,
             metro_num: 7,
             q_metro: true,
+            trk_vol: vec![127, 100],
+            trk_gain: vec![80, 60],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -174,6 +187,8 @@ mod tests {
         assert!(back.q_metro);
         assert_eq!(back.ports_in, cfg.ports_in);
         assert_eq!(back.ports_out, cfg.ports_out);
+        assert_eq!(back.trk_vol, cfg.trk_vol);
+        assert_eq!(back.trk_gain, cfg.trk_gain);
     }
 
     #[test]
@@ -188,5 +203,9 @@ mod tests {
         let back: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(back.root_loops, 1);
         assert!(back.midi.is_empty());
+        // Per-loop levels are #[serde(default)] — old configs load as empty
+        // and App::new falls them back to 127 (vol) / 80 (gain).
+        assert!(back.trk_vol.is_empty());
+        assert!(back.trk_gain.is_empty());
     }
 }

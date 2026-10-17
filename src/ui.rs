@@ -101,6 +101,24 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = [
     None,               // select previous loop
     Some(egui::Key::U), // undo last overdub
     Some(egui::Key::Y), // redo last undone overdub
+    // Per-loop volume / gain (loops 1–16, interleaved): value-driven from
+    // MIDI knobs — a keyboard press carries no value, so never key-bound.
+    None, None, // Loop 1: volume / gain
+    None, None, // Loop 2
+    None, None, // Loop 3
+    None, None, // Loop 4
+    None, None, // Loop 5
+    None, None, // Loop 6
+    None, None, // Loop 7
+    None, None, // Loop 8
+    None, None, // Loop 9
+    None, None, // Loop 10
+    None, None, // Loop 11
+    None, None, // Loop 12
+    None, None, // Loop 13
+    None, None, // Loop 14
+    None, None, // Loop 15
+    None, None, // Loop 16
 ];
 
 /// Metronome subdivisions: (clicks per beat, display name).
@@ -200,6 +218,43 @@ fn key_from_name(s: &str) -> Option<egui::Key> {
     KEY_CANDIDATES.iter().find(|k| format!("{k:?}") == s).copied()
 }
 
+// --- per-loop level controls ---------------------------------------------
+// MIDI knobs/sliders send 0..=127. Both mappings anchor 0 at silence
+// (-inf dB); the sliders in each track row show the resulting dB.
+
+/// MIDI value that maps to 0 dB on the per-loop gain slider.
+pub const GAIN_UNITY_MIDI: u8 = 80;
+
+/// Volume mapping: 0 = silence, 127 = 0 dB, ~0.47 dB per step down from
+/// there (~-60 dB at 1) — linear in dB so the slider feels even.
+pub fn vol_amp(v: u8) -> f32 {
+    if v == 0 {
+        0.0
+    } else {
+        10f32.powf((127 - v as i32) as f32 * (-60.0 / 127.0) / 20.0)
+    }
+}
+
+/// Gain-trim mapping: 0 = silence, 80 = 0 dB, 127 = +10 dB
+/// (~0.215 dB per step; below 80 it attenuates toward -inf at 1).
+pub fn gain_amp(v: u8) -> f32 {
+    if v == 0 {
+        0.0
+    } else {
+        let db = (v as i32 - GAIN_UNITY_MIDI as i32) as f32 * 0.215;
+        10f32.powf(db / 20.0)
+    }
+}
+
+/// dB display string ("  +0.0 dB", "-12.3 dB", "-inf dB").
+pub fn db_str(amp: f32) -> String {
+    if amp <= 0.0 {
+        "-inf dB".into()
+    } else {
+        format!("{:+.1} dB", 20.0 * amp.log10())
+    }
+}
+
 pub struct App {
     backend: Backend,
 
@@ -216,6 +271,15 @@ pub struct App {
     /// with the config so it can be restored on the next launch.
     applied_ports: Option<(Vec<String>, Vec<String>)>,
     gain: f32,
+    /// Per-loop playback volume, MIDI-knob style (0..=127; 0 = -inf, 127 =
+    /// 0 dB). Applied to each loop's contribution to the mix.
+    trk_vol: [u8; MAX_LOOPS],
+    /// Per-loop gain trim, MIDI-knob style (0..=127; 0 = -inf, 80 = 0 dB).
+    trk_gain: [u8; MAX_LOOPS],
+    /// Level sliders / MIDI knobs moved since the last config write; flushed
+    /// by `ui()` once the pointer is released (knob spam must not thrash the
+    /// disk).
+    levels_dirty: bool,
     /// GUI zoom factor (Settings → GUI); 1.0 = default UI size.
     gui_scale: f32,
 
@@ -256,10 +320,12 @@ pub struct App {
     metro_sub: usize,
 
     // --- latency compensation ---
-    /// Output delay in ms (text field; applied via its own button).
+    /// Input delay in ms (text field; applied via its own button). Delays the
+    /// incoming signal (recording + monitoring) so playing lands on the loop
+    /// grid; the output mix itself is never delayed.
     latency_ms: String,
 
-    // --- MIDI bindings: one slot per entry of MidiAction::ALL (25) ---
+    // --- MIDI bindings: one slot per entry of MidiAction::ALL ---
     midi_binds: [Option<MidiBind>; N_ACTIONS],
 
     // --- rebindable keyboard shortcuts (one slot per MidiAction::ALL entry) ---
@@ -333,6 +399,16 @@ impl App {
                 midi_binds[MidiAction::idx(b.action)] = b.bind;
             }
         }
+        // Per-loop levels: pad the persisted vectors (older configs have
+        // none) and push the restored values into the audio engine — the
+        // engine atomics are the live source of truth for the RT thread.
+        let trk_vol = core::array::from_fn(|i| cfg.trk_vol.get(i).copied().unwrap_or(127));
+        let trk_gain =
+            core::array::from_fn(|i| cfg.trk_gain.get(i).copied().unwrap_or(GAIN_UNITY_MIDI));
+        for t in 0..MAX_LOOPS {
+            backend.engine.set_loop_vol(t, vol_amp(trk_vol[t]));
+            backend.engine.set_loop_gain(t, gain_amp(trk_gain[t]));
+        }
         let root_loops = cfg.root_loops.clamp(1, 64);
         // Restore the last applied port selections so the user doesn't have to
         // re-check the same ports on every launch.
@@ -356,6 +432,9 @@ impl App {
             applied: None,
             applied_ports,
             gain: 1.0,
+            trk_vol,
+            trk_gain,
+            levels_dirty: false,
             gui_scale: cfg.gui_scale.clamp(0.7, 1.6),
             show_settings: false,
             dependent: false,
@@ -584,7 +663,22 @@ impl App {
             }
             MidiAction::UndoOverdub => self.backend.cmd(Cmd::UndoOverdub),
             MidiAction::RedoOverdub => self.backend.cmd(Cmd::RedoOverdub),
+            // Value-driven knob actions fire only through the MIDI path
+            // (handle_evt passes the CC value); a key press has no value.
+            MidiAction::VolLoop(_) | MidiAction::GainLoop(_) => {}
         }
+    }
+
+    /// Set loop `i`'s playback volume from a MIDI-range value (0..=127).
+    fn set_trk_vol(&mut self, i: usize, v: u8) {
+        self.trk_vol[i] = v;
+        self.backend.engine.set_loop_vol(i, vol_amp(v));
+    }
+
+    /// Set loop `i`'s gain trim from a MIDI-range value (0..=127).
+    fn set_trk_gain(&mut self, i: usize, v: u8) {
+        self.trk_gain[i] = v;
+        self.backend.engine.set_loop_gain(i, gain_amp(v));
     }
 
     /// Push the metronome state (play/stop / tempo / beats per measure /
@@ -622,6 +716,8 @@ impl App {
             // Only selections that were actually applied get persisted.
             ports_in: self.applied_ports.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
             ports_out: self.applied_ports.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
+            trk_vol: self.trk_vol.to_vec(),
+            trk_gain: self.trk_gain.to_vec(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[simplooper] could not save config: {e}");
@@ -685,9 +781,33 @@ impl App {
                             }
                             self.midi_learning_slot = None;
                         } else {
+                            // Value for continuous (knob) bindings: the CC
+                            // byte, or note velocity when the note binds.
+                            let cval = match &msg {
+                                MidiMsg::ControlChange { value, .. } => Some(*value),
+                                MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
+                                    Some(*velocity)
+                                }
+                                _ => None,
+                            };
                             for i in 0..N_ACTIONS {
                                 if self.midi_binds[i] == Some(bind) {
-                                    self.fire_midi_action(MidiAction::ALL[i]);
+                                    let a = MidiAction::ALL[i];
+                                    match a {
+                                        MidiAction::VolLoop(t) => {
+                                            if let Some(v) = cval {
+                                                self.set_trk_vol(t, v);
+                                                self.levels_dirty = true;
+                                            }
+                                        }
+                                        MidiAction::GainLoop(t) => {
+                                            if let Some(v) = cval {
+                                                self.set_trk_gain(t, v);
+                                                self.levels_dirty = true;
+                                            }
+                                        }
+                                        _ => self.fire_midi_action(a),
+                                    }
                                 }
                             }
                         }
@@ -806,6 +926,14 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
         // Push the gain slider value into the audio thread (f32 as bits).
         self.backend.gain.store(self.gain.to_bits(), Ordering::Relaxed);
+
+        // Flush per-loop level changes to the config once the control is
+        // released: sliders fire per pixel and MIDI knobs per message, so
+        // saving on every change would thrash the disk.
+        if self.levels_dirty && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.levels_dirty = false;
+            self.save_config();
+        }
 
         // Recomputed by the text-edit widgets below while they have focus.
         self.in_text_edit = false;
@@ -927,7 +1055,13 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
                 ui.label(
-                    RichText::new("Delays all output (monitoring, loops, metronome) to compensate for input/output latency.")
+                    RichText::new(
+                        "Delays the INCOMING signal (recording + monitoring) so your playing \
+                         lands on the already-recorded loop grid; the output mix (loops, \
+                         metronome, monitors) stays exactly on grid. Use it to cancel the \
+                         fixed input delay of your interface/DAW chain — negative problems \
+                         from output-side delay are gone: loops never drift.",
+                    )
                         .weak()
                         .small(),
                 );
@@ -994,15 +1128,19 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                             }
                         });
                 });
-                // The five rows below re-target the dropdown's loop; changing
-                // the selection swaps which slots they edit (labels update too).
-                for off in 0..5usize {
+                // The rows below re-target the dropdown's loop; changing the
+                // selection swaps which slots they edit (labels update too).
+                // Volume/gain are knob bindings: the action fires with the
+                // message VALUE (0..=127), so only CC / note-on drives them.
+                for off in 0..7usize {
                     let a = match off {
                         0 => MidiAction::RecLoop(app.bind_loop_sel),
                         1 => MidiAction::OdLoop(app.bind_loop_sel),
                         2 => MidiAction::ClearLoop(app.bind_loop_sel),
                         3 => MidiAction::PlayLoop(app.bind_loop_sel),
-                        _ => MidiAction::Select(app.bind_loop_sel),
+                        4 => MidiAction::Select(app.bind_loop_sel),
+                        5 => MidiAction::VolLoop(app.bind_loop_sel),
+                        _ => MidiAction::GainLoop(app.bind_loop_sel),
                     };
                     bind_row(ui, app, a);
                 }
@@ -1543,6 +1681,43 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
             app.import_loop(i);
         }
     });
+
+    // Per-loop level line: playback volume (0 = -inf, 127 = 0 dB) and gain
+    // trim (0 = -inf, 80 = 0 dB, 127 = +10 dB), both shown in dB. Each is
+    // bindable to a MIDI knob in Settings → per loop bindings.
+    ui.horizontal(|ui| {
+        let sw = ((ui.available_width() - 190.0) / 2.0).max(60.0);
+        ui.label(
+            RichText::new(format!("vol  {:>8}", db_str(vol_amp(app.trk_vol[i]))))
+                .monospace()
+                .small(),
+        );
+        let mut v = app.trk_vol[i];
+        let rv = ui
+            .add_sized(egui::vec2(sw, 0.0), Slider::new(&mut v, 0..=127).text(" "))
+            .on_hover_text(
+                "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+            );
+        if rv.changed() {
+            app.set_trk_vol(i, v);
+            app.levels_dirty = true;
+        }
+        ui.label(
+            RichText::new(format!("gain {:>8}", db_str(gain_amp(app.trk_gain[i]))))
+                .monospace()
+                .small(),
+        );
+        let mut g = app.trk_gain[i];
+        let rg = ui
+            .add_sized(egui::vec2(sw, 0.0), Slider::new(&mut g, 0..=127).text(" "))
+            .on_hover_text(
+                "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+            );
+        if rg.changed() {
+            app.set_trk_gain(i, g);
+            app.levels_dirty = true;
+        }
+    });
 }
 
 /// Draw a track's waveform, scaled to the track's own peak so quiet recordings
@@ -1927,15 +2102,53 @@ mod tests {
     }
 
     #[test]
-    fn undo_redo_slots_are_appended_with_default_keys() {
-        // The persisted shortcut table is positional: undo/redo must live at
-        // the END of MidiAction::ALL (never inserted), bound to U / Y.
-        let n = N_ACTIONS;
-        assert_eq!(MidiAction::ALL[n - 2], MidiAction::UndoOverdub);
-        assert_eq!(MidiAction::ALL[n - 1], MidiAction::RedoOverdub);
-        assert_eq!(SHORTCUT_DEFAULTS[n - 2], Some(egui::Key::U));
-        assert_eq!(SHORTCUT_DEFAULTS[n - 1], Some(egui::Key::Y));
+    fn undo_redo_slots_keep_their_positions_when_knobs_are_appended() {
+        // The persisted shortcut table is positional: undo/redo must keep
+        // their original slots even though the per-loop volume/gain knobs
+        // now extend the end of MidiAction::ALL (92-entry table: 90/91).
+        assert_eq!(MidiAction::idx(MidiAction::UndoOverdub), 90);
+        assert_eq!(MidiAction::idx(MidiAction::RedoOverdub), 91);
+        assert_eq!(SHORTCUT_DEFAULTS[90], Some(egui::Key::U));
+        assert_eq!(SHORTCUT_DEFAULTS[91], Some(egui::Key::Y));
         assert_eq!(MidiAction::UndoOverdub.label(), "undo overdub");
         assert_eq!(MidiAction::RedoOverdub.label(), "redo overdub");
+    }
+
+    #[test]
+    fn knob_actions_are_appended_and_value_driven() {
+        // Per-loop volume/gain slots were APPENDED after redo-overdub
+        // (interleaved vol/gain per loop); they are value-driven and must
+        // never carry a keyboard default (a key press carries no value).
+        assert_eq!(N_ACTIONS, 124);
+        for i in 0..MAX_LOOPS {
+            assert_eq!(MidiAction::idx(MidiAction::VolLoop(i)), 92 + i * 2);
+            assert_eq!(MidiAction::idx(MidiAction::GainLoop(i)), 93 + i * 2);
+            assert!(MidiAction::VolLoop(i).is_continuous());
+            assert!(MidiAction::GainLoop(i).is_continuous());
+            assert_eq!(SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::VolLoop(i))], None);
+            assert_eq!(SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::GainLoop(i))], None);
+        }
+        assert!(!MidiAction::RecLoop(0).is_continuous());
+        assert_eq!(MidiAction::VolLoop(0).label(), "loop 1: volume (knob)");
+        assert_eq!(MidiAction::GainLoop(15).label(), "loop 16: gain (knob)");
+    }
+
+    #[test]
+    fn per_loop_level_mappings() {
+        // MIDI 0 = silence (-inf dB) for both sliders.
+        assert_eq!(vol_amp(0), 0.0);
+        assert_eq!(gain_amp(0), 0.0);
+        assert_eq!(db_str(0.0), "-inf dB");
+        // Volume: 127 = 0 dB, monotonic down to ~-60 dB at 1.
+        assert!((vol_amp(127) - 1.0).abs() < 1e-6);
+        let v1 = vol_amp(1);
+        assert!(v1 > 0.0 && v1 < 0.011);
+        assert!(vol_amp(1) < vol_amp(64) && vol_amp(64) < vol_amp(100));
+        assert!(vol_amp(100) < vol_amp(127));
+        // Gain: unity at 80, cut below, boost above (+10 dB top ≈ ×3.16).
+        assert!((gain_amp(GAIN_UNITY_MIDI) - 1.0).abs() < 1e-6);
+        assert!((gain_amp(127) - 3.199).abs() < 0.01);
+        assert!(gain_amp(40) < 1.0 && gain_amp(40) > 0.0);
+        assert_eq!(db_str(1.0), "+0.0 dB");
     }
 }
