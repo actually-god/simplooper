@@ -41,6 +41,33 @@ pub const TR_REC: u8 = 1;
 pub const TR_PLAY: u8 = 2;
 pub const TR_OD: u8 = 3; // overdub = playing + writing live input
 
+/// MIDI value at which the per-loop gain slider sits at unity (0 dB): below
+/// it cuts toward -inf, above it boosts toward [`GAIN_MAX_DB`].
+pub const GAIN_UNITY_MIDI: u8 = 80;
+/// Maximum boost of the per-loop gain slider (MIDI 127), in dB.
+pub const GAIN_MAX_DB: f32 = 12.0;
+/// Linear amplitude of [`GAIN_MAX_DB`] (10^(12/20)).
+const GAIN_MAX_LIN: f32 = 1.584_893_2;
+
+/// Per-loop volume fader: MIDI 0..=127 → linear amplitude 0..=1
+/// (0 = silence / -inf dB, 127 = 0 dB).
+#[inline]
+pub fn vol_amp(v: u8) -> f32 {
+    v as f32 / 127.0
+}
+
+/// Per-loop gain trim: MIDI 0..=127 → linear amplitude (0 = silence / -inf,
+/// [`GAIN_UNITY_MIDI`] = unity / 0 dB, 127 = +12 dB).
+#[inline]
+pub fn gain_amp(v: u8) -> f32 {
+    if v <= GAIN_UNITY_MIDI {
+        v as f32 / GAIN_UNITY_MIDI as f32
+    } else {
+        1.0 + (v - GAIN_UNITY_MIDI) as f32 / (127 - GAIN_UNITY_MIDI) as f32
+            * (GAIN_MAX_LIN - 1.0)
+    }
+}
+
 /// A remote audio port the user can select (full name is `client:port`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PortInfo {
@@ -106,9 +133,10 @@ pub enum Cmd {
     /// the loops keep playing forever (changing N while playing restarts the
     /// ensemble from there).
     SetRootLoops(u32),
-    /// Delay the whole output mix (monitoring + loops + metronome) by `ms`
-    /// milliseconds to compensate for input/output latency. Clamped to
-    /// 0..=1000 ms.
+    /// Delay the INPUT (the dry mix feeding monitoring and recording) by `ms`
+    /// milliseconds to compensate for the existing delay in the total audio
+    /// loop: playing along to the loop you hear then lands on the loop grid,
+    /// and the output mix is never delayed further. Clamped to 0..=1000 ms.
     SetLatency { ms: f32 },
     /// Metronome: on/off, tempo in BPM, subdivision in clicks per beat
     /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...), and beats
@@ -259,8 +287,16 @@ pub struct LoopEngine {
     master_pos: AtomicU64,
     /// Dependent-mode ensemble length in units of the longest loop (>= 1).
     root_loops: AtomicU32,
-    /// Output delay in samples (latency compensation; 0 = off).
+    /// Input delay in samples (latency compensation; 0 = off). Delays the
+    /// dry input mix (monitoring + recording) — never the output.
     latency: AtomicU32,
+    /// Per-track playback volume (linear amplitude as f32 bits; 1.0 = 0 dB).
+    /// Applied to the loop's output contribution only — recorded/overdubbed
+    /// content always stays at raw input level.
+    vol: [AtomicU32; MAX_LOOPS],
+    /// Per-track playback gain trim (linear amplitude as f32 bits;
+    /// 1.0 = 0 dB). Same output-only semantics as `vol`.
+    trk_gain: [AtomicU32; MAX_LOOPS],
     /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat; beats per
     /// measure (time-signature numerator, default 4).
     metro_on: AtomicU8,
@@ -287,6 +323,8 @@ impl LoopEngine {
             master_pos: AtomicU64::new(0),
             root_loops: AtomicU32::new(1),
             latency: AtomicU32::new(0),
+            vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             metro_on: AtomicU8::new(0),
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
@@ -375,21 +413,24 @@ impl LoopEngine {
                 continue;
             }
             let buf = unsafe { std::slice::from_raw_parts(self.bufs[t], LOOP_CAP as usize) };
+            // Export mirrors the live mix: each track's playback trim
+            // (volume x gain) rides the render.
+            let tamp = self.loop_vol(t) * self.loop_gain(t);
             for p in 0..(periods / max_len as u64) {
                 let base = p * max_len as u64;
                 let start = (base % l) as usize;
                 let end = ((base + max_len as u64) % l) as usize;
                 if end > start {
                     for k in 0..(end - start) {
-                        out[(base + k as u64) as usize] += buf[start + k];
+                        out[(base + k as u64) as usize] += buf[start + k] * tamp;
                     }
                 } else {
                     let first = (l - start as u64) as usize;
                     for k in 0..first {
-                        out[(base + k as u64) as usize] += buf[start + k];
+                        out[(base + k as u64) as usize] += buf[start + k] * tamp;
                     }
                     for k in 0..end {
-                        out[(base + first as u64 + k as u64) as usize] += buf[k];
+                        out[(base + first as u64 + k as u64) as usize] += buf[k] * tamp;
                     }
                 }
             }
@@ -463,9 +504,29 @@ impl LoopEngine {
         self.root_loops.load(Ordering::Relaxed)
     }
 
-    /// Output delay in samples (0 = latency compensation off).
+    /// Input delay in samples (0 = latency compensation off).
     pub fn latency_samples(&self) -> u32 {
         self.latency.load(Ordering::Relaxed)
+    }
+
+    /// Per-track playback volume (linear amplitude; 1.0 = 0 dB).
+    pub fn loop_vol(&self, i: usize) -> f32 {
+        f32::from_bits(self.vol[i].load(Ordering::Relaxed))
+    }
+
+    /// Set track `i`'s playback volume (linear amplitude; 0 = silence).
+    pub fn set_loop_vol(&self, i: usize, amp: f32) {
+        self.vol[i].store(amp.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Per-track gain trim (linear amplitude; 1.0 = 0 dB).
+    pub fn loop_gain(&self, i: usize) -> f32 {
+        f32::from_bits(self.trk_gain[i].load(Ordering::Relaxed))
+    }
+
+    /// Set track `i`'s gain trim (linear amplitude; 0 = silence).
+    pub fn set_loop_gain(&self, i: usize, amp: f32) {
+        self.trk_gain[i].store(amp.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Metronome state: (on, bpm, clicks per beat, beats per measure).
@@ -1380,6 +1441,15 @@ impl ProcessHandler for Proc {
             self.engine.len[i].load(Ordering::Relaxed)
         });
         let mode = self.engine.mode.load(Ordering::Relaxed);
+        // Per-track output trim (volume x gain, linear) snapshotted once per
+        // cycle; applied to each loop's PLAYBACK contribution only, so the
+        // mix level rides the slider while recorded content stays at raw
+        // input level (overdub writes below always use the undamped `src_in`).
+        let mut amp = [1.0f32; MAX_LOOPS];
+        for (a, t) in amp.iter_mut().zip(0..MAX_LOOPS) {
+            *a = f32::from_bits(self.engine.vol[t].load(Ordering::Relaxed))
+                * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
+        }
         // Compact list of the non-IDLE tracks: the sample loop iterates only
         // these instead of all MAX_LOOPS slots per sample.
         let mut active: [u8; MAX_LOOPS] = [0u8; MAX_LOOPS];
@@ -1450,6 +1520,13 @@ impl ProcessHandler for Proc {
         let (ins, outs) = (&in_bufs[..nin], &out_bufs[..nout]);
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        // Latency-compensation INPUT delay (samples, clamped to the line
+        // size). The delay line holds one full second max (see `delay_n`);
+        // the GUI slider is clamped to 0..=1000 ms.
+        let dn = self.delay.len();
+        let dly = (self.engine.latency.load(Ordering::Relaxed) as usize).min(dn - 1);
+        // A delay is only meaningful with a live input connection.
+        let dly_active = dly > 0 && nin > 0;
         // Metronome parameters for this cycle (click is added to the output
         // mix only — never to `dry`, so it can never be recorded into a loop).
         let (metro_on, metro_bpm, metro_sub, metro_num) = self.engine.metro();
@@ -1471,9 +1548,6 @@ impl ProcessHandler for Proc {
         self.prev_metro_on = metro_on;
         let metro_dur = (self.sr / 40).max(2); // 25 ms click
         let metro_decay = self.sr as f32 * 0.012;
-        // Latency-compensation delay (samples, clamped to the line size).
-        let dn = self.delay.len();
-        let dly = (self.engine.latency.load(Ordering::Relaxed) as usize).min(dn - 1);
         let dependent = mode == 1;
         // Dependent-mode ensemble: the longest PLAYING/overdubbing track is
         // the "root" loop; the ensemble period is `root_loops` copies of it.
@@ -1509,6 +1583,16 @@ impl ProcessHandler for Proc {
             for b in ins {
                 dry += unsafe { *b.add(i) };
             }
+            // Input delay line: `src_in` is the dry input delayed by `dly`
+            // samples — everything downstream of the input (monitoring and
+            // recording/overdubbing) uses it, so latency compensation shifts
+            // the INPUT while the output mix stays exactly on the loop grid.
+            // The line is fed unconditionally so changing latency mid-stream
+            // never gaps or drops.
+            let tap = self.delay[(self.didx + dn - dly) & (dn - 1)];
+            self.delay[self.didx] = dry;
+            self.didx = (self.didx + 1) & (dn - 1);
+            let src_in = if dly_active { tap } else { dry };
 
             // Loop engine step, shared by all output slots.
             let mut play = 0.0f32;
@@ -1520,7 +1604,7 @@ impl ProcessHandler for Proc {
                     let st = st_now[t];
                     if st == TR_REC {
                         // Contiguous capture from the start of the buffer.
-                        if self.engine.rec_sample(t, dry) && self.rec_full & (1u16 << t) == 0 {
+                        if self.engine.rec_sample(t, src_in) && self.rec_full & (1u16 << t) == 0 {
                             // Capacity reached: stop capturing into this loop,
                             // keep playing (the buffer is full of content).
                             // The bit guard keeps the remaining samples of
@@ -1540,20 +1624,20 @@ impl ProcessHandler for Proc {
                                 // One read serves playback and the overdub mix
                                 // (OD sums live input onto the take in place).
                                 let old = self.engine.read(t, off as u32);
-                                play += old;
+                                play += old * amp[t];
                                 if st == TR_OD {
                                     // Additive overdub: layer the live input
                                     // on top of the existing recording at its
                                     // original level — never replace it.
-                                    self.engine.write(t, off as u32, old + dry);
+                                    self.engine.write(t, off as u32, old + src_in);
                                 }
                                 pos_now[t] = off;
                             } else {
                                 let off = self.pos[t] % l;
                                 let old = self.engine.read(t, off as u32);
-                                play += old;
+                                play += old * amp[t];
                                 if st == TR_OD {
-                                    self.engine.write(t, off as u32, old + dry);
+                                    self.engine.write(t, off as u32, old + src_in);
                                 }
                                 pos_now[t] = off;
                                 self.pos[t] += 1;
@@ -1645,25 +1729,16 @@ impl ProcessHandler for Proc {
             }
             self.sample_no += 1;
 
-            let v = (dry + play + click) * g;
-            // Latency compensation: delay the whole output mix by `dly`
-            // samples (the line is always fed so re-enabling never gaps).
-            let out = if dly > 0 {
-                let s = self.delay[(self.didx + dn - dly) & (dn - 1)];
-                self.delay[self.didx] = v;
-                self.didx = (self.didx + 1) & (dn - 1);
-                s
-            } else {
-                self.delay[self.didx] = v;
-                self.didx = (self.didx + 1) & (dn - 1);
-                v
-            };
-            let av = out.abs();
+            let v = (src_in + play + click) * g;
+            // The output mix is NEVER delayed — latency compensation lives
+            // entirely on the input side (see `src_in` above), so what the
+            // user hears stays exactly on the loop grid.
+            let av = v.abs();
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
             }
             for b in outs {
-                unsafe { *b.add(i) = out };
+                unsafe { *b.add(i) = v };
             }
         }
         // Continuous ensemble: at the period end the clock simply wraps and

@@ -279,6 +279,14 @@ pub enum MidiAction {
     UndoOverdub,
     /// Redo the most recently undone overdub.
     RedoOverdub,
+    /// Set loop `i`'s playback volume from a continuous controller: the
+    /// binding fires on the message VALUE (CC / note velocity, 0..=127;
+    /// 0 = -inf dB, 127 = 0 dB). Keyboard bindings cannot carry a value and
+    /// are never fired for these actions.
+    VolLoop(usize),
+    /// Set loop `i`'s gain trim from a continuous controller (0 = -inf dB,
+    /// 80 = 0 dB, 127 = +10 dB). Value semantics as [`MidiAction::VolLoop`].
+    GainLoop(usize),
 }
 
 impl MidiAction {
@@ -288,7 +296,7 @@ impl MidiAction {
     /// loops (the settings panel shows these through a loop dropdown), then
     /// dependent mode, metronome, and next/previous selection. New actions
     /// must be APPENDED (the persisted `shortcuts` vector is positional).
-    pub const ALL: [MidiAction; 92] = [
+    pub const ALL: [MidiAction; 124] = [
         MidiAction::RecSelected,
         MidiAction::OdSelected,
         MidiAction::ClearSelected,
@@ -385,6 +393,39 @@ impl MidiAction {
         // APPENDED (never inserted): the persisted shortcut table is positional.
         MidiAction::UndoOverdub,
         MidiAction::RedoOverdub,
+        // Per-loop continuous (knob/slider) bindings, appended per loop.
+        MidiAction::VolLoop(0),
+        MidiAction::GainLoop(0),
+        MidiAction::VolLoop(1),
+        MidiAction::GainLoop(1),
+        MidiAction::VolLoop(2),
+        MidiAction::GainLoop(2),
+        MidiAction::VolLoop(3),
+        MidiAction::GainLoop(3),
+        MidiAction::VolLoop(4),
+        MidiAction::GainLoop(4),
+        MidiAction::VolLoop(5),
+        MidiAction::GainLoop(5),
+        MidiAction::VolLoop(6),
+        MidiAction::GainLoop(6),
+        MidiAction::VolLoop(7),
+        MidiAction::GainLoop(7),
+        MidiAction::VolLoop(8),
+        MidiAction::GainLoop(8),
+        MidiAction::VolLoop(9),
+        MidiAction::GainLoop(9),
+        MidiAction::VolLoop(10),
+        MidiAction::GainLoop(10),
+        MidiAction::VolLoop(11),
+        MidiAction::GainLoop(11),
+        MidiAction::VolLoop(12),
+        MidiAction::GainLoop(12),
+        MidiAction::VolLoop(13),
+        MidiAction::GainLoop(13),
+        MidiAction::VolLoop(14),
+        MidiAction::GainLoop(14),
+        MidiAction::VolLoop(15),
+        MidiAction::GainLoop(15),
     ];
 
     /// Position of `a` in [`MidiAction::ALL`] (binding-table index).
@@ -412,7 +453,16 @@ impl MidiAction {
             MidiAction::SelectPrev => "select previous loop".into(),
             MidiAction::UndoOverdub => "undo overdub".into(),
             MidiAction::RedoOverdub => "redo overdub".into(),
+            MidiAction::VolLoop(i) => format!("loop {}: volume (knob)", i + 1),
+            MidiAction::GainLoop(i) => format!("loop {}: gain (knob)", i + 1),
         }
+    }
+
+    /// True for value-driven actions (volume / gain knobs): they fire with
+    /// the message's second data byte and keyboard bindings can never fire
+    /// them (a key press carries no value).
+    pub fn is_continuous(self) -> bool {
+        matches!(self, MidiAction::VolLoop(_) | MidiAction::GainLoop(_))
     }
 }
 
