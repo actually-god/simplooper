@@ -9,22 +9,54 @@ keywords = ["audio", "jack", "looper", "midi"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-eframe = "0.36.2"
+# Explicit feature set: the `glow` (OpenGL) renderer instead of the default
+# wgpu stack (drops wgpu/naga/ash from the build and shrinks the binary),
+# no `links` (the app renders no hyperlinks) and no `web_screen_reader`
+# (wasm-only). accesskit stays so screen readers keep working.
+# eframe's `wayland`/`x11` features already enable the matching winit
+# backends (and eframe pins winit/rwh_06 + egui-winit/clipboard itself), so
+# winit's own defaults add nothing needed here: skipping them drops
+# wayland-dlopen (the binary links libwayland directly — a normal
+# auto-detected dep) and sctk-adwaita CSD (compositors like KWin decorate
+# windows themselves).
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.36"
 jack = "0.13.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Only used to decode the bundled application icon (assets/icon.png).
 image = { version = "0.25", default-features = false, features = ["png"] }
-# Recording import: decode mp3/ogg/flac/wav/m4a into engine-rate mono f32.
-symphonia = "0.5"
+# Recording import: decode the formats in audio_io::IMPORT_EXTENSIONS into
+# engine-rate mono f32. Explicit features: symphonia's defaults omit the
+# MP3/M4A/AIFF decoders (the import dialog advertises them) while pulling the
+# unused adpcm/mkv decoders, so list exactly what the dialog offers.
+symphonia = { version = "0.5", default-features = false, features = [
+    "pcm",
+    "wav",
+    "aiff",
+    "vorbis",
+    "ogg",
+    "flac",
+    "mp3",
+    "isomp4",
+    "aac",
+] }
 rubato = "5"
 # Recording export: pure-Rust FLAC encoder (WAV is written by hand).
 rusty_flac = "0.2"
-# Native file dialogs for import/export (GTK on Linux).
+# Native file dialogs for import/export (XDG portal / GTK / Qt on Linux).
 rfd = "0.17"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+# The app never unwinds (no catch_unwind anywhere); aborting keeps panic
+# landing pads and unwinding tables out of the shipped binary.
+panic = "abort"
