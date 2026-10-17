@@ -58,6 +58,19 @@ binding, independent/dependent loop modes, and an easy quantize tool.
   incoming event is parsed and shown in the bottom panel and on stdout.
 - **Live mix passthrough** — selected inputs are summed × master gain into
   selected outputs, independent of the loop engine.
+- **Per-loop effects** — a runtime-compiled effects framework. Each loop row's
+  bottom strip stacks **volume** over **gain** (bottom-left), puts an **FX**
+  button next to them, and shows every enabled effect *after* the button —
+  each with live sliders for the parameters its script declares. The Effects
+  window (the FX button) points at an effects folder (text box + **browse**;
+  default `~/.local/share/simplooper/effects`, created and seeded with a
+  documented template on first run), lists every valid script with a toggle
+  (default off), and lets enabled effects be reordered with ▲▼ — they snap to
+  the top and the top-to-bottom order *is* the audio chain order. Effects run
+  after the vol × gain trim, in GUI chain order, both live and in export
+  renders. Effects are plain **Rust scripts**: drop a `.rs` file in the
+  folder, simplooper compiles it with `rustc` and hot-loads it
+  (**Rescan**). See *Effects* below.
 - **Latency compensation** — the settings panel's *latency (ms)* delays the
   INCOMING signal (recording + monitoring) so your playing lands on the
   already-recorded loop grid; the output mix (loops, metronome, monitors)
@@ -66,7 +79,8 @@ binding, independent/dependent loop modes, and an easy quantize tool.
 
 ## Requirements
 
-- Rust (stable) and `cargo`
+- Rust (stable) and `cargo`; **`rustc` at runtime** for building effect
+  scripts on the fly (optional — the app runs fine without custom effects)
 - Build-time system libraries: JACK headers + `.pc` file (provided by
   `pipewire-jack` or the official `libjack` package), plus `pkgconf`.
   No other system deps — the GUI stack is pure-Rust.
@@ -97,6 +111,40 @@ cargo build --release
    **PLAY** toggles playback, **CLEAR** zeros the buffer.
 4. Tick **dependent** to lock all tracks to one ensemble clock (see
    *Loop modes* above).
+
+### Effects
+
+Each loop owns an independent effect chain. Click the loop's **FX** button:
+
+- **Effects location** — the folder simplooper scans for effect scripts;
+  type a path or press **browse** (same chooser as export) and press
+  **Set**. The default folder is created automatically and seeded with
+  `template.rs` + the ABI contract file.
+- **The list** — one row per script found: a toggle (default off), the
+  effect's display name, and hover text with author/description. Switching
+  a script on snaps it to the top block; ▲▼ inside that block reorder the
+  chain. Scripts that fail to compile or load are listed dimmed with the
+  compiler's error, so an effect author can fix and **Rescan** without
+  leaving the app.
+- **Chain display** — enabled effects appear to the right of the FX button
+  (left-to-right = chain order), each with a labelled slider per parameter,
+  per loop. Parameter values persist with the config, keyed per script.
+
+Signal order per loop: recorded audio × volume × gain, then effects in
+chain order. The same chain runs when exporting/rendering a loop.
+
+Writing an effect: copy `template.rs` (it ships in the effects folder and in
+`effects/` of the repo), rename the file, edit. An effect is one standalone
+Rust file that `include!`s `effect_api.rs` (written into the folder for you)
+and provides three `extern "C"` functions (`create` / `process` /
+`destroy`), a `static DESC: EffectInfoV1` description block, and the
+one-line `simplooper_effect_info` entry point. Only `name` is required text;
+`author`, `description`, and up to 8 parameters are optional. The template's
+comments document every field, how to add/remove parameters, and the
+validity rules (allocation-free, non-blocking, `depth 0`-style pass-through
+not required but polite). Effects are compiled with
+`rustc --edition 2021 --crate-type cdylib` — so **rustc must be installed**
+to use custom effects; a missing compiler just lists scripts with a hint.
 
 ### MIDI binding
 
@@ -149,6 +197,10 @@ src/
 ├── main.rs    entry point, eframe window setup
 ├── audio.rs   JACK backend + LoopEngine: manager thread, Cmd/Evt channels,
 │              RT process handler (record/overdub/playback inline)
+├── fx.rs      effects framework: scan/compile/cache/load effect scripts,
+│              ABI validation, per-loop chains, RT-safe parameter relay
+├── effect_api.rs  the effect ABI contract (source of truth; also written
+│              into every effects folder for scripts to `include!`)
 ├── midi.rs    MIDI parsing, formatting, MidiBind matching (unit-tested)
 ├── quantize.rs  grid snap + zero-crossing refinement + seam crossfade
 └── ui.rs      egui app: top bar (hamburger), settings panel, loop dashboard,

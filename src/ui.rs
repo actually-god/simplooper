@@ -14,8 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::Frame;
 use egui::{Color32, RichText, Sense, Slider};
 
-use crate::audio::{Backend, Cmd, Evt, PortInfo, MAX_LOOPS, TR_OD, TR_PLAY, TR_REC};
-use crate::config::{Config, MidiBinding};
+use crate::audio::{Backend, Cmd, Evt, FxSlot, PortInfo, TrackFx, MAX_LOOPS, TR_OD, TR_PLAY, TR_REC};
+use crate::config::{Config, MidiBinding, TrackFxSave};
+use crate::fx;
 use crate::midi::{hex, MidiAction, MidiBind, MidiMsg};
 use crate::quantize::Unit;
 
@@ -339,6 +340,24 @@ pub struct App {
     midi_sources: Vec<String>,
     /// True while the export prompt dialog is open.
     show_export: bool,
+
+    // --- per-loop effects framework ---
+    /// Effects folder registry (GUI thread; compile + load happen here).
+    fx_registry: fx::Registry,
+    /// Effects-window rows per loop: enabled first in chain order, then the
+    /// disabled ones alphabetically.
+    fx_entries: Vec<Vec<fx::UiEntry>>,
+    /// Live chain instances per loop (parallel to the enabled entries; the
+    /// sliders ride these directly and the audio thread reads their atomics).
+    fx_live: Vec<Vec<std::sync::Arc<fx::Instance>>>,
+    /// Loop whose Effects window is open (None = closed).
+    fx_window: Option<usize>,
+    /// "Effects location" text box (folder of effect scripts).
+    fx_dir_edit: String,
+    /// Status line shown inside the effects window.
+    fx_note: String,
+    /// Chain edits flush the config once the pointer is released.
+    fx_save_pending: bool,
     /// Which loop the "Per loop bindings" dropdown points at (0-based).
     bind_loop_sel: usize,
     /// Export dialog state: whole-project toggle, destination path, format
@@ -361,6 +380,27 @@ impl App {
     pub fn new(backend: Backend) -> Self {
         // Load persisted settings (shortcuts, MIDI binds, root loops).
         let cfg = Config::load();
+        // Effects framework: open (creating/seeding when needed) the folder
+        // and compile+load every script; chains get rebuilt once the engine
+        // sample rate is known (Evt::Ready).
+        let fx_dir = fx::prepare_effects_dir(if cfg.fx_dir.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.fx_dir.trim())
+        });
+        let mut fx_registry = fx::Registry::open(fx_dir.clone());
+        fx_registry.rescan();
+        let fx_stems = fx_registry.stems();
+        let fx_entries: Vec<Vec<fx::UiEntry>> = (0..MAX_LOOPS)
+            .map(|i| {
+                let saved: Vec<(String, Vec<f32>)> = cfg
+                    .track_fx
+                    .get(i)
+                    .map(|v| v.iter().map(|s| (s.stem.clone(), s.params.clone())).collect())
+                    .unwrap_or_default();
+                fx::merge_entries(&[], &fx_stems, &saved)
+            })
+            .collect();
         let mut short_keys = core::array::from_fn(|i| SHORTCUT_DEFAULTS[i]);
         // Legacy 9-slot order (select 1–4, play/stop, record, overdub, clear,
         // dependent); remap onto the per-action table. Newer configs store one
@@ -470,6 +510,13 @@ impl App {
             midi_learning_slot: None,
             midi_sources: Vec::new(),
             show_export: false,
+            fx_registry,
+            fx_entries,
+            fx_live: vec![Vec::new(); MAX_LOOPS],
+            fx_window: None,
+            fx_dir_edit: fx_dir.display().to_string(),
+            fx_note: String::new(),
+            fx_save_pending: false,
             bind_loop_sel: 0,
             export_whole: false,
             export_path: String::new(),
@@ -681,6 +728,75 @@ impl App {
         self.backend.engine.set_loop_gain(i, gain_amp(v));
     }
 
+    /// Rebuild loop `i`'s live effect chain from its window rows and hand it
+    /// to the audio engine. Also seeds each row's slider values from the
+    /// descriptors (stored values win, clamped to range).
+    fn rebuild_fx(&mut self, i: usize) {
+        let mut live: Vec<std::sync::Arc<fx::Instance>> = Vec::new();
+        let mut slots: Vec<FxSlot> = Vec::new();
+        for e in self.fx_entries[i].iter_mut() {
+            if !e.enabled {
+                continue;
+            }
+            if slots.len() >= fx::MAX_FX_PER_TRACK {
+                break;
+            }
+            let Some(desc) = self.fx_registry.desc(&e.stem).cloned() else { continue };
+            let vals = fx::seed_values(&e.params, &desc);
+            e.params = vals.clone();
+            if let Some(inst) =
+                self.fx_registry.create_instance(&e.stem, self.sample_rate as f64, &vals)
+            {
+                slots.push(FxSlot { inst: inst.clone(), desc });
+                live.push(inst);
+            }
+        }
+        self.fx_live[i] = live;
+        self.backend.cmd(Cmd::SetTrackEffects { i, chain: TrackFx { slots: std::sync::Arc::new(slots) } });
+    }
+
+    /// Ride one effect slider: live instance now, window row for persistence.
+    fn set_fx_param(&mut self, i: usize, slot: usize, par: usize, v: f32) {
+        if let Some(inst) = self.fx_live[i].get(slot) {
+            inst.set_param(par, v);
+        }
+        if let Some(e) = self.fx_entries[i].iter_mut().filter(|e| e.enabled).nth(slot) {
+            if let Some(pv) = e.params.get_mut(par) {
+                *pv = v;
+            }
+        }
+    }
+
+    /// Resolve the "effects location" text box, rescan, and re-point every
+    /// loop's chain at the new folder (chains whose scripts vanished simply
+    /// drop those slots; slider values of survivors are kept).
+    fn apply_fx_dir(&mut self) {
+        let dir = fx::prepare_effects_dir(Some(self.fx_dir_edit.trim()));
+        self.fx_registry.set_dir(dir.clone());
+        self.fx_dir_edit = dir.display().to_string();
+        self.fx_registry.rescan();
+        let stems = self.fx_registry.stems();
+        for i in 0..MAX_LOOPS {
+            self.fx_entries[i] = fx::merge_entries(&self.fx_entries[i], &stems, &[]);
+            self.rebuild_fx(i);
+        }
+        self.fx_note = format!("folder: {}", dir.display());
+        self.save_config();
+    }
+
+    /// Compile/load every script in the folder again and refresh all rows.
+    fn rescan_fx(&mut self) {
+        self.fx_registry.rescan();
+        let stems = self.fx_registry.stems();
+        for i in 0..MAX_LOOPS {
+            self.fx_entries[i] = fx::merge_entries(&self.fx_entries[i], &stems, &[]);
+            self.rebuild_fx(i);
+        }
+        let ok = self.fx_registry.stems().len();
+        let bad = self.fx_registry.items().iter().filter(|e| e.error.is_some()).count();
+        self.fx_note = format!("{ok} valid effect(s), {bad} rejected");
+    }
+
     /// Push the metronome state (play/stop / tempo / beats per measure /
     /// subdivision) to the audio thread and persist it. Tempo text that fails
     /// to parse keeps 120 BPM; beats-per-measure text falls back to 4.
@@ -718,6 +834,16 @@ impl App {
             ports_out: self.applied_ports.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
             trk_vol: self.trk_vol.to_vec(),
             trk_gain: self.trk_gain.to_vec(),
+            fx_dir: self.fx_dir_edit.trim().to_string(),
+            track_fx: (0..MAX_LOOPS)
+                .map(|i| {
+                    self.fx_entries[i]
+                        .iter()
+                        .filter(|e| e.enabled)
+                        .map(|e| TrackFxSave { stem: e.stem.clone(), params: e.params.clone() })
+                        .collect()
+                })
+                .collect(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[simplooper] could not save config: {e}");
@@ -736,6 +862,15 @@ impl App {
                 self.backend.cmd(Cmd::SetRootLoops(self.root_loops));
                 self.backend.cmd(Cmd::SetLatency { ms: self.latency_ms.trim().parse().unwrap_or(0.0) });
                 self.send_metro();
+                // Effect instances made before the backend was up were
+                // created with rate 0; rebuild every chain at the real rate.
+                for t in 0..MAX_LOOPS {
+                    if !self.fx_live[t].is_empty()
+                        || self.fx_entries[t].iter().any(|e| e.enabled)
+                    {
+                        self.rebuild_fx(t);
+                    }
+                }
                 // Re-apply the port bindings persisted from the previous
                 // session so audio flows on launch without re-clicking
                 // "Apply Selection" (missing ports just fail to connect and
@@ -934,6 +1069,10 @@ impl eframe::App for App {
             self.levels_dirty = false;
             self.save_config();
         }
+        if self.fx_save_pending && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.fx_save_pending = false;
+            self.save_config();
+        }
 
         // Recomputed by the text-edit widgets below while they have focus.
         self.in_text_edit = false;
@@ -946,6 +1085,9 @@ impl eframe::App for App {
         central_panels(ui, self);
         if self.show_export {
             export_window(ui, self);
+        }
+        if self.fx_window.is_some() {
+            effects_window(ui, self);
         }
     }
 }
@@ -1323,6 +1465,175 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
     app.show_export = open && !cancelled && !done;
 }
 
+/// The per-loop effects window: folder picker ("effects location"), one
+/// row per script with a toggle (disabled by default), reorder arrows for
+/// enabled ones (enabled effects snap to the top of the list, in chain
+/// order), plus rescan / add-template helpers. Rejected scripts are listed
+/// with their compile/load error so effect authors can fix them.
+fn effects_window(ui: &mut egui::Ui, app: &mut App) {
+    let Some(loop_i) = app.fx_window else { return };
+    let mut open = true;
+    egui::Window::new(RichText::new(format!("EFFECTS — loop {}", loop_i + 1)).strong())
+        .open(&mut open)
+        .min_width(520.0)
+        .default_height(420.0)
+        .show(ui, |ui| {
+            ui.label("Effects location:");
+            ui.horizontal(|ui| {
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
+                app.in_text_edit = app.in_text_edit || r.has_focus();
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().set_title("Effects folder").pick_folder()
+                    {
+                        app.fx_dir_edit = p.to_string_lossy().into_owned();
+                        app.apply_fx_dir();
+                    }
+                }
+                if ui.button("Apply").clicked() {
+                    app.apply_fx_dir();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Rescan").clicked() {
+                    app.rescan_fx();
+                }
+                if ui.button("Add template").clicked() {
+                    match app.fx_registry.add_template() {
+                        Ok(stem) => {
+                            let stems = app.fx_registry.stems();
+                            for i in 0..MAX_LOOPS {
+                                app.fx_entries[i] =
+                                    fx::merge_entries(&app.fx_entries[i], &stems, &[]);
+                                app.rebuild_fx(i);
+                            }
+                            app.fx_note =
+                                format!("created {stem}.rs — enable it below to hear it");
+                        }
+                        Err(e) => app.fx_note = e,
+                    }
+                }
+            });
+            if !fx::rustc_available() {
+                ui.label(
+                    RichText::new(
+                        "rustc is not on PATH — effect scripts cannot compile. Install Rust (rustup).",
+                    )
+                    .color(Color32::YELLOW),
+                );
+            }
+            if !app.fx_note.is_empty() {
+                ui.label(RichText::new(&app.fx_note).weak().small());
+            }
+            ui.separator();
+
+            // One row per script: valid ones get a toggle (+ arrows when
+            // enabled); invalid ones show the rejection reason instead.
+            let mut act: Option<(u8, usize)> = None; // (0 toggle, 1 up, 2 down)
+            for (k, e) in app.fx_entries[loop_i].clone().iter().enumerate() {
+                let desc = app.fx_registry.desc(&e.stem).cloned();
+                let err = app
+                    .fx_registry
+                    .items()
+                    .iter()
+                    .find(|it| it.stem == e.stem)
+                    .and_then(|it| it.error.clone());
+                ui.horizontal(|ui| {
+                    let mut en = e.enabled;
+                    let cb = ui.checkbox(&mut en, "");
+                    if cb.changed() {
+                        act = Some((0, k));
+                    }
+                    let label = desc.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| e.stem.clone());
+                    let txt = if e.enabled && desc.is_some() {
+                        RichText::new(&label).strong()
+                    } else {
+                        RichText::new(&label)
+                    };
+                    let hover = match (&desc, &err) {
+                        (Some(d), _) => {
+                            let mut h = String::new();
+                            if let Some(a) = &d.author {
+                                h.push_str(&format!("by {a}\n"));
+                            }
+                            if let Some(t) = &d.description {
+                                h.push_str(t);
+                            }
+                            if d.params.is_empty() {
+                                h.push_str("\n(no parameters)");
+                            } else {
+                                h.push_str(&format!("\nparams: {}", d.params.len()));
+                            }
+                            h
+                        }
+                        (None, Some(t)) => t.clone(),
+                        (None, None) => label.clone(),
+                    };
+                    ui.add_enabled_ui(desc.is_some(), |ui| {
+                        ui.label(txt).on_hover_text(hover);
+                        if e.enabled {
+                            if ui.button("▲").on_hover_text("Move earlier in the chain").clicked() {
+                                act = Some((1, k));
+                            }
+                            if ui.button("▼").on_hover_text("Move later in the chain").clicked() {
+                                act = Some((2, k));
+                            }
+                        }
+                    });
+                    if let Some(t) = &err {
+                        let short: String = t.chars().take(72).collect();
+                        ui.label(RichText::new(format!("✗ {short}")).color(Color32::from_rgb(220, 120, 120)).small());
+                    }
+                });
+            }
+            // Scripts that failed to compile or load: dimmed rows with the
+            // rejection reason, so an effect author can fix the script in
+            // place and Rescan.
+            for it in app.fx_registry.items().iter().filter(|it| it.desc.is_none()) {
+                ui.horizontal(|ui| {
+                    let mut dim = false;
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.checkbox(&mut dim, "");
+                        ui.label(RichText::new(&it.stem).weak().monospace());
+                    });
+                    let t = it.error.clone().unwrap_or_else(|| "invalid".into());
+                    let short: String = t.chars().take(140).collect();
+                    ui.label(
+                        RichText::new(format!("✗ {}", short.replace('\n', " · ")))
+                            .color(Color32::from_rgb(220, 120, 120))
+                            .small(),
+                    )
+                    .on_hover_text(t);
+                });
+            }
+            if let Some((m, k)) = act {
+                let changed = if m == 0 {
+                    app.fx_entries[loop_i][k].enabled ^= true;
+                    let stems = app.fx_registry.stems();
+                    fx::resort_entries(&mut app.fx_entries[loop_i], &stems);
+                    true
+                } else {
+                    fx::move_enabled(&mut app.fx_entries[loop_i], k, m == 1)
+                };
+                if changed {
+                    app.rebuild_fx(loop_i);
+                    app.save_config();
+                }
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(
+                    "Enabled effects run in list order (top first) on this loop's playback, \
+                     after gain and volume. Drop a Rust script into the folder above, \
+                     press Rescan, and toggle it — see template.rs for the contract.",
+                )
+                .weak()
+                .small(),
+            );
+        });
+    app.fx_window = if open { Some(loop_i) } else { None };
+}
+
 fn central_panels(ui: &mut egui::Ui, app: &mut App) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -1682,42 +1993,107 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         }
     });
 
-    // Per-loop level line: playback volume (0 = -inf, 127 = 0 dB) and gain
-    // trim (0 = -inf, 80 = 0 dB, 127 = +10 dB), both shown in dB. Each is
-    // bindable to a MIDI knob in Settings → per loop bindings.
+    // Bottom strip of the loop: one stacked volume+gain element pinned to
+    // the bottom-left, the Effects button right next to it, then every
+    // enabled effect with its own sliders, left to right in chain order.
+    // Gain x volume are always applied first — before any effect.
     ui.horizontal(|ui| {
-        let sw = ((ui.available_width() - 190.0) / 2.0).max(60.0);
-        ui.label(
-            RichText::new(format!("vol  {:>8}", db_str(vol_amp(app.trk_vol[i]))))
-                .monospace()
-                .small(),
-        );
-        let mut v = app.trk_vol[i];
-        let rv = ui
-            .add_sized(egui::vec2(sw, 0.0), Slider::new(&mut v, 0..=127).text(" "))
-            .on_hover_text(
-                "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
-            );
-        if rv.changed() {
-            app.set_trk_vol(i, v);
-            app.levels_dirty = true;
+        // Stacked level element (vol over gain), each bindable to a MIDI
+        // knob in Settings → per loop bindings.
+        ui.vertical(|ui| {
+            let w = (ui.available_width() * 0.24).clamp(180.0, 300.0);
+            ui.set_width(w);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("vol  {:>8}", db_str(vol_amp(app.trk_vol[i]))))
+                        .monospace()
+                        .small(),
+                );
+                let mut v = app.trk_vol[i];
+                let rv = ui
+                    .add_sized(egui::vec2(w - 92.0, 0.0), Slider::new(&mut v, 0..=127).text(" "))
+                    .on_hover_text(
+                        "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+                    );
+                if rv.changed() {
+                    app.set_trk_vol(i, v);
+                    app.levels_dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("gain {:>8}", db_str(gain_amp(app.trk_gain[i]))))
+                        .monospace()
+                        .small(),
+                );
+                let mut g = app.trk_gain[i];
+                let rg = ui
+                    .add_sized(egui::vec2(w - 92.0, 0.0), Slider::new(&mut g, 0..=127).text(" "))
+                    .on_hover_text(
+                        "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+                    );
+                if rg.changed() {
+                    app.set_trk_gain(i, g);
+                    app.levels_dirty = true;
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+        let fb = ui
+            .button("Effects")
+            .on_hover_text("Open this loop's effects window (folder, toggles, order).");
+        if fb.clicked() {
+            app.fx_window = Some(i);
+            app.fx_dir_edit = app.fx_registry.dir().display().to_string();
+            app.fx_note = String::new();
         }
-        ui.label(
-            RichText::new(format!("gain {:>8}", db_str(gain_amp(app.trk_gain[i]))))
-                .monospace()
-                .small(),
-        );
-        let mut g = app.trk_gain[i];
-        let rg = ui
-            .add_sized(egui::vec2(sw, 0.0), Slider::new(&mut g, 0..=127).text(" "))
-            .on_hover_text(
-                "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
-            );
-        if rg.changed() {
-            app.set_trk_gain(i, g);
-            app.levels_dirty = true;
-        }
+        ui.separator();
+        fx_chips(ui, app, i);
     });
+}
+
+/// Enabled effects drawn directly on the loop row, left to right in chain
+/// order (identical to the effects window): name + one slider per parameter.
+fn fx_chips(ui: &mut egui::Ui, app: &mut App, i: usize) {
+    let mut pend: Option<(usize, usize, f32)> = None;
+    let mut k = 0usize; // chain index (enabled entries only)
+    for e in app.fx_entries[i].iter() {
+        if !e.enabled {
+            continue;
+        }
+        let Some(desc) = app.fx_registry.desc(&e.stem).cloned() else { continue };
+        let live = app.fx_live[i].get(k).cloned();
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(&desc.name)
+                        .strong()
+                        .small()
+                        .color(Color32::from_rgb(150, 200, 255)),
+                )
+                .on_hover_text(desc.description.as_deref().unwrap_or(""));
+                for (p, pd) in desc.params.iter().enumerate() {
+                    let mut v = live.as_ref().map(|l| l.param(p)).unwrap_or(pd.default);
+                    let r = ui
+                        .add_sized(
+                            egui::vec2(76.0, 0.0),
+                            Slider::new(&mut v, pd.min..=pd.max).show_value(false),
+                        )
+                        .on_hover_text(format!("{} — range {:.2}…{:.2}", pd.label, pd.min, pd.max));
+                    if r.changed() {
+                        pend = Some((k, p, v));
+                    }
+                    ui.label(RichText::new(format!("{v:.2}")).monospace().small());
+                }
+            });
+        });
+        k += 1;
+    }
+    if let Some((slot, p, v)) = pend {
+        app.set_fx_param(i, slot, p, v);
+        app.fx_save_pending = true;
+    }
 }
 
 /// Draw a track's waveform, scaled to the track's own peak so quiet recordings
@@ -2150,5 +2526,57 @@ mod tests {
         assert!((gain_amp(127) - 3.199).abs() < 0.01);
         assert!(gain_amp(40) < 1.0 && gain_amp(40) > 0.0);
         assert_eq!(db_str(1.0), "+0.0 dB");
+    }
+
+    /// The effects window's rows (toggle → chain order → live instances)
+    /// drive `fx_live` exactly: enable snaps to the top block, arrows
+    /// reorder the chain, disable drops the slot.
+    #[test]
+    fn effects_window_rows_drive_the_live_chain() {
+        if !fx::rustc_available() {
+            return; // no compiler in the environment: chain build is skipped
+        }
+        let mut app = test_app("fxchain");
+        let dir = std::env::temp_dir().join(format!("simplooper-fxui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fx::TEMPLATE_FILE), fx::TEMPLATE_SRC).unwrap();
+        app.fx_dir_edit = dir.display().to_string();
+        app.apply_fx_dir();
+        assert_eq!(app.fx_entries[0].len(), 1, "template listed (disabled)");
+
+        // A second copy of the script to exercise chain ordering.
+        std::fs::write(dir.join("second.rs"), fx::TEMPLATE_SRC).unwrap();
+        app.rescan_fx();
+
+        // Enable template then second: enabled block keeps that order.
+        let stems = app.fx_registry.stems();
+        let kt = app.fx_entries[0].iter().position(|e| e.stem == "template").unwrap();
+        app.fx_entries[0][kt].enabled = true;
+        fx::resort_entries(&mut app.fx_entries[0], &stems);
+        let ks = app.fx_entries[0].iter().position(|e| e.stem == "second").unwrap();
+        app.fx_entries[0][ks].enabled = true;
+        fx::resort_entries(&mut app.fx_entries[0], &stems);
+        app.rebuild_fx(0);
+        assert_eq!(app.fx_live[0].len(), 2, "one live instance per enabled slot");
+        let on: Vec<&str> =
+            app.fx_entries[0].iter().filter(|e| e.enabled).map(|e| e.stem.as_str()).collect();
+        assert_eq!(on, vec!["template", "second"]);
+
+        // Move second ahead of template — chain order follows the list.
+        let k_second = app.fx_entries[0].iter().position(|e| e.stem == "second").unwrap();
+        assert!(fx::move_enabled(&mut app.fx_entries[0], k_second, true));
+        app.rebuild_fx(0);
+        let on: Vec<&str> =
+            app.fx_entries[0].iter().filter(|e| e.enabled).map(|e| e.stem.as_str()).collect();
+        assert_eq!(on, vec!["second", "template"]);
+
+        // Disable: the live instance goes away, the row drops down the list.
+        let k_second = app.fx_entries[0].iter().position(|e| e.stem == "second").unwrap();
+        app.fx_entries[0][k_second].enabled = false;
+        fx::resort_entries(&mut app.fx_entries[0], &stems);
+        app.rebuild_fx(0);
+        assert_eq!(app.fx_live[0].len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

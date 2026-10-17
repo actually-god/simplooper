@@ -75,6 +75,32 @@ pub struct PortInfo {
     pub client: String,
 }
 
+/// One live per-loop effect slot: the refcounted effect instance plus the
+/// description needed to clone it for offline renders (never touched by the
+/// realtime path).
+pub struct FxSlot {
+    pub inst: Arc<crate::fx::Instance>,
+    pub desc: crate::fx::EffectDesc,
+}
+
+/// A track's live effect chain (GUI order = audio order). Replaced whole
+/// when the GUI edits it; the RT thread only reads slots, and slider moves
+/// ride on the instance's atomics — no chain rebuild, no locks per sample.
+#[derive(Clone, Default)]
+pub struct TrackFx {
+    pub slots: Arc<Vec<FxSlot>>,
+}
+
+impl TrackFx {
+    pub fn slots(&self) -> &[FxSlot] {
+        &self.slots
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
 /// Raw MIDI message copied out of the realtime thread.
 #[derive(Debug)]
 pub struct RawMidiMsg {
@@ -127,6 +153,10 @@ pub enum Cmd {
     },
     /// true = dependent looping (finite ensemble clock), false = independent players.
     SetDependent(bool),
+    /// GUI replaced track `i`'s effect chain (order = audio order). The slots
+    /// hold refcounted effect instances created on the GUI thread; the audio
+    /// thread picks the new table up on the next cycle without locking.
+    SetTrackEffects { i: usize, chain: TrackFx },
     /// Dependent-mode ensemble length in units of the longest ("root") loop,
     /// clamped to 1..=64. The ensemble period is N root loops: every track
     /// repeats within the period, and the clock wraps at the period end so
@@ -297,6 +327,11 @@ pub struct LoopEngine {
     /// Per-track playback gain trim (linear amplitude as f32 bits;
     /// 1.0 = 0 dB). Same output-only semantics as `vol`.
     trk_gain: [AtomicU32; MAX_LOOPS],
+    /// Per-track live effect chains. The manager thread swaps the whole
+    /// table on `SetTrackEffects`; the RT handler refreshes a cached Arc
+    /// clone when `fx_gen` changes (try_lock — never blocks).
+    fx: std::sync::Mutex<Arc<[TrackFx; MAX_LOOPS]>>,
+    fx_gen: AtomicU64,
     /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat; beats per
     /// measure (time-signature numerator, default 4).
     metro_on: AtomicU8,
@@ -325,6 +360,8 @@ impl LoopEngine {
             latency: AtomicU32::new(0),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            fx: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| TrackFx::default()))),
+            fx_gen: AtomicU64::new(0),
             metro_on: AtomicU8::new(0),
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
@@ -414,23 +451,36 @@ impl LoopEngine {
             }
             let buf = unsafe { std::slice::from_raw_parts(self.bufs[t], LOOP_CAP as usize) };
             // Export mirrors the live mix: each track's playback trim
-            // (volume x gain) rides the render.
+            // (volume x gain) and effect chain ride the render. The chain
+            // uses FRESH private instances (phase 0) so the live instances
+            // the RT thread is advancing are never touched.
             let tamp = self.loop_vol(t) * self.loop_gain(t);
+            let fx: Vec<Arc<crate::fx::Instance>> = {
+                let tb = self.fx.lock().unwrap();
+                tb[t].slots().iter().filter_map(|s| s.inst.spawn_fresh(&s.desc)).collect()
+            };
+            let mix = |x: f32| {
+                let mut s = x * tamp;
+                for f in &fx {
+                    s = f.process_private(s);
+                }
+                s
+            };
             for p in 0..(periods / max_len as u64) {
                 let base = p * max_len as u64;
                 let start = (base % l) as usize;
                 let end = ((base + max_len as u64) % l) as usize;
                 if end > start {
                     for k in 0..(end - start) {
-                        out[(base + k as u64) as usize] += buf[start + k] * tamp;
+                        out[(base + k as u64) as usize] += mix(buf[start + k]);
                     }
                 } else {
                     let first = (l - start as u64) as usize;
                     for k in 0..first {
-                        out[(base + k as u64) as usize] += buf[start + k] * tamp;
+                        out[(base + k as u64) as usize] += mix(buf[start + k]);
                     }
                     for k in 0..end {
-                        out[(base + first as u64 + k as u64) as usize] += buf[k] * tamp;
+                        out[(base + first as u64 + k as u64) as usize] += mix(buf[k]);
                     }
                 }
             }
@@ -527,6 +577,25 @@ impl LoopEngine {
     /// Set track `i`'s gain trim (linear amplitude; 0 = silence).
     pub fn set_loop_gain(&self, i: usize, amp: f32) {
         self.trk_gain[i].store(amp.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Replace track `i`'s live effect chain (manager thread).
+    pub fn set_track_fx(&self, i: usize, chain: TrackFx) {
+        let mut t = self.fx.lock().unwrap();
+        let fresh = core::array::from_fn(|k| if k == i { chain.clone() } else { t[k].clone() });
+        *t = Arc::new(fresh);
+        drop(t);
+        self.fx_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current effect-chain table (GUI snapshots; the RT handler picks it up
+    /// when `fx_gen` moves — see `Proc::process`).
+    pub fn fx_table(&self) -> Arc<[TrackFx; MAX_LOOPS]> {
+        self.fx.lock().unwrap().clone()
+    }
+
+    pub fn fx_gen(&self) -> u64 {
+        self.fx_gen.load(Ordering::Relaxed)
     }
 
     /// Metronome state: (on, bpm, clicks per beat, beats per measure).
@@ -797,6 +866,9 @@ fn run(
         metro_tone: 0,
         prev_metro_on: false,
         sample_no: 0,
+        fx_cache: engine.fx_table(),
+        fx_cache_gen: engine.fx_gen(),
+        fx_rt: Vec::new(),
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -974,6 +1046,9 @@ fn run(
             Ok(Cmd::SetDependent(dep)) => {
                 engine.mode.store(if dep { 1 } else { 0 }, Ordering::Relaxed);
                 send_loop_state(&engine, &evt_tx);
+            }
+            Ok(Cmd::SetTrackEffects { i, chain }) => {
+                engine.set_track_fx(i.min(MAX_LOOPS - 1), chain);
             }
             Ok(Cmd::SetRootLoops(n)) => {
                 engine.root_loops.store(n.clamp(1, 64), Ordering::Relaxed);
@@ -1412,6 +1487,44 @@ struct Proc {
     prev_metro_on: bool,
     /// Absolute sample counter (metronome timeline).
     sample_no: u64,
+    /// Cached effect-chain table; refreshed from the engine when fx_gen
+    /// moves (rare, user-driven — the only allocation left on this thread).
+    fx_cache: Arc<[TrackFx; MAX_LOOPS]>,
+    fx_cache_gen: u64,
+    /// Per-track, per-slot cached slider snapshots (+ the instance
+    /// generation they were read at), refreshed per block on change.
+    fx_rt: Vec<Vec<FxRt>>,
+}
+
+/// RT-side snapshot of one effect instance's sliders.
+struct FxRt {
+    gen: u64,
+    p: [f32; crate::fx::MAX_PARAMS],
+}
+
+impl Proc {
+    /// Run one loop-output sample through the track's effect chain (the
+    /// volume x gain trim has already been multiplied into `x`).
+    #[inline]
+    fn fx_mix(&mut self, t: usize, x: f32) -> f32 {
+        let chain = &self.fx_cache[t];
+        if chain.is_empty() {
+            return x;
+        }
+        let mut s = x;
+        for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
+            let inst = &slot.inst;
+            let g = inst.param_gen();
+            if g != rt.gen {
+                inst.read_params(&mut rt.p);
+                rt.gen = g;
+            }
+            // SAFETY: the live chain is advanced by this thread only, and
+            // `rt.p` holds the instance's current slider snapshot.
+            s = unsafe { inst.call_sample(s, &rt.p) };
+        }
+        s
+    }
 }
 
 impl ProcessHandler for Proc {
@@ -1441,6 +1554,22 @@ impl ProcessHandler for Proc {
             self.engine.len[i].load(Ordering::Relaxed)
         });
         let mode = self.engine.mode.load(Ordering::Relaxed);
+        // Pick up edited effect chains (user action only; try_lock so the
+        // audio path can never block on the manager thread).
+        let fxg = self.engine.fx_gen.load(Ordering::Relaxed);
+        if fxg != self.fx_cache_gen {
+            if let Ok(tb) = self.engine.fx.try_lock() {
+                self.fx_cache = tb.clone();
+                self.fx_cache_gen = fxg;
+                self.fx_rt = self
+                    .fx_cache
+                    .iter()
+                    .map(|tf| {
+                        tf.slots().iter().map(|_| FxRt { gen: 0, p: [0.0; crate::fx::MAX_PARAMS] }).collect()
+                    })
+                    .collect();
+            }
+        }
         // Per-track output trim (volume x gain, linear) snapshotted once per
         // cycle; applied to each loop's PLAYBACK contribution only, so the
         // mix level rides the slider while recorded content stays at raw
@@ -1624,7 +1753,8 @@ impl ProcessHandler for Proc {
                                 // One read serves playback and the overdub mix
                                 // (OD sums live input onto the take in place).
                                 let old = self.engine.read(t, off as u32);
-                                play += old * amp[t];
+                                // Effects (if any) run after gain x volume.
+                                play += self.fx_mix(t, old * amp[t]);
                                 if st == TR_OD {
                                     // Additive overdub: layer the live input
                                     // on top of the existing recording at its
@@ -1635,7 +1765,7 @@ impl ProcessHandler for Proc {
                             } else {
                                 let off = self.pos[t] % l;
                                 let old = self.engine.read(t, off as u32);
-                                play += old * amp[t];
+                                play += self.fx_mix(t, old * amp[t]);
                                 if st == TR_OD {
                                     self.engine.write(t, off as u32, old + src_in);
                                 }
@@ -1785,6 +1915,53 @@ fn describe_err(e: jack::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ensemble render must run each track's effect chain (on private
+    /// instances, leaving the live ones untouched) after the vol x gain trim.
+    #[test]
+    fn render_ensemble_applies_effect_chain() {
+        if !crate::fx::rustc_available() {
+            return; // environments without a compiler skip the loader
+        }
+        let dir = std::env::temp_dir().join(format!("simplooper-fxrender-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::fx::TEMPLATE_FILE), crate::fx::TEMPLATE_SRC).unwrap();
+        let mut reg = crate::fx::Registry::open(dir.clone());
+        reg.rescan();
+        assert!(reg.desc("template").is_some(), "template must load");
+
+        let e = LoopEngine::new();
+        let n = 4000usize;
+        e.import_track(0, &vec![0.5f32; n]);
+        e.set_loop_vol(0, 1.0);
+        e.set_loop_gain(0, 1.0);
+        let desc = reg.desc("template").unwrap().clone();
+
+        // No chain: the render is the content itself (trim = 1).
+        let plain = e.render_ensemble(1).unwrap();
+        assert!(plain.iter().take(n).all(|&v| (v - 0.5).abs() < 1e-6));
+
+        // Template at depth 0: exact pass-through, per the ABI contract.
+        let inst0 = reg.create_instance("template", 48000.0, &[0.0, 4.0, 1.0, 1.0]).unwrap();
+        e.set_track_fx(0, TrackFx { slots: std::sync::Arc::new(vec![FxSlot { inst: inst0, desc: desc.clone() }]) });
+        assert_eq!(e.fx_gen(), 1);
+        let thru = e.render_ensemble(1).unwrap();
+        assert!(thru.iter().take(n).all(|&v| (v - 0.5).abs() < 1e-3), "depth 0 must pass through");
+
+        // depth 1 / mix 1: the tremolo must dip the render (a full LFO
+        // cycle lands inside the 4000-sample window at 4 Hz).
+        let inst1 = reg.create_instance("template", 48000.0, &[1.0, 4.0, 1.0, 1.0]).unwrap();
+        e.set_track_fx(0, TrackFx { slots: std::sync::Arc::new(vec![FxSlot { inst: inst1.clone(), desc }]) });
+        assert_eq!(e.fx_gen(), 2);
+        let wet = e.render_ensemble(1).unwrap();
+        let lo = wet.iter().take(n).copied().fold(f32::MAX, f32::min);
+        assert!(lo < 0.45, "tremolo must modulate the render (min was {lo})");
+        // Rendering ran on private clones: the live instance is untouched.
+        assert_eq!(inst1.param(0), 1.0);
+        assert_eq!(e.fx_table()[0].slots().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn engine_fresh() {

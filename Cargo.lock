@@ -2681,6 +2681,7 @@ dependencies = [
  "egui",
  "image",
  "jack",
+ "libloading 0.8.9",
  "rfd",
  "rubato",
  "rusty_flac",

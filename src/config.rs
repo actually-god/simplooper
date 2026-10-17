@@ -18,6 +18,15 @@ pub struct MidiBinding {
     pub bind: Option<MidiBind>,
 }
 
+/// One enabled effect in a loop's saved chain (script stem + slider values,
+/// in chain order). The stem is the key: dropping scripts is always safe.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackFxSave {
+    pub stem: String,
+    #[serde(default)]
+    pub params: Vec<f32>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Keyboard shortcuts as key names (e.g. `"R"`, `"Space"`), one per entry
@@ -65,6 +74,14 @@ pub struct Config {
     /// Easy quantize: snap to the metronome grid instead of the root loop.
     #[serde(default)]
     pub q_metro: bool,
+    /// Effects folder ("" = default: `effects/` next to the installed
+    /// package). The folder is created and seeded on first use.
+    #[serde(default)]
+    pub fx_dir: String,
+    /// Per-loop effect chains: index = track, entries = enabled scripts in
+    /// chain order (each stem + its slider values).
+    #[serde(default)]
+    pub track_fx: Vec<Vec<TrackFxSave>>,
 }
 
 impl Default for Config {
@@ -85,6 +102,8 @@ impl Default for Config {
             metro_sub: default_metro_sub(),
             metro_num: default_metro_num(),
             q_metro: false,
+            fx_dir: String::new(),
+            track_fx: Vec::new(),
         }
     }
 }
@@ -173,6 +192,8 @@ mod tests {
             q_metro: true,
             trk_vol: vec![127, 100],
             trk_gain: vec![80, 60],
+            fx_dir: "/tmp/effects".into(),
+            track_fx: vec![vec![TrackFxSave { stem: "template".into(), params: vec![0.5, 4.0] }]],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -189,6 +210,9 @@ mod tests {
         assert_eq!(back.ports_out, cfg.ports_out);
         assert_eq!(back.trk_vol, cfg.trk_vol);
         assert_eq!(back.trk_gain, cfg.trk_gain);
+        assert_eq!(back.fx_dir, "/tmp/effects");
+        assert_eq!(back.track_fx[0][0].stem, "template");
+        assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);
     }
 
     #[test]

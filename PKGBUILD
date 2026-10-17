@@ -22,6 +22,9 @@ license=(MIT)
 # (winit/glutin/wayland) also dlopens its libraries, so nothing else is a
 # hard runtime dep.
 depends=(libjack.so)
+# The per-loop effects framework compiles user effect scripts at runtime with
+# plain rustc; without it the app runs, custom effects just refuse to build.
+optdepends=('rust: build per-loop effect scripts dropped into the effects folder')
 # Build: cargo/rust may come from rustup or pacman; `jack` provides the
 # headers + .pc file, `pkgconf` finds it; either JACK implementation works.
 makedepends=(cargo rust pkgconf jack)
