@@ -9,6 +9,13 @@ independent/dependent loop modes, and an easy quantize tool.
 - **4-loop engine** — each track has its own pre-allocated buffer (~60 s at
   48 kHz) and runs fully in the realtime process callback: record (fresh
   capture), overdub (play while writing live input on top), play, clear.
+- **Overdub undo/redo** — `UNDO` / `REDO` buttons in the main window (keys
+  `U` / `Y`, both rebindable and MIDI-bindable) revert or re-apply the most
+  recent overdub: the loop it was dubbed over goes back to the exact content
+  it had before that overdub started. Each overdub start snapshots the track,
+  8 levels deep per direction; re-recording, clearing, importing or
+  quantizing invalidates the affected history so discarded audio is never
+  resurrected.
 - **Dashboard** — the main window is a grid of four track rows, each showing
   the recorded waveform plus REC / OD / PLAY / CLEAR buttons.
 - **Settings menu** — the three-bar (hamburger) button in the top-left opens
@@ -105,6 +112,8 @@ selected one:
 | `O` | overdub toggle |
 | `C` | clear the selected loop |
 | `D` | toggle independent/dependent mode |
+| `U` | undo the last overdub |
+| `Y` | redo the last undone overdub |
 | `Del` | clear the selected loop (fixed — not rebindable) |
 
 Every key in the table can be reassigned in settings → **MIDI bindings**
@@ -136,9 +145,9 @@ src/
 - `Backend::start()` spawns the **audio manager thread**, which owns the
   `jack::Client` (`NO_START`). GUI ↔ audio communication is two bounded
   channels: commands (`Refresh`, `Apply{ins,outs}`, `Quit`, `ToggleRecord`,
-  `ToggleOverdub`, `TogglePlay`, `ClearTrack`, `SetDependent`, `Quantize`,
-  `SetRootLoops`) and events (`Ready`, `Ports`, `Applied`, `Midi`, `Xrun`,
-  `LoopState`, errors).
+  `ToggleOverdub`, `TogglePlay`, `ClearTrack`, `UndoOverdub`, `RedoOverdub`,
+  `SetDependent`, `Quantize`, `SetRootLoops`) and events (`Ready`, `Ports`,
+  `Applied`, `Midi`, `Xrun`, `LoopState`, `UndoState`, errors).
 - The client is **never deactivated**: a fixed pool of 16 in / 16 out ports
   is created once; `Apply` only (dis)connects them. This avoids a jack-crate
   bug where notification callbacks survive `clear_callbacks` after deactivation.
@@ -223,4 +232,4 @@ run it before submitting to the AUR or after any PKGBUILD change.
 - [x] Quantize to grid (beat/bar) with zero-crossing refinement
 - [ ] Per-slot send/return levels, mute/solo
 - [x] Keyboard shortcuts for loop actions
-- [ ] Undo/redo of loop edits
+- [x] Undo/redo of loop edits (overdub undo/redo)
