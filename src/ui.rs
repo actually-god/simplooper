@@ -1308,14 +1308,22 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                         app.send_metro();
                     }
                     ui.label("· subdivision");
-                    let sub = egui::ComboBox::from_id_salt("metro_sub")
+                    // NB: `ComboBox::show_ui` returns the BUTTON response,
+                    // which egui never marks changed when a popup item is
+                    // picked — watch the `selectable_value` responses instead
+                    // (this was why a subdivision change only reached the
+                    // engine on the next play/stop click).
+                    let mut sub_changed = false;
+                    egui::ComboBox::from_id_salt("metro_sub")
                         .selected_text(SUBDIVISIONS[app.metro_sub.min(SUBDIVISIONS.len() - 1)].1)
                         .show_ui(ui, |ui| {
                             for (n, (_, name)) in SUBDIVISIONS.iter().enumerate() {
-                                ui.selectable_value(&mut app.metro_sub, n, *name);
+                                if ui.selectable_value(&mut app.metro_sub, n, *name).changed() {
+                                    sub_changed = true;
+                                }
                             }
                         });
-                    if sub.response.changed() {
+                    if sub_changed {
                         app.send_metro();
                     }
                 });
