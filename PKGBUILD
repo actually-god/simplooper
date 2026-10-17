@@ -6,11 +6,11 @@
 pkgname=simplooper
 # Keep in sync with Cargo.toml
 pkgver=0.1.0
-# Bumped for the re-cut v0.1.0 tag (Delete reserved as clear-bindings key,
-# mutual exclusion of key/MIDI learn modes, first-row selection-frame clip
-# fix; on top of import/export, metronome, latency compensation) so
-# `pacman -U` upgrades existing 0.1.0-5 installs.
-pkgrel=6
+# Bumped for the re-cut v0.1.0 tag (configurable metronome beats per
+# measure, three-tone click, instant downbeat start, play/stop metronome
+# button; on top of import/export, metronome, latency compensation) so
+# `pacman -U` upgrades existing 0.1.0-6 installs.
+pkgrel=7
 pkgdesc="Lightweight JACK step looper: four quantized loops, MIDI and keyboard control"
 arch=(x86_64)
 url="https://github.com/actually-god/simplooper"
@@ -27,7 +27,7 @@ depends=(libjack.so)
 # headers + .pc file, provided by either JACK implementation.
 makedepends=(cargo rust pkgconf jack)
 source=("https://github.com/actually-god/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('d4b9d76dd0f0097c0319da8726b4c3cf3694bd13b8b2743ea97393e2c82e935e')
+sha256sums=('a6c07444ba6afd11e7f385a4ec7830c82519f5626c707aae911227163fd26ee7')
 
 build() {
   # Remap the build dir out of the binary so no $srcdir paths leak into
