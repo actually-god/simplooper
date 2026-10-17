@@ -105,9 +105,12 @@ pub enum Cmd {
     /// 0..=1000 ms.
     SetLatency { ms: f32 },
     /// Metronome: on/off, tempo in BPM, subdivision in clicks per beat
-    /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...). The click
-    /// goes to every selected output but is never recorded into a loop.
-    SetMetro { on: bool, bpm: u32, sub: u32 },
+    /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...), and beats
+    /// per measure (the time-signature numerator; beat 1 of every measure
+    /// gets the downbeat tone). Three distinct tones: downbeat, quarter note
+    /// and subdivision. The click goes to every selected output but is never
+    /// recorded into a loop.
+    SetMetro { on: bool, bpm: u32, sub: u32, num: u32 },
     /// Easy-quantize every loop against the chosen root loop's recorded length
     /// (or, with `metro = true`, against the metronome grid: beat = 60/bpm
     /// seconds, bar = beat x `num`; `bars` is then unused).
@@ -249,10 +252,12 @@ pub struct LoopEngine {
     root_loops: AtomicU32,
     /// Output delay in samples (latency compensation; 0 = off).
     latency: AtomicU32,
-    /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat.
+    /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat; beats per
+    /// measure (time-signature numerator, default 4).
     metro_on: AtomicU8,
     metro_bpm: AtomicU32,
     metro_sub: AtomicU32,
+    metro_num: AtomicU32,
 }
 
 impl LoopEngine {
@@ -276,6 +281,7 @@ impl LoopEngine {
             metro_on: AtomicU8::new(0),
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
+            metro_num: AtomicU32::new(4),
         })
     }
 
@@ -445,12 +451,13 @@ impl LoopEngine {
         self.latency.load(Ordering::Relaxed)
     }
 
-    /// Metronome state: (on, bpm, clicks per beat).
-    pub fn metro(&self) -> (bool, u32, u32) {
+    /// Metronome state: (on, bpm, clicks per beat, beats per measure).
+    pub fn metro(&self) -> (bool, u32, u32, u32) {
         (
             self.metro_on.load(Ordering::Relaxed) != 0,
             self.metro_bpm.load(Ordering::Relaxed),
             self.metro_sub.load(Ordering::Relaxed),
+            self.metro_num.load(Ordering::Relaxed),
         )
     }
 }
@@ -591,8 +598,13 @@ fn run(
         didx: 0,
         metro_next: 0,
         metro_start: -1,
-        metro_accent: false,
-        metro_cnt: 0,
+        metro_beat_start: 0,
+        metro_beat_len: 0,
+        metro_beat: 0,
+        metro_k: 0,
+        metro_sub_eff: 1,
+        metro_tone: 0,
+        prev_metro_on: false,
         sample_no: 0,
     };
 
@@ -741,10 +753,11 @@ fn run(
                     .latency
                     .store((ms * sample_rate as f32 / 1000.0).round() as u32, Ordering::Relaxed);
             }
-            Ok(Cmd::SetMetro { on, bpm, sub }) => {
+            Ok(Cmd::SetMetro { on, bpm, sub, num }) => {
                 engine.metro_on.store(on as u8, Ordering::Relaxed);
                 engine.metro_bpm.store(bpm.clamp(20, 300), Ordering::Relaxed);
                 engine.metro_sub.store(sub.clamp(1, 16), Ordering::Relaxed);
+                engine.metro_num.store(num.clamp(1, 16), Ordering::Relaxed);
             }
             Ok(Cmd::Quantize { num, den, bars, unit, root, metro, bpm }) => {
                 // Grid source: the metronome tempo, or the root loop's
@@ -1141,11 +1154,23 @@ struct Proc {
     delay: Vec<f32>,
     didx: usize,
     /// Metronome clock: absolute sample of the next click, start sample of
-    /// the click currently sounding (-1 = idle), accent flag, click counter.
+    /// the click currently sounding (-1 = idle), and the beat-grid state:
+    /// start sample and length of the current beat, the index of the next
+    /// quarter note within the measure (0 = downbeat), the index of the next
+    /// click within the beat (0 = quarter note), the subdivision in force
+    /// for the current beat, and the tone of the click currently sounding
+    /// (0 = downbeat, 1 = quarter note, 2 = subdivision).
     metro_next: u64,
     metro_start: i64,
-    metro_accent: bool,
-    metro_cnt: u64,
+    metro_beat_start: u64,
+    metro_beat_len: u64,
+    metro_beat: u32,
+    metro_k: u32,
+    metro_sub_eff: u32,
+    metro_tone: u8,
+    /// Last metronome on/off flag; the rising edge re-arms the grid so the
+    /// first click is always a downbeat, immediately on activation.
+    prev_metro_on: bool,
     /// Absolute sample counter (metronome timeline).
     sample_no: u64,
 }
@@ -1230,11 +1255,23 @@ impl ProcessHandler for Proc {
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
         // Metronome parameters for this cycle (click is added to the output
         // mix only — never to `dry`, so it can never be recorded into a loop).
-        let (metro_on, metro_bpm, metro_sub) = self.engine.metro();
-        let metro_bpm = metro_bpm.max(1);
-        let metro_sub = metro_sub.max(1);
-        let metro_interval =
-            (self.sr as f64 * 60.0 / (metro_bpm as f64 * metro_sub as f64)).max(1.0) as u64;
+        let (metro_on, metro_bpm, metro_sub, metro_num) = self.engine.metro();
+        let metro_bpm = metro_bpm.clamp(20, 300).max(1);
+        let metro_sub = metro_sub.clamp(1, 16);
+        let metro_num = metro_num.clamp(1, 16);
+        if metro_on && !self.prev_metro_on {
+            // Rising edge: re-arm the grid so the very first click is a
+            // downbeat, right now — the metronome always starts directly on
+            // the first beat of a measure.
+            self.metro_beat = 0;
+            self.metro_k = 0;
+            self.metro_sub_eff = metro_sub;
+            self.metro_beat_len = ((self.sr as u64 * 60) / metro_bpm as u64).max(1);
+            self.metro_beat_start = self.sample_no;
+            self.metro_next = self.sample_no;
+            self.metro_start = -1;
+        }
+        self.prev_metro_on = metro_on;
         let metro_dur = (self.sr / 40).max(2); // 25 ms click
         let metro_decay = self.sr as f32 * 0.012;
         // Latency-compensation delay (samples, clamped to the line size).
@@ -1346,22 +1383,56 @@ impl ProcessHandler for Proc {
             if metro_on {
                 if self.sample_no >= self.metro_next {
                     self.metro_start = self.sample_no as i64;
-                    // Accent every 4 beats (first click of each 4-beat bar).
-                    self.metro_accent =
-                        self.metro_cnt.is_multiple_of(4 * metro_sub as u64);
-                    self.metro_cnt += 1;
-                    self.metro_next += metro_interval;
-                    if self.metro_next <= self.sample_no {
-                        // Tempo change outran the schedule: resync.
-                        self.metro_next = self.sample_no + metro_interval;
+                    // Tone of this click: the first quarter note of the
+                    // measure is the downbeat, the other quarter notes get
+                    // the plain quarter tone, everything in between gets the
+                    // subdivision tone.
+                    self.metro_tone = if self.metro_k == 0 {
+                        if self.metro_beat == 0 {
+                            0
+                        } else {
+                            1
+                        }
+                    } else {
+                        2
+                    };
+                    // Schedule the next click: subdivision clicks land at
+                    // even fractions of the current beat; after the last one
+                    // the next click is the next quarter note.
+                    self.metro_k += 1;
+                    if self.metro_k < self.metro_sub_eff.max(1) {
+                        let s = self.metro_sub_eff.max(1) as u64;
+                        self.metro_next = self.metro_beat_start
+                            + self.metro_k as u64 * self.metro_beat_len / s;
+                    } else {
+                        // Next quarter note: rescan tempo, beats-per-measure
+                        // and subdivision here, so a change made mid-beat
+                        // takes effect exactly on that next quarter note.
+                        self.metro_beat = (self.metro_beat + 1) % metro_num.max(1);
+                        self.metro_beat_len =
+                            ((self.sr as u64 * 60) / metro_bpm as u64).max(1);
+                        self.metro_sub_eff = metro_sub;
+                        self.metro_k = 0;
+                        self.metro_beat_start += self.metro_beat_len;
+                        self.metro_next = self.metro_beat_start;
+                        if self.metro_next <= self.sample_no {
+                            // Tempo change outran the schedule: resync.
+                            self.metro_beat_start = self.sample_no;
+                            self.metro_next = self.sample_no + self.metro_beat_len;
+                        }
                     }
                 }
                 if self.metro_start >= 0 {
                     let k = self.sample_no as i64 - self.metro_start;
                     if k >= 0 && (k as u32) < metro_dur {
                         let kf = k as f32;
-                        let f = if self.metro_accent { 1760.0f32 } else { 1175.0 };
-                        let amp = if self.metro_accent { 0.5f32 } else { 0.35 };
+                        // Three distinct tones: downbeat (high, loudest),
+                        // quarter note (mid), subdivision (low, softest).
+                        let (f, amp) = match self.metro_tone {
+                            0 => (1760.0f32, 0.5f32),
+                            1 => (1175.0, 0.35),
+                            _ => (880.0, 0.25),
+                        };
                         click = (kf * std::f32::consts::TAU * f / self.sr as f32).sin()
                             * (-kf / metro_decay).exp()
                             * amp;

@@ -4,6 +4,8 @@
 //! live JACK/PipeWire-JACK server, using a second JACK client as test source:
 //! - audio: two constant sources are summed into one sink through the applied
 //!   port layout (`out = Σ in × gain`);
+//! - metronome: click grid, three-tone pattern and immediate downbeat start
+//!   are captured at a sink;
 //! - midi: messages are sent to `simplooper:midi_in` and must come back parsed.
 //!
 //! If no JACK/PipeWire server is running, the tests skip themselves.
@@ -20,6 +22,16 @@ use jack::{
 use simplooper::audio::{Backend, Cmd, Evt, LOOP_CAP, TR_IDLE, TR_OD, TR_PLAY, TR_REC};
 use simplooper::midi::MidiMsg;
 use simplooper::quantize::{compute_target, snap_length, Unit};
+
+/// Serialize the e2e tests. Each drives the live audio server in real time
+/// and asserts on sample-accurate timing; running them concurrently starves
+/// the JACK clients and produces spurious "ensemble stalled" gaps.
+static E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the e2e lock, surviving a poisoned guard from an earlier failed test.
+fn e2e_lock() -> std::sync::MutexGuard<'static, ()> {
+    E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Poll `b.evt_rx` until an event satisfies `pred` (or the timeout expires).
 fn wait_for(b: &Backend, pred: impl Fn(&Evt) -> bool, timeout: Duration) -> Option<Evt> {
@@ -90,6 +102,7 @@ impl ProcessHandler for MixProc {
 
 #[test]
 fn e2e_audio_mixing() {
+    let _g = e2e_lock();
     let Some((b, _client_name, _sr)) = start_backend() else {
         return; // no audio server: skip
     };
@@ -173,6 +186,7 @@ impl ProcessHandler for MidiSrcProc {
 
 #[test]
 fn e2e_midi_monitor() {
+    let _g = e2e_lock();
     let Some((b, client_name, _sr)) = start_backend() else {
         return; // no audio server: skip
     };
@@ -266,6 +280,7 @@ impl ProcessHandler for SincoSrcProc {
 /// bound action — here "select loop 2", observable via `App::selected_loop`.
 #[test]
 fn e2e_midi_capture_and_fire_sinco() {
+    let _g = e2e_lock();
     let Some((b, client_name, _sr)) = start_backend() else {
         return; // no audio server: skip
     };
@@ -459,6 +474,7 @@ fn acf_norm(x: &[f32], lag: usize) -> f64 {
 
 #[test]
 fn e2e_loop_engine() {
+    let _g = e2e_lock();
     let Some((b, _client_name, sr)) = start_backend() else {
         return; // no audio server: skip
     };
@@ -779,6 +795,190 @@ fn e2e_loop_engine() {
         || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
         Duration::from_secs(2),
         "silence after clear",
+    );
+
+    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    let _ = active;
+}
+
+// --------------------------------------------------------------- metronome --
+
+/// Sink-only capture client: records everything arriving at the applied
+/// simplooper output into a ring buffer.
+struct CapProc {
+    sink: Port<AudioIn>,
+    ring: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+}
+
+impl ProcessHandler for CapProc {
+    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+        let n = ps.n_frames() as usize;
+        if n == 0 {
+            return Control::Continue;
+        }
+        let sink = self.sink.as_slice(ps);
+        let nring = self.ring.len() as u64;
+        let mut w = self.widx.load(Ordering::Relaxed);
+        for s in sink {
+            self.ring[(w % nring) as usize].store(s.to_bits(), Ordering::Relaxed);
+            w += 1;
+        }
+        self.widx.store(w, Ordering::Relaxed);
+        Control::Continue
+    }
+}
+
+/// Detect metronome clicks in a capture. Returns `(onset sample, tone)` per
+/// click, where the tone is classified from the zero-crossing rate over the
+/// first 15 ms of the click: 0 = downbeat (1760 Hz), 1 = quarter (1175 Hz),
+/// 2 = subdivision (880 Hz).
+fn metro_clicks(x: &[f32], sr: u32) -> Vec<(usize, u8)> {
+    let thr = 0.08f32;
+    let win = (sr as usize * 15 / 1000).max(16);
+    let quiet_need = (sr as usize / 500).max(8); // 2 ms of quiet re-arms
+    let mut out: Vec<(usize, u8)> = Vec::new();
+    let mut armed = true;
+    let mut quiet = 0usize;
+    let mut i = 0usize;
+    while i < x.len() {
+        if armed && x[i].abs() > thr {
+            let end = (i + win).min(x.len());
+            let zc = (i + 1..end).filter(|&k| (x[k] >= 0.0) != (x[k - 1] >= 0.0)).count();
+            let f = zc as f32 * sr as f32 / (2.0 * (end - i) as f32);
+            let tone = if f > 1450.0 { 0 } else if f > 1000.0 { 1 } else { 2 };
+            out.push((i, tone));
+            armed = false;
+            quiet = 0;
+            i = end; // skip the rest of this click
+        } else {
+            // Re-arm only after a sustained quiet run, so zero crossings
+            // inside one click cannot split it into two onsets.
+            if x[i].abs() < thr * 0.3 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            if quiet >= quiet_need {
+                armed = true;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn e2e_metronome() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+
+    let (client, _status) = Client::new("metro_test", ClientOptions::NO_START_SERVER)
+        .expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .unwrap();
+
+    b.cmd(Cmd::Apply { ins: vec![], outs: vec![format!("{src_name}:sink")] });
+    assert!(
+        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
+            .is_some(),
+        "metronome test: output not applied"
+    );
+    // Let the sink settle on silence before arming the click.
+    std::thread::sleep(Duration::from_millis(150));
+
+    let read_range = |a: u64, c: u64| -> Vec<f32> {
+        let n = ring_n as u64;
+        (a..c)
+            .map(|i| f32::from_bits(ring[(i % n) as usize].load(Ordering::Relaxed)))
+            .collect()
+    };
+
+    // --- Phase 1: activation starts immediately on the downbeat ------------
+    // 120 BPM, eighth-note subdivision, 4 beats per measure.
+    let beat = sr as usize / 2; // samples per quarter note
+    let start = widx.load(Ordering::Relaxed);
+    b.cmd(Cmd::SetMetro { on: true, bpm: 120, sub: 2, num: 4 });
+    std::thread::sleep(Duration::from_millis(2600)); // ~5 beats
+    let x = read_range(start, widx.load(Ordering::Relaxed));
+    let clicks = metro_clicks(&x, sr);
+    assert!(!clicks.is_empty(), "metronome produced no clicks");
+    assert!(
+        clicks[0].0 < sr as usize / 10,
+        "first click {:.0} ms after activation — must start directly on the beat",
+        clicks[0].0 as f32 * 1000.0 / sr as f32
+    );
+
+    // Expected tone pattern for 4/4 with eighth notes:
+    // downbeat, sub, quarter, sub, quarter, sub, quarter, sub, downbeat, sub.
+    let expect = [0u8, 2, 1, 2, 1, 2, 1, 2, 0, 2];
+    assert!(
+        clicks.len() >= expect.len(),
+        "expected at least {} clicks in 2.6 s, got {}",
+        expect.len(),
+        clicks.len()
+    );
+    for (k, &want) in expect.iter().enumerate() {
+        assert_eq!(
+            clicks[k].1, want,
+            "click {k} has tone {} ({} Hz-class), expected {want} at {:.3} s",
+            clicks[k].1,
+            [1760, 1175, 880][clicks[k].1 as usize],
+            clicks[k].0 as f32 / sr as f32
+        );
+    }
+    // Clicks land on the eighth-note grid (every half beat, ±10%).
+    for k in 1..expect.len() {
+        let d = clicks[k].0 - clicks[k - 1].0;
+        let want = beat / 2;
+        assert!(
+            (d as isize - want as isize).abs() < (want / 10) as isize,
+            "click {k} off grid: interval {d}, expected ~{want}"
+        );
+    }
+
+    // --- Phase 2: subdivision change applies on the next quarter note ------
+    let start2 = widx.load(Ordering::Relaxed);
+    b.cmd(Cmd::SetMetro { on: true, bpm: 120, sub: 4, num: 4 });
+    std::thread::sleep(Duration::from_millis(1500)); // 3 more beats
+    let end2 = widx.load(Ordering::Relaxed);
+    let x2 = read_range(start2, end2);
+    // Analyze only the last ~0.8 s: fully inside the sixteenth-note grid.
+    let tail_at = x2.len().saturating_sub(sr as usize * 8 / 10);
+    let clicks2 = metro_clicks(&x2[tail_at..], sr);
+    assert!(
+        clicks2.len() >= 4,
+        "sixteenth subdivision not applied after the change: {} clicks in 0.8 s",
+        clicks2.len()
+    );
+    for k in 1..clicks2.len() {
+        let d = clicks2[k].0 - clicks2[k - 1].0;
+        let want = beat / 4;
+        assert!(
+            (d as isize - want as isize).abs() < (want / 6) as isize,
+            "post-change click {k} off the sixteenth grid: interval {d}, expected ~{want}"
+        );
+    }
+
+    // --- Phase 3: stop silences the click -----------------------------------
+    b.cmd(Cmd::SetMetro { on: false, bpm: 120, sub: 4, num: 4 });
+    std::thread::sleep(Duration::from_millis(400));
+    let start3 = widx.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(600));
+    let x3 = read_range(start3, widx.load(Ordering::Relaxed));
+    assert!(
+        metro_clicks(&x3, sr).is_empty(),
+        "metronome still clicking after stop"
     );
 
     b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
