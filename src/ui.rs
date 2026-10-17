@@ -94,6 +94,8 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = [
     Some(egui::Key::M), // metronome on / off
     None,               // select next loop
     None,               // select previous loop
+    Some(egui::Key::U), // undo last overdub
+    Some(egui::Key::Y), // redo last undone overdub
 ];
 
 /// Metronome subdivisions: (clicks per beat, display name).
@@ -223,6 +225,10 @@ pub struct App {
     track_state: [u8; MAX_LOOPS],
     track_len: [u32; MAX_LOOPS],
     wave: [Option<WaveCache>; MAX_LOOPS],
+    /// Overdub undo/redo availability, mirrored from the audio thread via
+    /// `Evt::UndoState` (drives the UNDO/REDO buttons' enabled state).
+    can_undo: bool,
+    can_redo: bool,
 
     // --- easy quantize tool ---
     /// Which loop's recorded length defines the quantize grid (0 = Loop 1).
@@ -353,6 +359,8 @@ impl App {
             track_state: [0u8; MAX_LOOPS],
             track_len: [0u32; MAX_LOOPS],
             wave: core::array::from_fn(|_| None),
+            can_undo: false,
+            can_redo: false,
             q_root_loop: 0,
             q_num: "4".into(),
             q_den: "4".into(),
@@ -564,6 +572,8 @@ impl App {
             MidiAction::SelectPrev => {
                 self.selected = (self.selected + MAX_LOOPS - 1) % MAX_LOOPS;
             }
+            MidiAction::UndoOverdub => self.backend.cmd(Cmd::UndoOverdub),
+            MidiAction::RedoOverdub => self.backend.cmd(Cmd::RedoOverdub),
         }
     }
 
@@ -644,6 +654,10 @@ impl App {
             }
             Evt::Quantized { summary } => {
                 self.q_result = Some(summary);
+            }
+            Evt::UndoState { can_undo, can_redo } => {
+                self.can_undo = can_undo;
+                self.can_redo = can_redo;
             }
             Evt::Midi(raw) => {
                 if let Some(msg) = MidiMsg::parse(&raw.bytes) {
@@ -953,6 +967,8 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     MidiAction::PlaySelected,
                     MidiAction::ImportSelected,
                     MidiAction::Export,
+                    MidiAction::UndoOverdub,
+                    MidiAction::RedoOverdub,
                     MidiAction::Dependent,
                     MidiAction::Metronome,
                     MidiAction::SelectNext,
@@ -1193,6 +1209,30 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
             ui.separator();
             if ui.button("Export").clicked() {
                 app.show_export = true;
+            }
+            // Overdub undo/redo (global — acts on the most recent overdub).
+            let b_undo = egui::Button::new(RichText::new("UNDO").monospace());
+            let r_undo = ui
+                .add_enabled(app.can_undo, b_undo)
+                .on_hover_text(if app.can_undo {
+                    "Undo the last overdub: the loop it was dubbed over reverts to its \
+                     pre-overdub content (U). Redo with Y or the REDO button. Bindable via MIDI."
+                } else {
+                    "Nothing to undo yet — overdub a loop first (key: U)"
+                });
+            if r_undo.clicked() {
+                app.backend.cmd(Cmd::UndoOverdub);
+            }
+            let b_redo = egui::Button::new(RichText::new("REDO").monospace());
+            let r_redo = ui
+                .add_enabled(app.can_redo, b_redo)
+                .on_hover_text(if app.can_redo {
+                    "Re-apply the undone overdub (Y). Bindable via MIDI."
+                } else {
+                    "Nothing to redo — undo an overdub first (key: Y)"
+                });
+            if r_redo.clicked() {
+                app.backend.cmd(Cmd::RedoOverdub);
             }
             ui.label(
                 RichText::new("independent = each loop plays on its own clock").weak().small(),
@@ -1871,5 +1911,18 @@ mod tests {
         app.arm_key_slot(2);
         assert_eq!(app.midi_learning_slot, None);
         assert_eq!(app.learning_slot, Some(2));
+    }
+
+    #[test]
+    fn undo_redo_slots_are_appended_with_default_keys() {
+        // The persisted shortcut table is positional: undo/redo must live at
+        // the END of MidiAction::ALL (never inserted), bound to U / Y.
+        let n = N_ACTIONS;
+        assert_eq!(MidiAction::ALL[n - 2], MidiAction::UndoOverdub);
+        assert_eq!(MidiAction::ALL[n - 1], MidiAction::RedoOverdub);
+        assert_eq!(SHORTCUT_DEFAULTS[n - 2], Some(egui::Key::U));
+        assert_eq!(SHORTCUT_DEFAULTS[n - 1], Some(egui::Key::Y));
+        assert_eq!(MidiAction::UndoOverdub.label(), "undo overdub");
+        assert_eq!(MidiAction::RedoOverdub.label(), "redo overdub");
     }
 }

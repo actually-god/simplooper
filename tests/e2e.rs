@@ -6,6 +6,8 @@
 //!   port layout (`out = Σ in × gain`);
 //! - metronome: click grid, three-tone pattern and immediate downbeat start
 //!   are captured at a sink;
+//! - overdub undo/redo: an additive overdub is undone back to the pre-overdub
+//!   content and redone, verified acoustically at the sink;
 //! - midi: messages are sent to `simplooper:midi_in` and must come back parsed.
 //!
 //! If no JACK/PipeWire server is running, the tests skip themselves.
@@ -797,6 +799,156 @@ fn e2e_loop_engine() {
         "silence after clear",
     );
 
+    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    let _ = active;
+}
+
+// ------------------------------------------------------ overdub undo/redo --
+
+#[test]
+fn e2e_overdub_undo() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let mode = Arc::new(AtomicU8::new(0));
+    let const_val = Arc::new(AtomicU32::new(0.25f32.to_bits()));
+
+    let (client, _status) = Client::new("undo_test", ClientOptions::NO_START_SERVER)
+        .expect("no JACK server");
+    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            LoopSrcProc {
+                out: out_a,
+                sink,
+                mode: mode.clone(),
+                const_val: const_val.clone(),
+                seed: 0x9e37_79b9,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+
+    b.cmd(Cmd::Apply {
+        ins: vec![format!("{src_name}:out_a")],
+        outs: vec![format!("{src_name}:sink")],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "backend did not apply the 1-in/1-out layout"
+    );
+
+    // --- record +0.25 for ~400 ms, keep it playing -------------------------
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_REC),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "track 0 did not enter REC"
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::LoopState { states, lens } if states[0] == TR_PLAY && lens[0] > 12_000),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "track 0 did not stop into PLAY"
+    );
+    let len0 = b.engine.len_of(0);
+
+    // --- additive overdub of -0.1 (buffer becomes 0.15 everywhere) ---------
+    const_val.store((-0.1f32).to_bits(), Ordering::Relaxed);
+    b.cmd(Cmd::ToggleOverdub { i: 0 });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_OD),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "track 0 did not enter OD"
+    );
+    let od_time = Duration::from_millis(len0 as u64 * 1000 / sr as u64 + 800);
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.05).abs() < 0.03).unwrap_or(false),
+        od_time,
+        "overdub pass: sink -> dry(-0.1) + mixed take(0.15) = 0.05",
+    );
+    b.cmd(Cmd::ToggleOverdub { i: 0 }); // back to PLAY
+    const_val.store(0.0f32.to_bits(), Ordering::Relaxed);
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.15).abs() < 0.03).unwrap_or(false),
+        Duration::from_secs(2),
+        "overdubbed content (0.15) playing back",
+    );
+
+    // --- undo: the loop reverts to its pre-overdub content (0.25) ----------
+    b.cmd(Cmd::UndoOverdub);
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Notice(m) if m.contains("undid overdub")),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "no undo notice"
+    );
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::LoopState { states, lens } if states[0] == TR_PLAY && lens[0] == len0),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "track 0 did not resume playing at its original length after undo"
+    );
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.25).abs() < 0.03).unwrap_or(false),
+        Duration::from_secs(2),
+        "undone content (0.25) playing back",
+    );
+
+    // --- redo: the overdubbed state comes back (0.15) ----------------------
+    b.cmd(Cmd::RedoOverdub);
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Notice(m) if m.contains("redid overdub")),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "no redo notice"
+    );
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.15).abs() < 0.03).unwrap_or(false),
+        Duration::from_secs(2),
+        "redone overdub (0.15) playing back",
+    );
+
+    // --- cleanup ------------------------------------------------------------
+    b.cmd(Cmd::TogglePlay { i: 0 });
+    b.cmd(Cmd::ClearTrack { i: 0 });
     b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
     let _ = active;
 }

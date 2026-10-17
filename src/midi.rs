@@ -274,6 +274,11 @@ pub enum MidiAction {
     SelectNext,
     /// Select the previous loop (wraps around).
     SelectPrev,
+    /// Undo the most recent overdub (global — reverts the loop it was dubbed
+    /// over to its pre-overdub content).
+    UndoOverdub,
+    /// Redo the most recently undone overdub.
+    RedoOverdub,
 }
 
 impl MidiAction {
@@ -283,7 +288,7 @@ impl MidiAction {
     /// loops (the settings panel shows these through a loop dropdown), then
     /// dependent mode, metronome, and next/previous selection. New actions
     /// must be APPENDED (the persisted `shortcuts` vector is positional).
-    pub const ALL: [MidiAction; 90] = [
+    pub const ALL: [MidiAction; 92] = [
         MidiAction::RecSelected,
         MidiAction::OdSelected,
         MidiAction::ClearSelected,
@@ -377,6 +382,9 @@ impl MidiAction {
         MidiAction::Metronome,
         MidiAction::SelectNext,
         MidiAction::SelectPrev,
+        // APPENDED (never inserted): the persisted shortcut table is positional.
+        MidiAction::UndoOverdub,
+        MidiAction::RedoOverdub,
     ];
 
     /// Position of `a` in [`MidiAction::ALL`] (binding-table index).
@@ -402,6 +410,8 @@ impl MidiAction {
             MidiAction::Metronome => "metronome on / off".into(),
             MidiAction::SelectNext => "select next loop".into(),
             MidiAction::SelectPrev => "select previous loop".into(),
+            MidiAction::UndoOverdub => "undo overdub".into(),
+            MidiAction::RedoOverdub => "redo overdub".into(),
         }
     }
 }

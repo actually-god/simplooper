@@ -70,6 +70,12 @@ pub enum Cmd {
     ToggleOverdub { i: usize },
     /// Start/stop playback of a loop track.
     TogglePlay { i: usize },
+    /// Undo the most recent overdub (across all tracks): the track it was
+    /// dubbed over reverts to the content it had before that overdub started.
+    /// The undone state goes on the redo stack.
+    UndoOverdub,
+    /// Re-apply the most recently undone overdub.
+    RedoOverdub,
     /// Stop and erase a loop track.
     ClearTrack { i: usize },
     /// Replace track i's recording with `data` (decoded, engine-rate mono
@@ -141,6 +147,9 @@ pub enum Evt {
     LoopState { states: [u8; MAX_LOOPS], lens: [u32; MAX_LOOPS] },
     /// A quantize pass finished; `summary` describes the grid and results.
     Quantized { summary: String },
+    /// Overdub undo/redo availability changed (an overdub started, an
+    /// undo/redo ran, or a content-discarding command invalidated history).
+    UndoState { can_undo: bool, can_redo: bool },
     Midi(RawMidiMsg),
     /// Remote MIDI source ports currently wired into `simplooper:midi_in`
     /// (auto-connected; refreshed on port/client registration events).
@@ -393,6 +402,14 @@ impl LoopEngine {
         core::array::from_fn(|i| self.len[i].load(Ordering::Relaxed))
     }
 
+    /// Clone of track `i`'s recorded content (length + samples). Safe from
+    /// the manager thread while the track is not REC/OD: the RT thread only
+    /// reads buffer data during PLAY.
+    pub fn snapshot(&self, i: usize) -> (u32, Vec<f32>) {
+        let l = self.len_of(i);
+        (l, self.read_range(i, l).to_vec())
+    }
+
     /// Zero the buffer and arm a fresh capture on track i.
     pub fn start_rec(&self, i: usize) {
         self.state[i].store(TR_IDLE, Ordering::Relaxed);
@@ -492,6 +509,118 @@ fn loop_state(engine: &LoopEngine) -> ([u8; MAX_LOOPS], [u32; MAX_LOOPS]) {
 fn send_loop_state(engine: &LoopEngine, tx: &SyncSender<Evt>) {
     let (states, lens) = loop_state(engine);
     let _ = tx.send(Evt::LoopState { states, lens });
+}
+
+fn send_undo_state(hist: &OdHistory, tx: &SyncSender<Evt>) {
+    let _ = tx.try_send(Evt::UndoState {
+        can_undo: hist.can_undo(),
+        can_redo: hist.can_redo(),
+    });
+}
+
+/// Max overdub snapshots kept per stack. Each snapshot is one track buffer
+/// (up to LOOP_CAP floats), so 8 deep costs at most ~92 MB per stack in the
+/// absolute worst case (sixteen 60 s tracks) and far less in practice.
+pub const MAX_OD_HISTORY: usize = 8;
+
+/// One overdub-undo entry: a track's full content plus whether it was
+/// playing, captured right before an overdub started (or, for a redo entry,
+/// the state captured at undo time).
+struct OdSnapshot {
+    track: usize,
+    data: Vec<f32>,
+    playing: bool,
+}
+
+/// Global overdub undo/redo history — manager-thread state only, owned by
+/// the audio manager loop.
+///
+/// Every overdub start pushes the dubbed track's pre-overdub buffer onto the
+/// undo stack (and clears the redo stack, like any fresh edit). Undo stops
+/// the track, lets the RT thread quiesce, swaps the buffer for the snapshot,
+/// and pushes the overdubbed state onto the redo stack; redo swaps back.
+/// Commands that discard or rewrite a track's content (fresh record, clear,
+/// import, quantize) invalidate that track's entries so an undo can never
+/// resurrect audio the user deliberately threw away.
+#[derive(Default)]
+pub struct OdHistory {
+    undo: Vec<OdSnapshot>,
+    redo: Vec<OdSnapshot>,
+}
+
+impl OdHistory {
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// An overdub is starting on track `i`: capture its current content.
+    /// MUST be called before arming TR_OD — while the track still reads as
+    /// PLAY/IDLE the RT thread never writes its buffer.
+    pub fn begin(&mut self, engine: &LoopEngine, i: usize) {
+        let playing = engine.state_of(i) == TR_PLAY;
+        let (_, data) = engine.snapshot(i);
+        self.undo.push(OdSnapshot { track: i, data, playing });
+        while self.undo.len() > MAX_OD_HISTORY {
+            self.undo.remove(0);
+        }
+        // A fresh edit invalidates the redo branch.
+        self.redo.clear();
+    }
+
+    /// Undo the most recent overdub. Returns the affected track index, or
+    /// None when the undo stack is empty.
+    pub fn undo(&mut self, engine: &LoopEngine) -> Option<usize> {
+        let s = self.undo.pop()?;
+        let t = s.track;
+        Self::swap_in(engine, s, &mut self.redo);
+        Some(t)
+    }
+
+    /// Re-apply the most recently undone overdub.
+    pub fn redo(&mut self, engine: &LoopEngine) -> Option<usize> {
+        let s = self.redo.pop()?;
+        let t = s.track;
+        Self::swap_in(engine, s, &mut self.undo);
+        Some(t)
+    }
+
+    /// Drop every entry for track `i` (its content was discarded/rewritten).
+    pub fn invalidate_track(&mut self, i: usize) {
+        self.undo.retain(|s| s.track != i);
+        self.redo.retain(|s| s.track != i);
+    }
+
+    /// Drop everything (a quantize rewrote every buffer in place).
+    pub fn clear_all(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Restore snapshot `s` into its track and push the state being replaced
+    /// onto `stack` (the opposite direction's stack).
+    fn swap_in(engine: &LoopEngine, s: OdSnapshot, stack: &mut Vec<OdSnapshot>) {
+        // Was the track audible before we stop it? (Undo during a live
+        // overdub counts as playing.)
+        let cur_playing = matches!(engine.state_of(s.track), TR_PLAY | TR_OD);
+        // Stop first, then let the RT thread quiesce before rewriting the
+        // buffer (same discipline as clear/quantize).
+        engine.state[s.track].store(TR_IDLE, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (_, cur_data) = engine.snapshot(s.track);
+        stack.push(OdSnapshot { track: s.track, data: cur_data, playing: cur_playing });
+        while stack.len() > MAX_OD_HISTORY {
+            stack.remove(0);
+        }
+        engine.import_track(s.track, &s.data);
+        engine.state[s.track].store(
+            if s.playing && !s.data.is_empty() { TR_PLAY } else { TR_IDLE },
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// Manager-side record toggle: start a fresh capture, or stop and keep the
@@ -637,6 +766,9 @@ fn run(
     let mut cur_in: Vec<Option<String>> = vec![None; MAX_SLOTS];
     let mut cur_out: Vec<Option<String>> = vec![None; MAX_SLOTS];
 
+    // Overdub undo/redo history (manager-thread state only).
+    let mut hist = OdHistory::default();
+
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Cmd::Refresh) => send_ports(active.as_client(), &evt_tx),
@@ -654,19 +786,51 @@ fn run(
             }
             Ok(Cmd::ToggleRecord { i }) => {
                 toggle_record(&engine, i);
+                // A fresh capture discards the old content — any history
+                // entry for this track would resurrect discarded audio.
+                if engine.state_of(i) == TR_REC {
+                    hist.invalidate_track(i);
+                    send_undo_state(&hist, &evt_tx);
+                }
                 send_loop_state(&engine, &evt_tx);
             }
             Ok(Cmd::ToggleOverdub { i }) => {
                 match engine.state_of(i) {
                     TR_OD => engine.state[i].store(TR_PLAY, Ordering::Relaxed),
-                    TR_PLAY => engine.state[i].store(TR_OD, Ordering::Relaxed),
+                    TR_PLAY => {
+                        // Snapshot BEFORE arming OD (RT must not be writing).
+                        hist.begin(&engine, i);
+                        engine.state[i].store(TR_OD, Ordering::Relaxed);
+                    }
                     TR_IDLE if engine.len_of(i) > 0 => {
-                        engine.state[i].store(TR_OD, Ordering::Relaxed)
+                        hist.begin(&engine, i);
+                        engine.state[i].store(TR_OD, Ordering::Relaxed);
                     }
                     _ => {} // IDLE with no content, or REC: ignore
                 }
+                send_undo_state(&hist, &evt_tx);
                 send_loop_state(&engine, &evt_tx);
             }
+            Ok(Cmd::UndoOverdub) => match hist.undo(&engine) {
+                Some(t) => {
+                    let _ = evt_tx.send(Evt::Notice(format!("undid overdub on loop {}", t + 1)));
+                    send_undo_state(&hist, &evt_tx);
+                    send_loop_state(&engine, &evt_tx);
+                }
+                None => {
+                    let _ = evt_tx.send(Evt::Notice("nothing to undo".into()));
+                }
+            },
+            Ok(Cmd::RedoOverdub) => match hist.redo(&engine) {
+                Some(t) => {
+                    let _ = evt_tx.send(Evt::Notice(format!("redid overdub on loop {}", t + 1)));
+                    send_undo_state(&hist, &evt_tx);
+                    send_loop_state(&engine, &evt_tx);
+                }
+                None => {
+                    let _ = evt_tx.send(Evt::Notice("nothing to redo".into()));
+                }
+            },
             Ok(Cmd::TogglePlay { i }) => {
                 match engine.state_of(i) {
                     TR_IDLE if engine.len_of(i) > 0 => {
@@ -684,12 +848,17 @@ fn run(
             }
             Ok(Cmd::ClearTrack { i }) => {
                 engine.clear(i);
+                hist.invalidate_track(i);
+                send_undo_state(&hist, &evt_tx);
                 send_loop_state(&engine, &evt_tx);
             }
             Ok(Cmd::ImportTrack { i, data }) => {
                 // The import dialog + decode already ran on the GUI thread;
                 // this is just the buffer swap (track is quiesced by import).
-                engine.import_track(i.min(MAX_LOOPS - 1), &data);
+                let i = i.min(MAX_LOOPS - 1);
+                engine.import_track(i, &data);
+                hist.invalidate_track(i);
+                send_undo_state(&hist, &evt_tx);
                 send_loop_state(&engine, &evt_tx);
             }
             Ok(Cmd::ExportTrack { i, path, fmt }) => {
@@ -793,6 +962,10 @@ fn run(
                         }
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         let lens = engine.quantize_all(target, sample_rate);
+                        // Every buffer was rewritten in place — no overdub
+                        // snapshot still describes its track.
+                        hist.clear_all();
+                        send_undo_state(&hist, &evt_tx);
                         let eff_bpm = 60.0 / (beat / sample_rate as f64);
                         let unit_name = match unit {
                             crate::quantize::Unit::Beat => "beat",
@@ -1598,5 +1771,116 @@ mod tests {
             assert!(e.rec_sample(0, 0.0));
         }
         assert_eq!(e.len_of(0), LOOP_CAP);
+    }
+
+    /// Fill track `i` with a constant and mark it playing (manager-side).
+    fn fill_playing(e: &LoopEngine, i: usize, n: u32, v: f32) {
+        for k in 0..n {
+            e.write(i, k, v);
+        }
+        e.len[i].store(n, Ordering::Relaxed);
+        e.state[i].store(TR_PLAY, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn overdub_undo_redo_roundtrip() {
+        let e = LoopEngine::new();
+        fill_playing(&e, 2, 1000, 0.25);
+        let mut h = OdHistory::default();
+        assert!(!h.can_undo() && !h.can_redo());
+        assert!(h.undo(&e).is_none(), "undo on empty history is a no-op");
+
+        // Overdub starts: snapshot, then simulate the additive write (0.25-0.1).
+        h.begin(&e, 2);
+        assert!(h.can_undo() && !h.can_redo());
+        for k in 0..1000 {
+            e.write(2, k, 0.15);
+        }
+
+        // Undo: buffer back to the pre-overdub content, track resumes playing.
+        assert_eq!(h.undo(&e), Some(2));
+        assert_eq!(e.state_of(2), TR_PLAY);
+        assert_eq!(e.len_of(2), 1000);
+        assert!(e.read_range(2, 1000).iter().all(|&v| (v - 0.25).abs() < 1e-9));
+        assert!(
+            !h.can_undo() && h.can_redo(),
+            "the only entry was undone: nothing left to undo, redo available"
+        );
+
+        // Redo: the overdubbed content comes back.
+        assert_eq!(h.redo(&e), Some(2));
+        assert_eq!(e.state_of(2), TR_PLAY);
+        assert!(e.read_range(2, 1000).iter().all(|&v| (v - 0.15).abs() < 1e-9));
+        assert!(!h.can_redo());
+
+        // Undo again (redo must stay reachable).
+        h.undo(&e);
+        assert!(e.read_range(2, 1000).iter().all(|&v| (v - 0.25).abs() < 1e-9));
+        assert!(h.can_redo());
+    }
+
+    #[test]
+    fn overdub_undo_stacks_across_tracks_and_fresh_begin_clears_redo() {
+        let e = LoopEngine::new();
+        fill_playing(&e, 0, 500, 0.1);
+        fill_playing(&e, 1, 700, 0.2);
+        let mut h = OdHistory::default();
+
+        // Two overdubs on two tracks; undo pops the most recent first.
+        h.begin(&e, 0);
+        for k in 0..500 {
+            e.write(0, k, 0.9);
+        }
+        h.begin(&e, 1);
+        for k in 0..700 {
+            e.write(1, k, 0.8);
+        }
+        assert_eq!(h.undo(&e), Some(1), "undo must take the LAST overdub");
+        assert!(e.read_range(1, 700).iter().all(|&v| (v - 0.2).abs() < 1e-9));
+        // Track 0 keeps its overdubbed content until its own undo.
+        assert!(e.read_range(0, 500).iter().all(|&v| (v - 0.9).abs() < 1e-9));
+        assert_eq!(h.undo(&e), Some(0));
+        assert!(e.read_range(0, 500).iter().all(|&v| (v - 0.1).abs() < 1e-9));
+
+        // A fresh overdub invalidates the redo branch.
+        assert!(h.can_redo());
+        h.begin(&e, 0);
+        assert!(!h.can_redo(), "a new edit clears redo");
+    }
+
+    #[test]
+    fn overdub_history_invalidation_and_cap() {
+        let e = LoopEngine::new();
+        fill_playing(&e, 3, 100, 0.5);
+        let mut h = OdHistory::default();
+        h.begin(&e, 3);
+        h.begin(&e, 3);
+        assert_eq!(h.undo(&e), Some(3));
+        // Clearing the track drops its entries in BOTH directions.
+        h.invalidate_track(3);
+        assert!(!h.can_undo() && !h.can_redo());
+
+        // Depth cap: only the newest MAX_OD_HISTORY snapshots survive.
+        for _ in 0..(MAX_OD_HISTORY + 5) {
+            h.begin(&e, 3);
+        }
+        assert_eq!(h.undo.len(), MAX_OD_HISTORY);
+        h.clear_all();
+        assert!(!h.can_undo() && !h.can_redo());
+    }
+
+    #[test]
+    fn overdub_undo_of_paused_track_stays_paused() {
+        let e = LoopEngine::new();
+        fill_playing(&e, 1, 100, 0.5);
+        e.state[1].store(TR_IDLE, Ordering::Relaxed); // paused with content
+        let mut h = OdHistory::default();
+        h.begin(&e, 1);
+        assert!(!h.undo(&e).is_none());
+        assert_eq!(
+            e.state_of(1),
+            TR_IDLE,
+            "undo restores playback state, not forced playback"
+        );
     }
 }
