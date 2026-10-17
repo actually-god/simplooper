@@ -49,6 +49,10 @@ pub struct Config {
     /// Metronome subdivision as clicks per beat (1 = quarter, 2 = eighth, ...).
     #[serde(default = "default_metro_sub")]
     pub metro_sub: u32,
+    /// Metronome beats per measure (time-signature numerator); the first
+    /// quarter note of every measure gets the downbeat tone.
+    #[serde(default = "default_metro_num")]
+    pub metro_num: u32,
     /// Easy quantize: snap to the metronome grid instead of the root loop.
     #[serde(default)]
     pub q_metro: bool,
@@ -68,6 +72,7 @@ impl Default for Config {
             latency_ms: 0.0,
             metro_bpm: default_metro_bpm(),
             metro_sub: default_metro_sub(),
+            metro_num: default_metro_num(),
             q_metro: false,
         }
     }
@@ -87,6 +92,10 @@ fn default_metro_bpm() -> u32 {
 
 fn default_metro_sub() -> u32 {
     1
+}
+
+fn default_metro_num() -> u32 {
+    4
 }
 
 impl Config {
@@ -149,6 +158,7 @@ mod tests {
             latency_ms: 12.5,
             metro_bpm: 96,
             metro_sub: 3,
+            metro_num: 7,
             q_metro: true,
         };
         let s = serde_json::to_string(&cfg).unwrap();
@@ -160,6 +170,7 @@ mod tests {
         assert!((back.latency_ms - 12.5).abs() < f32::EPSILON);
         assert_eq!(back.metro_bpm, 96);
         assert_eq!(back.metro_sub, 3);
+        assert_eq!(back.metro_num, 7);
         assert!(back.q_metro);
         assert_eq!(back.ports_in, cfg.ports_in);
         assert_eq!(back.ports_out, cfg.ports_out);

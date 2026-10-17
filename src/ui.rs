@@ -239,6 +239,8 @@ pub struct App {
     metro_on: bool,
     /// Tempo in BPM (text field; parsed on apply).
     metro_bpm: String,
+    /// Beats per measure — time-signature numerator (text field; default 4).
+    metro_num: String,
     /// Index into [`SUBDIVISIONS`].
     metro_sub: usize,
 
@@ -360,6 +362,7 @@ impl App {
             q_metro: cfg.q_metro,
             metro_on: false,
             metro_bpm: cfg.metro_bpm.to_string(),
+            metro_num: cfg.metro_num.clamp(1, 16).to_string(),
             metro_sub: SUBDIVISIONS
                 .iter()
                 .position(|(c, _)| *c == cfg.metro_sub)
@@ -564,14 +567,16 @@ impl App {
         }
     }
 
-    /// Push the metronome state (toggle / tempo / subdivision) to the audio
-    /// thread and persist it. Tempo text that fails to parse keeps 120 BPM.
+    /// Push the metronome state (play/stop / tempo / beats per measure /
+    /// subdivision) to the audio thread and persist it. Tempo text that fails
+    /// to parse keeps 120 BPM; beats-per-measure text falls back to 4.
     fn send_metro(&mut self) {
         let bpm = self.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300);
         self.backend.cmd(Cmd::SetMetro {
             on: self.metro_on,
             bpm,
             sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
+            num: self.metro_num.trim().parse::<u32>().unwrap_or(4).clamp(1, 16),
         });
         self.save_config();
     }
@@ -592,6 +597,7 @@ impl App {
             latency_ms: self.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0),
             metro_bpm: self.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300),
             metro_sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
+            metro_num: self.metro_num.trim().parse::<u32>().unwrap_or(4).clamp(1, 16),
             q_metro: self.q_metro,
             // Only selections that were actually applied get persisted.
             ports_in: self.applied_ports.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
@@ -1268,12 +1274,24 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
             .inner_margin(6.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let m = ui.checkbox(&mut app.metro_on, "METRONOME").on_hover_text(
-                        "Click track: audible on all selected outputs but never \
-                         recorded into a loop. Toggle also on M (rebindable in \
-                         Settings).",
+                    // Play/stop button in the same style as the per-loop
+                    // transport buttons: ▶ starts the click immediately on
+                    // the downbeat, ■ stops it.
+                    let (m_label, m_active) =
+                        if app.metro_on { ("■ METRO", true) } else { ("▶ METRO", false) };
+                    let mut b_metro = egui::Button::new(RichText::new(m_label).monospace());
+                    if m_active {
+                        b_metro = b_metro.fill(Color32::from_rgb(90, 140, 90));
+                    }
+                    let r_metro = ui.add(b_metro).on_hover_text(
+                        "Metronome: starts directly on the downbeat. Click track: \
+                         audible on all selected outputs but never recorded into a \
+                         loop. Beat 1 of every measure gets the high downbeat tone, \
+                         the other quarter notes a mid tone, subdivisions a low \
+                         tone. Toggle also on M (rebindable in Settings).",
                     );
-                    if m.changed() {
+                    if r_metro.clicked() {
+                        app.metro_on = !app.metro_on;
                         app.send_metro();
                     }
                     ui.separator();
@@ -1283,7 +1301,13 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                     if r_bpm.changed() && app.metro_bpm.trim().parse::<u32>().is_ok() {
                         app.send_metro();
                     }
-                    ui.label("BPM · subdivision");
+                    ui.label("BPM · beats/measure");
+                    let r_num = ui.add(egui::TextEdit::singleline(&mut app.metro_num).desired_width(30.0));
+                    app.in_text_edit = app.in_text_edit || r_num.has_focus();
+                    if r_num.changed() && app.metro_num.trim().parse::<u32>().is_ok() {
+                        app.send_metro();
+                    }
+                    ui.label("· subdivision");
                     let sub = egui::ComboBox::from_id_salt("metro_sub")
                         .selected_text(SUBDIVISIONS[app.metro_sub.min(SUBDIVISIONS.len() - 1)].1)
                         .show_ui(ui, |ui| {
