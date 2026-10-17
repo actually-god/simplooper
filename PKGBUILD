@@ -26,7 +26,7 @@ depends=(libjack.so)
 # headers + .pc file, `pkgconf` finds it; either JACK implementation works.
 makedepends=(cargo rust pkgconf jack)
 source=("https://github.com/actually-god/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('5e879423777aa4bf25c6b8553733142f90a94b4f6226f1f77a1ceb939b841a61')
+sha256sums=('38775da46bd1dd0c503779b34ccb635496f38888816b76dcbd85ab35640996cd')
 # No check(): the test suite's e2e half drives a live JACK server in real
 # time and self-skips without one, so a build-time run would test nothing
 # new on build machines and double compile time on top of the release build.
