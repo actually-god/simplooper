@@ -14,6 +14,7 @@ pub mod audio;
 pub mod audio_io;
 pub mod config;
 pub mod fx;
+pub mod fxgui;
 pub mod midi;
 pub mod ports;
 pub mod quantize;

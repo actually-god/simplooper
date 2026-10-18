@@ -352,6 +352,10 @@ pub struct App {
     fx_live: Vec<Vec<std::sync::Arc<fx::Instance>>>,
     /// Loop whose Effects window is open (None = closed).
     fx_window: Option<usize>,
+    /// Open effect editor child window (loop row button / effects window).
+    /// Holding it keeps the edited instance alive; dropping it runs the
+    /// custom GUI's destroy. One editor at a time.
+    fx_editor: Option<Box<crate::fxgui::FxEditor>>,
     /// "Effects location" text box (folder of effect scripts).
     fx_dir_edit: String,
     /// Status line shown inside the effects window.
@@ -514,6 +518,7 @@ impl App {
             fx_entries,
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
+            fx_editor: None,
             fx_dir_edit: fx_dir.display().to_string(),
             fx_note: String::new(),
             fx_save_pending: false,
@@ -732,6 +737,11 @@ impl App {
     /// to the audio engine. Also seeds each row's slider values from the
     /// descriptors (stored values win, clamped to range).
     fn rebuild_fx(&mut self, i: usize) {
+        // The editor window edits one specific live instance; a chain
+        // rebuild replaces that instance, so the window must not outlive it.
+        if self.fx_editor.as_ref().is_some_and(|ed| ed.loop_i == i) {
+            self.fx_editor = None;
+        }
         let mut live: Vec<std::sync::Arc<fx::Instance>> = Vec::new();
         let mut slots: Vec<FxSlot> = Vec::new();
         for e in self.fx_entries[i].iter_mut() {
@@ -755,15 +765,57 @@ impl App {
         self.backend.cmd(Cmd::SetTrackEffects { i, chain: TrackFx { slots: std::sync::Arc::new(slots) } });
     }
 
-    /// Ride one effect slider: live instance now, window row for persistence.
-    fn set_fx_param(&mut self, i: usize, slot: usize, par: usize, v: f32) {
-        if let Some(inst) = self.fx_live[i].get(slot) {
-            inst.set_param(par, v);
-        }
-        if let Some(e) = self.fx_entries[i].iter_mut().filter(|e| e.enabled).nth(slot) {
-            if let Some(pv) = e.params.get_mut(par) {
-                *pv = v;
+    /// Open (or reopen) the child editor window for loop `i`'s chain slot
+    /// `slot`. Effects that export a custom GUI get their own canvas;
+    /// everything else gets the auto slider window. Params ride the same
+    /// live instance the sliders used to sit next to on the loop row.
+    fn open_fx_editor(&mut self, i: usize, slot: usize) {
+        self.fx_editor = None; // closing an old window frees its GUI state
+        let Some(stem) = self.fx_entries[i]
+            .iter()
+            .filter(|e| e.enabled)
+            .nth(slot)
+            .map(|e| e.stem.clone())
+        else {
+            return;
+        };
+        let inst = self.fx_live[i].get(slot).cloned();
+        let desc = self.fx_registry.desc(&stem).cloned();
+        let (Some(inst), Some(desc)) = (inst, desc) else { return };
+        let gui = self.fx_registry.gui(&stem);
+        self.fx_editor = Some(Box::new(crate::fxgui::FxEditor::new(
+            i,
+            slot,
+            stem,
+            desc,
+            inst,
+            gui,
+            self.sample_rate as f64,
+        )));
+    }
+
+    /// Draw the editor window and flush its param rides into the persisted
+    /// chain rows (config save goes through `fx_save_pending`).
+    fn fx_editor_window(&mut self, ui: &mut egui::Ui) {
+        let mut closed = false;
+        if let Some(ed) = self.fx_editor.as_mut() {
+            closed = !crate::fxgui::window(ui, ed);
+            let pend = std::mem::take(&mut ed.pending);
+            if !pend.is_empty() {
+                if let Some(e) =
+                    self.fx_entries[ed.loop_i].iter_mut().filter(|e| e.enabled).nth(ed.slot)
+                {
+                    for (k, v) in pend {
+                        if let Some(p) = e.params.get_mut(k) {
+                            *p = v;
+                        }
+                    }
+                    self.fx_save_pending = true;
+                }
             }
+        }
+        if closed {
+            self.fx_editor = None;
         }
     }
 
@@ -1088,6 +1140,9 @@ impl eframe::App for App {
         }
         if self.fx_window.is_some() {
             effects_window(ui, self);
+        }
+        if self.fx_editor.is_some() {
+            self.fx_editor_window(ui);
         }
     }
 }
@@ -2073,50 +2128,41 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
             app.fx_note = String::new();
         }
         ui.separator();
-        fx_chips(ui, app, i);
+        fx_buttons(ui, app, i);
     });
 }
 
-/// Enabled effects drawn directly on the loop row, left to right in chain
-/// order (identical to the effects window): name + one slider per parameter.
-fn fx_chips(ui: &mut egui::Ui, app: &mut App, i: usize) {
-    let mut pend: Option<(usize, usize, f32)> = None;
+/// Enabled effects drawn on the loop row as plain name buttons, left to
+/// right in chain order. The buttons replace the old inline sliders: a
+/// click opens the effect's child editor window (auto sliders, or the
+/// effect's own custom GUI if it scripts one).
+fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
+    let mut open_slot: Option<usize> = None;
     let mut k = 0usize; // chain index (enabled entries only)
     for e in app.fx_entries[i].iter() {
         if !e.enabled {
             continue;
         }
         let Some(desc) = app.fx_registry.desc(&e.stem).cloned() else { continue };
-        let live = app.fx_live[i].get(k).cloned();
-        ui.group(|ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(&desc.name)
-                        .strong()
-                        .small()
-                        .color(Color32::from_rgb(150, 200, 255)),
-                )
-                .on_hover_text(desc.description.as_deref().unwrap_or(""));
-                for (p, pd) in desc.params.iter().enumerate() {
-                    let mut v = live.as_ref().map(|l| l.param(p)).unwrap_or(pd.default);
-                    let r = ui
-                        .add_sized(
-                            egui::vec2(76.0, 0.0),
-                            Slider::new(&mut v, pd.min..=pd.max).show_value(false),
-                        )
-                        .on_hover_text(format!("{} — range {:.2}…{:.2}", pd.label, pd.min, pd.max));
-                    if r.changed() {
-                        pend = Some((k, p, v));
-                    }
-                    ui.label(RichText::new(format!("{v:.2}")).monospace().small());
-                }
-            });
-        });
+        let mut hover = String::new();
+        if let Some(d) = desc.description.as_deref() {
+            hover.push_str(d);
+            hover.push('\n');
+        }
+        hover.push_str("Click to open this effect's controls window.");
+        let color = if app.fx_live[i].get(k).is_some() {
+            Color32::from_rgb(150, 200, 255)
+        } else {
+            Color32::from_gray(140)
+        };
+        if ui.button(RichText::new(&desc.name).small().color(color)).on_hover_text(hover).clicked()
+        {
+            open_slot = Some(k);
+        }
         k += 1;
     }
-    if let Some((slot, p, v)) = pend {
-        app.set_fx_param(i, slot, p, v);
-        app.fx_save_pending = true;
+    if let Some(k) = open_slot {
+        app.open_fx_editor(i, k);
     }
 }
 

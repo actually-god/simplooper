@@ -1,0 +1,465 @@
+// ============================================================ simplooper ==
+// space_echo.rs — reverb + delay in one effect, with a custom child GUI.
+//
+// A mono effects chain in the classic dub/ambient order: a modulated
+// feedback delay (tone-controlled damping in the loop) feeding a Schroeder
+// FDN reverb (damped comb banks + all-pass diffusers), then a dry/wet mix.
+//
+//   dry ─────────────┐
+//   in → delay ──→ reverb ──┤ mix → out
+//
+// Params are ordinary effect params, so the auto slider window works too;
+// the child GUI below is a scripted canvas showing the echo pattern
+// (tick spacing = time, fade = feedback, jitter = wobble) over a reverb
+// tail wedge, plus an input level history trace and the knob row.
+// ---------------------------------------------------------------------------
+
+include!("effect_api.rs");
+
+// ---------------------------------------------------------------------------
+// Params
+// ---------------------------------------------------------------------------
+const P_TIME: usize = 0; // delay seconds (log range via slider range)
+const P_FEED: usize = 1; // delay feedback 0..0.95
+const P_TONE: usize = 2; // delay-loop damping, Hz (log)
+const P_WOBBLE: usize = 3; // modulation depth 0..1 (= ±1 % of time)
+const P_RATE: usize = 4; // modulation rate Hz
+const P_DECAY: usize = 5; // reverb feedback 0.5..0.95
+const P_DAMP: usize = 6; // reverb damping, Hz (log)
+const P_MIX: usize = 7; // wet mix 0..1
+const P_OUT: usize = 8; // output trim 0..2
+const NPARAMS: u32 = 9;
+
+// ---------------------------------------------------------------------------
+// Delay line with cubic (Hermite) fractional read.
+// ---------------------------------------------------------------------------
+struct Delay {
+    buf: Vec<f64>,
+    wp: usize,
+}
+
+impl Delay {
+    fn new(n: usize) -> Self {
+        Self { buf: vec![0.0; n.max(4)], wp: 0 }
+    }
+    #[inline]
+    fn write(&mut self, x: f64) {
+        self.buf[self.wp] = x;
+        self.wp = (self.wp + 1) % self.buf.len();
+    }
+    /// Read `d` samples in the past (d >= 1.0), cubic-interpolated.
+    #[inline]
+    fn read(&self, d: f64) -> f64 {
+        let n = self.buf.len() as f64;
+        let d = d.clamp(1.0, n - 2.0);
+        let df = d.floor();
+        let frac = d - df;
+        let base = (self.wp as f64 - df) as i64;
+        let idx = |k: i64| -> usize {
+            let mut i = k % self.buf.len() as i64;
+            if i < 0 {
+                i += self.buf.len() as i64;
+            }
+            i as usize
+        };
+        let xm1 = self.buf[idx(base - 1)];
+        let x0 = self.buf[idx(base)];
+        let x1 = self.buf[idx(base + 1)];
+        let x2 = self.buf[idx(base + 2)];
+        // cubic Hermite (Catmull-Rom)
+        let a = -0.5 * xm1 + 1.5 * x0 - 1.5 * x1 + 0.5 * x2;
+        let b = xm1 - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
+        let c = -0.5 * xm1 + 0.5 * x1;
+        ((a * frac + b) * frac + c) * frac + x0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schroeder comb with damping (Freeverb topology) and all-pass diffusers.
+// ---------------------------------------------------------------------------
+struct Comb {
+    buf: Vec<f64>,
+    idx: usize,
+    lp: f64,
+}
+
+impl Comb {
+    fn new(n: usize) -> Self {
+        Self { buf: vec![0.0; n.max(4)], idx: 0, lp: 0.0 }
+    }
+    #[inline]
+    fn process(&mut self, x: f64, fb: f64, damp_c: f64) -> f64 {
+        let out = self.buf[self.idx];
+        self.lp = out * (1.0 - damp_c) + self.lp * damp_c;
+        if !self.lp.is_finite() {
+            self.lp = 0.0;
+        }
+        self.buf[self.idx] = x + self.lp * fb;
+        self.idx = (self.idx + 1) % self.buf.len();
+        if !out.is_finite() {
+            return 0.0;
+        }
+        out
+    }
+}
+
+#[inline]
+fn allpass(prev: &mut Allpass, x: f64, g: f64) -> f64 {
+    let bufout = prev.buf[prev.idx];
+    prev.buf[prev.idx] = x + g * bufout;
+    prev.idx = (prev.idx + 1) % prev.buf.len();
+    let out = bufout - g * prev.buf[prev.idx];
+    if out.is_finite() {
+        out
+    } else {
+        0.0
+    }
+}
+
+struct Allpass {
+    buf: Vec<f64>,
+    idx: usize,
+}
+
+impl Allpass {
+    fn new(n: usize) -> Self {
+        Self { buf: vec![0.0; n.max(4)], idx: 0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+struct SpaceEcho {
+    sr: f64,
+    delay: Delay,
+    /// one-pole damping state in the delay feedback loop
+    tone_lp: f64,
+    tone_c: f64,
+    phase: f64, // LFO phase (radians)
+    combs: [Comb; 4],
+    ap: [Allpass; 4],
+    /// comb lengths at sr=44.1 kHz; scaled by sr and by a 0.9..1.1 "room"
+    /// spread so the two banks don't share modes.
+    mix: f64,
+    out: f64,
+    gui_open: AtomicU32,
+    in_peak: AtomicU32,
+}
+
+/// Comb tunings (samples @ 44100) and their spread factors.
+const COMB_TUNE: [(f64, f64); 4] = [(1557.0, 1.0), (1617.0, 0.89), (1491.0, 0.77), (1422.0, 0.65)];
+/// All-pass tunings (samples @ 44100).
+const AP_TUNE: [f64; 4] = [225.0, 341.0, 441.0, 556.0];
+
+impl SpaceEcho {
+    fn new(sample_rate: f64) -> Self {
+        let sr = if sample_rate.is_finite() && sample_rate > 1.0 { sample_rate } else { 48000.0 };
+        let dl_n = (sr * 2.5) as usize + 16; // up to 2.5 s delay
+        let scale = sr / 44100.0;
+        let combs = COMB_TUNE.map(|(t, sp)| Comb::new(((t * sp * scale) as usize) + 1));
+        let ap = AP_TUNE.map(|t| Allpass::new((t * scale) as usize + 1));
+        Self {
+            sr,
+            delay: Delay::new(dl_n),
+            tone_lp: 0.0,
+            tone_c: 0.5,
+            phase: 0.0,
+            combs,
+            ap,
+            mix: 0.4,
+            out: 1.0,
+            gui_open: AtomicU32::new(0),
+            in_peak: AtomicU32::new(0),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio entry points.
+// ---------------------------------------------------------------------------
+extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
+    Box::into_raw(Box::new(SpaceEcho::new(sample_rate))) as *mut core::ffi::c_void
+}
+
+extern "C" fn destroy(state: *mut core::ffi::c_void) {
+    if !state.is_null() {
+        drop(unsafe { Box::from_raw(state as *mut SpaceEcho) });
+    }
+}
+
+#[inline]
+fn one_c(fc_hz: f64, sr: f64) -> f64 {
+    // one-pole lowpass coefficient
+    (-(core::f64::consts::TAU * fc_hz.max(20.0) / sr)).exp()
+}
+
+extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32 {
+    if state.is_null() {
+        return input;
+    }
+    let st = unsafe { &mut *(state as *mut SpaceEcho) };
+    let sr = st.sr;
+    let g = |k: usize| unsafe { *params.add(k) };
+    let x = input as f64;
+    let x = if x.is_finite() { x } else { 0.0 };
+
+    // Input level for the GUI meter (free when the editor is closed).
+    if st.gui_open.load(Relaxed) != 0 {
+        let m = if x < 0.0 { -x } else { x };
+        let prev = f32::from_bits(st.in_peak.load(Relaxed)) as f64;
+        let env = if m > prev { m } else { prev * 0.999 };
+        st.in_peak.store((env as f32).to_bits(), Relaxed);
+    }
+
+    // ---- delay with LFO-modulated time and damped feedback ----
+    let time_s = (g(P_TIME) as f64).clamp(0.02, 2.4);
+    let fb = (g(P_FEED) as f64).clamp(0.0, 0.95);
+    let wobble = (g(P_WOBBLE) as f64).clamp(0.0, 1.0);
+    let rate = (g(P_RATE) as f64).clamp(0.01, 20.0);
+    let decay = (g(P_DECAY) as f64).clamp(0.5, 0.95);
+    st.mix += ((g(P_MIX) as f64).clamp(0.0, 1.0) - st.mix) * 0.01;
+    st.out += ((g(P_OUT) as f64).clamp(0.0, 2.0) - st.out) * 0.01;
+
+    st.tone_c = one_c(g(P_TONE) as f64, sr);
+    st.phase += core::f64::consts::TAU * rate / sr;
+    if st.phase > core::f64::consts::TAU {
+        st.phase -= core::f64::consts::TAU;
+    }
+    let w = 1.0 + wobble * 0.01 * st.phase.sin();
+    let d = (time_s * sr * w).clamp(1.0, (st.delay.buf.len() - 4) as f64);
+
+    let echoed = st.delay.read(d);
+    // damped feedback loop
+    st.tone_lp = echoed * (1.0 - st.tone_c) + st.tone_lp * st.tone_c;
+    if !st.tone_lp.is_finite() {
+        st.tone_lp = 0.0;
+    }
+    st.delay.write(x + st.tone_lp * fb);
+
+    // ---- FDN reverb on the delay output (with a little dry-to-verb tap) ----
+    let verb_in = (echoed * 0.7 + x * 0.3) * 0.25;
+    let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
+    let mut sum = 0.0f64;
+    for c in st.combs.iter_mut() {
+        sum += c.process(verb_in, decay, damp_c);
+    }
+    let mut v = sum;
+    for a in st.ap.iter_mut() {
+        v = allpass(a, v, 0.5);
+    }
+
+    let wet = echoed + v;
+    let o = x * (1.0 - st.mix) + wet * st.mix * st.out;
+    if !o.is_finite() {
+        return 0.0;
+    }
+    o as f32
+}
+
+// ---------------------------------------------------------------------------
+// Custom child GUI.
+// ---------------------------------------------------------------------------
+const HIST: usize = 160;
+
+struct Gs {
+    /// input-level history, newest last.
+    hist: Vec<f32>,
+    /// animation clock (seconds of GUI time)
+    clock: f64,
+    /// level history from the audio side, cached across draws
+    inst: Option<*mut core::ffi::c_void>,
+    last_t: f64,
+}
+
+extern "C" fn gui_create(_sample_rate: f64) -> *mut core::ffi::c_void {
+    Box::into_raw(Box::new(Gs { hist: vec![0.0; HIST], clock: 0.0, inst: None, last_t: 0.0 })) as *mut core::ffi::c_void
+}
+
+extern "C" fn gui_destroy(gs: *mut core::ffi::c_void) {
+    if gs.is_null() {
+        return;
+    }
+    let gs = unsafe { Box::from_raw(gs as *mut Gs) };
+    if let Some(p) = gs.inst {
+        unsafe { (*(p as *mut SpaceEcho)).gui_open.store(0, Relaxed) };
+    }
+}
+
+extern "C" fn gui_draw(
+    gs: *mut core::ffi::c_void,
+    state: *mut core::ffi::c_void,
+    frame: *const GuiFrameV1,
+    api: *const GuiApiV1,
+) {
+    if gs.is_null() || frame.is_null() || api.is_null() {
+        return;
+    }
+    let gs = unsafe { &mut *(gs as *mut Gs) };
+    let fr = unsafe { &*frame };
+    let api = unsafe { &*api };
+    let c = api.ctx;
+
+    // animation clock from the app-wide time
+    if gs.last_t == 0.0 {
+        gs.last_t = fr.time;
+    }
+    gs.clock += (fr.time - gs.last_t).clamp(0.0, 0.1);
+    gs.last_t = fr.time;
+
+    if !state.is_null() {
+        gs.inst = Some(state);
+        unsafe { (*(state as *mut SpaceEcho)).gui_open.store(1, Relaxed) };
+    }
+
+    let gp = |k: u32| unsafe { (api.get_param)(c, k) };
+    let sp = |k: u32, v: f32| unsafe { (api.set_param)(c, k, v) };
+
+    let w = fr.width;
+    let h = fr.height;
+    let canvas_h = (h - 116.0).max(100.0);
+
+    // ---- level history ----------------------------------------------------
+    let lvl = if !state.is_null() {
+        f32::from_bits(unsafe { (*(state as *const SpaceEcho)).in_peak.load(Relaxed) })
+    } else {
+        0.0
+    };
+    gs.hist.remove(0);
+    gs.hist.push(lvl);
+
+    unsafe {
+        (api.rect_filled)(c, 8.0, 8.0, w - 16.0, canvas_h, 0.09, 0.10, 0.13, 1.0);
+        // history trace
+        let cw = w - 16.0;
+        let mut pts: Vec<f32> = Vec::with_capacity(HIST * 2);
+        for (i, v) in gs.hist.iter().enumerate() {
+            let db = 20.0f32 * (v.max(1e-6)).log10(); // -120..0
+            let y = ((-db) / 60.0).clamp(0.0, 1.0);
+            pts.push(8.0 + (i as f32 / (HIST - 1) as f32) * cw);
+            pts.push(8.0 + canvas_h - y.min(1.0) * canvas_h * 0.98);
+        }
+        (api.polyline)(c, pts.as_ptr(), pts.len() as u32 / 2, 0, 1.4, 0.30, 0.85, 0.55, 0.85);
+
+        // ---- echo pattern + reverb tail ---------------------------------
+        let time = gp(P_TIME as u32);
+        let feed = gp(P_FEED as u32);
+        let wobble = gp(P_WOBBLE as u32);
+        let rate = gp(P_RATE as u32);
+        let decay = gp(P_DECAY as u32);
+        let clk = gs.clock as f32;
+
+        // scrolling playhead: 2 s across the canvas
+        let scroll = 2.0f32;
+        let px_per_s = cw / scroll;
+        let midy = 8.0 + canvas_h * 0.62;
+        // "now" is the right edge; echoes arrive every `time` seconds.
+        let mut et = clk % time; // phase into the next echo
+        let mut n = 0usize;
+        while n < 24 {
+            let x = cw + 8.0 - et * px_per_s;
+            if x < 8.0 {
+                break;
+            }
+            let amp = feed.powi(n as i32);
+            // wobble jitters the arrival time
+            let jitter = (clk * rate * core::f32::consts::TAU + n as f32 * 1.7).sin() * wobble * 0.01 * time;
+            let x = x + jitter * px_per_s;
+            let hh = (amp * canvas_h * 0.36).clamp(2.0, canvas_h * 0.48);
+            (api.rect_filled)(c, x - 2.0, midy - hh / 2.0, 4.0, hh, 1.0, 0.75, 0.35, (0.25 + amp * 0.75).min(1.0));
+            et += time;
+            n += 1;
+        }
+        // reverb tail wedge behind each echo, sized by decay
+        let tail = (0.05_f32).max((decay.ln() / (0.95_f32).ln()).sqrt()) * time * 4.0;
+        et = clk % time;
+        for n in 0..6 {
+            let amp = feed.powi(n as i32);
+            let x = cw + 8.0 - et * px_per_s;
+            let tl = (tail * px_per_s * amp).clamp(0.0, cw * 2.0);
+            (api.rect_filled)(c, x, midy - 2.0, tl, 4.0, 0.42, 0.60, 0.95, 0.10 + amp * 0.20);
+            et += time;
+        }
+
+        // input head marker on the left
+        (api.text)(c, 12.0, 12.0, 10.0, 0, 0.7, 0.7, 0.75, 1.0, c"in".as_ptr());
+        let lv = lvl.clamp(0.0, 1.0) * (canvas_h - 20.0);
+        (api.rect_filled)(c, 12.0, 8.0 + canvas_h - 10.0 - lv, 6.0, lv, 0.30, 0.85, 0.55, 0.9);
+
+        // ---- knob row ----------------------------------------------------
+        let ky = canvas_h + 22.0;
+        let row = |i: usize, label: &str, idx: usize, min: f32, max: f32, curve: f32, fmt: &str| {
+            let mut v = gp(idx as u32);
+            let shown = match fmt {
+                "ms" => format!("{label} {:.0}ms", v * 1000.0),
+                "hz" => format!("{label} {:.1}Hz", v),
+                "khz" => format!("{label} {:.1}kHz", v / 1000.0),
+                "pct" => format!("{label} {:.0}%", v * 100.0),
+                "db" => format!("{label} {:+.1}dB", 20.0 * (v.max(1e-4)).log10()),
+                _ => format!("{label} {v:.2}"),
+            };
+            let s = std::ffi::CString::new(shown).unwrap();
+            if (api.knob)(c, 12.0 + i as f32 * 84.0, ky + 16.0, 48.0, s.as_ptr(), &mut v, min, max, curve) != 0 {
+                sp(idx as u32, v);
+            }
+        };
+        row(0, "time", P_TIME, 0.02, 2.4, 0.0, "ms");
+        row(1, "feedbk", P_FEED, 0.0, 0.95, 1.0, "pct");
+        row(2, "tone", P_TONE, 200.0, 16000.0, 0.0, "khz");
+        row(3, "wobble", P_WOBBLE, 0.0, 1.0, 1.0, "pct");
+        row(4, "rate", P_RATE, 0.05, 12.0, 0.0, "hz");
+        row(5, "decay", P_DECAY, 0.5, 0.95, 1.0, "pct");
+        row(6, "damp", P_DAMP, 200.0, 16000.0, 0.0, "khz");
+        row(7, "mix", P_MIX, 0.0, 1.0, 1.0, "pct");
+        row(8, "out", P_OUT, 0.0, 2.0, 1.0, "db");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor + GUI tables + exports.
+// ---------------------------------------------------------------------------
+static PARAMS: [EffectParamV1; 9] = [
+    EffectParamV1 { label: c"time".as_ptr(), min: 0.02, max: 2.4, default: 0.38 },
+    EffectParamV1 { label: c"feedback".as_ptr(), min: 0.0, max: 0.95, default: 0.62 },
+    EffectParamV1 { label: c"tone".as_ptr(), min: 200.0, max: 16000.0, default: 3600.0 },
+    EffectParamV1 { label: c"wobble".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
+    EffectParamV1 { label: c"rate".as_ptr(), min: 0.05, max: 12.0, default: 0.6 },
+    EffectParamV1 { label: c"decay".as_ptr(), min: 0.5, max: 0.95, default: 0.84 },
+    EffectParamV1 { label: c"damp".as_ptr(), min: 200.0, max: 16000.0, default: 2800.0 },
+    EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 0.4 },
+    EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
+];
+
+pub static DESC: EffectInfoV1 = EffectInfoV1 {
+    abi: SIMPLOOPER_EFFECT_ABI,
+    name: c"Space Echo".as_ptr(),
+    author: c"simplooper".as_ptr(),
+    description:
+        c"Modulated feedback delay feeding an FDN reverb; damped loops, wobble LFO, animated echo-pattern window.".as_ptr(),
+    n_params: NPARAMS,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+};
+
+pub static GUI: EffectGuiV1 = EffectGuiV1 {
+    abi: SIMPLOOPER_EFFECT_GUI_ABI,
+    want_width: 760.0,
+    want_height: 400.0,
+    create: gui_create,
+    draw: gui_draw,
+    destroy: gui_destroy,
+};
+
+#[no_mangle]
+pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1 {
+    &DESC
+}
+
+#[no_mangle]
+pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 {
+    &GUI
+}

@@ -29,7 +29,10 @@ mod api {
     #![allow(dead_code)]
     include!("effect_api.rs");
 }
-pub use api::{EffectInfoV1, EffectParamV1, SIMPLOOPER_EFFECT_ABI, SIMPLOOPER_MAX_PARAMS};
+pub use api::{
+    EffectGuiV1, EffectInfoV1, EffectParamV1, GuiApiV1, GuiFrameV1,
+    SIMPLOOPER_EFFECT_ABI, SIMPLOOPER_EFFECT_GUI_ABI, SIMPLOOPER_MAX_PARAMS,
+};
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
 pub const MAX_PARAMS: usize = SIMPLOOPER_MAX_PARAMS;
@@ -38,6 +41,8 @@ pub const MAX_FX_PER_TRACK: usize = 8;
 
 /// ABI version this build speaks.
 pub const ABI_VERSION: u32 = SIMPLOOPER_EFFECT_ABI;
+/// Child-GUI ABI version this build speaks.
+pub const GUI_ABI_VERSION: u32 = SIMPLOOPER_EFFECT_GUI_ABI;
 
 /// The generated shared-contract file every script includes.
 pub const API_FILE: &str = "effect_api.rs";
@@ -47,10 +52,21 @@ pub const API_SRC: &str = include_str!("effect_api.rs");
 pub const TEMPLATE_SRC: &str = include_str!("../effects/template.rs");
 /// File name the template is written under.
 pub const TEMPLATE_FILE: &str = "template.rs";
+/// Bundled example effects with custom child GUIs (parametric EQ with a
+/// response/spectrum graph, and the delay+reverb with an animated canvas).
+/// Written into brand-new effects folders so the child-GUI features are
+/// discoverable; never written over an existing (user-owned) copy.
+pub const EXAMPLES: &[(&str, &str)] = &[
+    ("parametric_eq.rs", include_str!("../effects/parametric_eq.rs")),
+    ("space_echo.rs", include_str!("../effects/space_echo.rs")),
+];
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
 /// takes the raw name bytes).
 const ENTRY: &[u8] = b"simplooper_effect_info\0";
+/// Optional symbol exporting the custom child-GUI vtable. Absent = the
+/// effect gets the auto slider window; the audio ABI does not care.
+const GUI_ENTRY: &[u8] = b"simplooper_effect_gui\0";
 
 // ---------------------------------------------------------------------------
 // Directory handling
@@ -122,12 +138,22 @@ fn seed_api(dir: &Path) {
             let _ = std::fs::write(&p, API_SRC);
         }
     }
-    // A brand-new effects folder also gets the documented template, so the
-    // Effects window opens with something switchable instead of nothing.
-    // Never written over: once the user edits it, it belongs to them.
+    // A brand-new effects folder also gets the documented template and the
+    // bundled examples, so the Effects window opens with something
+    // switchable instead of nothing. Never written over: once the user
+    // edits a file, it belongs to them.
+    let fresh = !has_scripts(dir);
     let t = dir.join(TEMPLATE_FILE);
-    if !t.exists() && !has_scripts(dir) {
+    if fresh && !t.exists() {
         let _ = std::fs::write(&t, TEMPLATE_SRC);
+    }
+    if fresh {
+        for (name, src) in EXAMPLES {
+            let p = dir.join(name);
+            if !p.exists() {
+                let _ = std::fs::write(&p, src);
+            }
+        }
     }
 }
 
@@ -257,6 +283,14 @@ impl Instance {
         self.sample_rate
     }
 
+    /// Raw pointer to the effect's per-instance state (what `create`
+    /// returned). Only ever handed to a live child GUI's `draw` while the
+    /// editor holds an `Arc<Instance>` clone — the instance (and its
+    /// library) cannot be destroyed underneath the GUI.
+    pub fn state_ptr(&self) -> *mut core::ffi::c_void {
+        self.state
+    }
+
     pub fn n_params(&self) -> usize {
         self.n_params
     }
@@ -328,6 +362,60 @@ impl Drop for Instance {
 }
 
 // ---------------------------------------------------------------------------
+// Custom child GUI handles
+// ---------------------------------------------------------------------------
+
+/// A validated child-GUI vtable from a loaded effect, plus the library ref
+/// that keeps its code mapped. Cheap to clone; the editor window owns one.
+#[derive(Clone)]
+pub struct EffectGuiRef {
+    v: &'static EffectGuiV1,
+    _lib: Arc<LibHandle>,
+}
+// Same reasoning as LibHandle: the Arc keeps the dlopen'd library mapped
+// while any clone exists, and the vtable static is read-only.
+unsafe impl Send for EffectGuiRef {}
+unsafe impl Sync for EffectGuiRef {}
+
+impl EffectGuiRef {
+    /// Preferred canvas size (0/NaN hints fall back to a sane default).
+    pub fn size_hint(&self) -> (f32, f32) {
+        let w = self.v.want_width;
+        let h = self.v.want_height;
+        let w = if w.is_finite() && w >= 120.0 { w } else { 480.0 };
+        let h = if h.is_finite() && h >= 90.0 { h } else { 320.0 };
+        (w, h)
+    }
+
+    /// Open a per-window GUI state. Null = effect declined (auto window).
+    pub fn create(&self, sample_rate: f64) -> *mut core::ffi::c_void {
+        (self.v.create)(sample_rate)
+    }
+
+    /// Draw one frame. `state` is the audio instance state (valid while
+    /// the editor's instance Arc lives); `api`/`frame` are per-call data.
+    ///
+    /// # Safety
+    /// `gs` must come from `create` on this same handle (not yet destroyed)
+    /// and `state` must belong to a live [`Instance`]; `frame`/`api` must
+    /// stay valid for the duration of the call.
+    pub unsafe fn draw(
+        &self,
+        gs: *mut core::ffi::c_void,
+        state: *mut core::ffi::c_void,
+        frame: &GuiFrameV1,
+        api: &GuiApiV1,
+    ) {
+        (self.v.draw)(gs, state, frame, api)
+    }
+
+    /// Close the window's GUI state. The instance must still be alive.
+    pub fn destroy(&self, gs: *mut core::ffi::c_void) {
+        (self.v.destroy)(gs)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -339,6 +427,8 @@ pub struct EffectEntry {
     pub stem: String,
     pub desc: Option<EffectDesc>,
     fns: Option<EffectFns>,
+    /// Custom child GUI exported by this effect (None = auto slider window).
+    gui: Option<&'static EffectGuiV1>,
     pub error: Option<String>,
     /// Keep the library mapped while instances may exist.
     _lib: Option<Arc<LibHandle>>,
@@ -445,7 +535,7 @@ impl Registry {
     }
 
     fn compile_and_load(&self, stem: &str, src: &Path) -> EffectEntry {
-        let mk = |error: String| EffectEntry { stem: stem.to_string(), desc: None, fns: None, error: Some(error), _lib: None };
+        let mk = |error: String| EffectEntry { stem: stem.to_string(), desc: None, fns: None, gui: None, error: Some(error), _lib: None };
         if !rustc_available() {
             return mk("rustc not found — install rust (or rustup) to compile effects".into());
         }
@@ -464,7 +554,7 @@ impl Registry {
             Err(e) => return mk(format!("could not load {}: {e}", so.display())),
         };
         match unsafe { validate(&lib.0) } {
-            Ok((desc, fns)) => EffectEntry { stem: stem.to_string(), desc: Some(desc), fns: Some(fns), error: None, _lib: Some(lib) },
+            Ok((desc, fns, gui)) => EffectEntry { stem: stem.to_string(), desc: Some(desc), fns: Some(fns), gui, error: None, _lib: Some(lib) },
             Err(e) => mk(e),
         }
     }
@@ -505,6 +595,14 @@ impl Registry {
         let desc = e.desc.as_ref()?;
         let lib = e._lib.as_ref()?.clone();
         Instance::new(fns, lib, desc, sample_rate, values)
+    }
+
+    /// The effect's custom child GUI, if it exported a valid one. The
+    /// handle keeps the library mapped independently of the registry.
+    pub fn gui(&self, stem: &str) -> Option<EffectGuiRef> {
+        let e = self.find(stem)?;
+        let v = e.gui?;
+        Some(EffectGuiRef { v, _lib: e._lib.as_ref()?.clone() })
     }
 }
 
@@ -547,8 +645,13 @@ fn sanitize_crate_name(stem: &str) -> String {
     s
 }
 
-/// Read + validate the exported description from a loaded library.
-unsafe fn validate(lib: &libloading::Library) -> Result<(EffectDesc, EffectFns), String> {
+/// Read + validate the exported description from a loaded library. Also
+/// picks up the optional custom child-GUI vtable (an effect that exports a
+/// broken one is rejected outright — silent auto-fallback would hide the
+/// very bug the author needs to see in the effects window).
+unsafe fn validate(
+    lib: &libloading::Library,
+) -> Result<(EffectDesc, EffectFns, Option<&'static EffectGuiV1>), String> {
     let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> =
         lib.get(ENTRY).map_err(|_| "missing entry point simplooper_effect_info — see template.rs".to_string())?;
     let info = sym();
@@ -575,9 +678,29 @@ unsafe fn validate(lib: &libloading::Library) -> Result<(EffectDesc, EffectFns),
         let (min, max) = if p.min <= p.max { (p.min, p.max) } else { (p.max, p.min) };
         params.push(ParamDesc { label, min, max, default: p.default.clamp(min, max) });
     }
+    let gui = match lib.get(GUI_ENTRY) {
+        Ok(gsym) => {
+            let gsym: libloading::Symbol<extern "C" fn() -> *const EffectGuiV1> = gsym;
+            let g = gsym();
+            if g.is_null() {
+                return Err("simplooper_effect_gui returned null".into());
+            }
+            let g = &*g;
+            if g.abi != GUI_ABI_VERSION {
+                return Err(format!("child GUI ABI version {} (this simplooper speaks {GUI_ABI_VERSION})", g.abi));
+            }
+            // create/draw/destroy are non-nullable fn types in the shared
+            // ABI file — a script cannot put null in them and compile, so
+            // (like EffectInfoV1) there is nothing to null-check.
+            Some(g)
+        }
+        // No GUI symbol: the auto slider window handles this effect.
+        Err(_) => None,
+    };
     Ok((
         EffectDesc { name, author, description, params },
         EffectFns { create: d.create, destroy: d.destroy, process: d.process },
+        gui,
     ))
 }
 
@@ -734,6 +857,36 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(std::fs::read_to_string(root.join("effects/effect_api.rs")).unwrap(), API_SRC);
         assert_eq!(std::fs::read_to_string(root.join("effects/template.rs")).unwrap(), TEMPLATE_SRC);
+        for (name, src) in EXAMPLES {
+            assert_eq!(std::fs::read_to_string(root.join("effects").join(name)).unwrap(), *src, "{name} out of sync");
+        }
+    }
+
+    #[test]
+    fn bundled_examples_load_with_custom_guis() {
+        // A fresh effects folder seeds template + examples; every one must
+        // compile through the real loader, and the two examples must carry
+        // a valid child GUI while the plain template must not.
+        if !rustc_available() {
+            return; // CI without rustc: nothing to verify
+        }
+        let dir = temp_dir("examples");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let want = ["template", "parametric_eq", "space_echo"];
+        for name in want {
+            let it = reg.items().iter().find(|e| e.stem == name).unwrap_or_else(|| {
+                panic!("missing {name}: {:?}", reg.items().iter().map(|e| (&e.stem, e.error.clone())).collect::<Vec<_>>())
+            });
+            assert!(it.error.is_none(), "{name} failed to load: {}", it.error.clone().unwrap_or_default());
+        }
+        assert_eq!(reg.desc("parametric_eq").unwrap().params.len(), 26);
+        assert_eq!(reg.desc("space_echo").unwrap().params.len(), 9);
+        assert!(reg.gui("parametric_eq").is_some(), "EQ must expose a child GUI");
+        assert!(reg.gui("space_echo").is_some(), "space echo must expose a child GUI");
+        assert!(reg.gui("template").is_none(), "template keeps the auto slider window");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -854,6 +1007,66 @@ mod tests {
         assert_eq!(p[0], 1.0);
         drop(fresh);
         drop(inst);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gui_symbol_optional_and_validated() {
+        // Optional child GUI: a script exporting it loads with a handle;
+        // one exporting a WRONG GUI ABI is rejected; scripts without the
+        // symbol (template) load with gui() == None.
+        if !rustc_available() {
+            eprintln!("skipping: rustc not on PATH");
+            return;
+        }
+        let minimal_audio = r#"
+include!("effect_api.rs");
+extern "C" fn create(_sr: f64) -> *mut core::ffi::c_void { core::ptr::null_mut() }
+extern "C" fn destroy(_s: *mut core::ffi::c_void) {}
+extern "C" fn process(_s: *mut core::ffi::c_void, i: f32, _p: *const f32) -> f32 { i }
+pub static DESC: EffectInfoV1 = EffectInfoV1 {
+    abi: SIMPLOOPER_EFFECT_ABI, name: c"t".as_ptr(), author: core::ptr::null(),
+    description: core::ptr::null(), n_params: 0, params: core::ptr::null(),
+    create, destroy, process,
+};
+#[no_mangle]
+pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1 { &DESC }
+"#;
+        let gui_fns = r#"
+extern "C" fn gcreate(_sr: f64) -> *mut core::ffi::c_void { core::ptr::null_mut() }
+extern "C" fn gdraw(_g: *mut core::ffi::c_void, _s: *mut core::ffi::c_void,
+    _f: *const GuiFrameV1, _a: *const GuiApiV1) {}
+extern "C" fn gdestroy(_g: *mut core::ffi::c_void) {}
+pub static GUI: EffectGuiV1 = EffectGuiV1 {
+    abi: ABI_CONST, want_width: 100.0, want_height: 100.0,
+    create: gcreate, draw: gdraw, destroy: gdestroy,
+};
+#[no_mangle]
+pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 { &GUI }
+"#;
+        let dir = temp_dir("gui");
+        std::fs::write(dir.join(API_FILE), API_SRC).unwrap();
+        std::fs::write(dir.join("plain.rs"), minimal_audio).unwrap();
+        std::fs::write(
+            dir.join("guied.rs"),
+            format!("const ABI_CONST: u32 = SIMPLOOPER_EFFECT_GUI_ABI;\n{minimal_audio}{gui_fns}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("badgui.rs"),
+            format!("const ABI_CONST: u32 = 99;\n{minimal_audio}{gui_fns}"),
+        )
+        .unwrap();
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let stems = reg.stems();
+        assert!(stems.contains(&"plain".to_string()) && stems.contains(&"guied".to_string()), "{:?}", reg.items().iter().map(|i| (&i.stem, &i.error)).collect::<Vec<_>>());
+        assert!(reg.gui("plain").is_none(), "no GUI symbol must mean auto window");
+        assert!(reg.gui("guied").is_some(), "valid GUI symbol must produce a handle");
+        let err = reg.items().iter().find(|i| i.stem == "badgui").and_then(|i| i.error.clone()).unwrap();
+        assert!(err.contains("GUI ABI"), "{err}");
+        // Size hint falls back when the effect leaves it at zero.
+        drop(reg);
         std::fs::remove_dir_all(&dir).ok();
     }
 
