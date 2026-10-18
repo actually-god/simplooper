@@ -30,7 +30,7 @@ optdepends=('rust: build per-loop effect scripts dropped into the effects folder
 # headers + .pc file, `pkgconf` finds it; either JACK implementation works.
 makedepends=(cargo rust pkgconf jack)
 source=("https://github.com/actually-god/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('9268f86db6e8f96db7ffab7b6080266ca674e3ee2fe9c45426565474fdc9937d')
+sha256sums=('1bb8bbf68d0f263d4e03510af88c6a2f4feefa3293d43104d63e1010e944c1d6')
 # No check(): the test suite's e2e half drives a live JACK server in real
 # time and self-skips without one, so a build-time run would test nothing
 # new on build machines and double compile time on top of the release build.
