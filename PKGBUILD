@@ -5,11 +5,11 @@
 pkgname=simplooper
 # Keep in sync with Cargo.toml
 pkgver=0.1.0
-# Bumped for the re-cut v0.1.0 tag (dB readouts centred on the vol/gain
-# sliders with raw MIDI values beside them, select next/prev loop clamped
-# to loops 1..16 instead of wrapping, latency compensation re-spec'd as a
-# record-start skip): 0.1.0-13 upgrades existing 0.1.0-12 installs.
-pkgrel=13
+# Bumped for the re-cut v0.1.0 tag (loop-row effect name buttons opening
+# child editor windows; scripted custom effect GUIs; 32-param cap; bundled
+# Parametric EQ and Space Echo examples with custom windows):
+# 0.1.0-14 upgrades existing 0.1.0-13 installs.
+pkgrel=14
 pkgdesc="Lightweight JACK audio looper: 16 quantized loops, MIDI and keyboard control"
 arch=(x86_64)
 url="https://github.com/actually-god/simplooper"
