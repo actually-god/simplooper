@@ -1,8 +1,14 @@
 # simplooper
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A minimalist live audio looper built in Rust for Linux (JACK / PipeWire-JACK).
 Sixteen simultaneous loops with record/overdub, waveform dashboard, MIDI
-binding, independent/dependent loop modes, and an easy quantize tool.
+binding, independent/dependent loop modes, an easy quantize tool, a metronome,
+import/export, and runtime-compiled per-loop effects.
+
+**Docs:** [install guide](docs/INSTALL.md) · [user guide](docs/USAGE.md) ·
+[agent/automation guide](docs/AGENT-GUIDE.md)
 
 ## Features
 
@@ -29,13 +35,13 @@ binding, independent/dependent loop modes, and an easy quantize tool.
   persisted between sessions and automatically re-applied when JACK comes up,
   so audio flows on launch without re-selecting.
 - **MIDI binding** — every action (loop select, record/overdub/clear/play-stop
-  on the selected loop, direct per-loop controls, dependent toggle) can be
-  bound to a live-captured Note On/Off, CC, or Program Change (channel +
-  note/controller/program). Bindings are recorded by clicking the cell and
-  sending a message; velocity/CC value is ignored so pedals and knobs fire
-  anywhere — except the per-loop *volume (knob)* / *gain (knob)* bindings,
-  which read the message value (0–127: 0 = off/−∞, 127 = max). All bindings
-  persist between sessions.
+  on the selected loop, direct per-loop controls, per-loop volume/gain knobs,
+  dependent toggle) can be bound to a live-captured Note On/Off, CC, or
+  Program Change (channel + note/controller/program). Bindings are recorded
+  by clicking the cell and sending a message; velocity/CC value is ignored so
+  pedals and knobs fire anywhere — except the per-loop *volume (knob)* /
+  *gain (knob)* bindings, which read the message value (0–127: 0 =
+  off/−∞, 127 = max). All bindings persist between sessions.
 - **Keyboard shortcuts** — keys `1`–`4` select a loop (the selected row is
   highlighted); `space` play/stop, `R` record, `O` overdub, `C` clear act on
   the selected loop; `D` toggles dependent mode; `M` toggles the metronome;
@@ -50,11 +56,20 @@ binding, independent/dependent loop modes, and an easy quantize tool.
     number of "root loops" (set in the main window, default 1) — the ensemble
     loops forever, never stopping in the middle. A tooltip warns to quantize
     first or you'll hear skips at the loop points.
+- **Metronome** — a ▶/■ METRO button with BPM (20–300), beats-per-measure
+  (1–16, configurable time-signature numerator), and subdivision (quarter
+  through thirty-second, incl. triplets). Three tones: high downbeat, mid
+  quarter notes, low subdivisions. The click goes to your outputs only and
+  is never recorded. The quantizer can lock to the metronome's tempo.
 - **Easy quantize** — lives in the main window (below the mode row): enter
   Loop 1's time signature (numerator/denominator), how many bars Loop 1 spans,
   and "quantize to beat/bar"; every recorded loop is snapped to that grid
   (nearest multiple → zero-crossing refinement within ±5 ms → short
   crossfade at the seam).
+- **Import / export** — import WAV, MP3, OGG, FLAC, M4A, AAC or AIFF files
+  into any loop (decoded + resampled to engine rate). Export any loop — or
+  the whole dependent-mode project — through the full effect chain as
+  WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
 - **MIDI monitor** — a permanent `simplooper:midi_in` JACK MIDI port; every
   incoming event is parsed and shown in the bottom panel and on stdout.
 - **Live mix passthrough** — selected inputs are summed × master gain into
@@ -62,12 +77,14 @@ binding, independent/dependent loop modes, and an easy quantize tool.
 - **Per-loop effects** — a runtime-compiled effects framework. Each loop row's
   bottom strip stacks **volume** over **gain** (bottom-left), puts an **FX**
   button next to them, and shows every enabled effect *after* the button —
-  each with live sliders for the parameters its script declares. The Effects
-  window (the FX button) points at an effects folder (text box + **browse**;
-  default `~/.local/share/simplooper/effects`, created and seeded with a
-  documented template on first run), lists every valid script with a toggle
-  (default off), and lets enabled effects be reordered with ▲▼ — they snap to
-  the top and the top-to-bottom order *is* the audio chain order. Effects run
+  each with live sliders for the parameters its script declares, plus a
+  click-through editor window (automatic sliders, or a **scripted custom
+  GUI** when the effect provides one). The Effects window (the FX button)
+  points at an effects folder (text box + **browse**; default
+  `~/.local/share/simplooper/effects`, created and seeded with a documented
+  template on first run), lists every valid script with a toggle (default
+  off), and lets enabled effects be reordered with ▲▼ — they snap to the top
+  and the top-to-bottom order *is* the audio chain order. Effects run
   after the vol × gain trim, in GUI chain order, both live and in export
   renders. Effects are plain **Rust scripts**: drop a `.rs` file in the
   folder, simplooper compiles it with `rustc` and hot-loads it
@@ -87,6 +104,7 @@ binding, independent/dependent loop modes, and an easy quantize tool.
 - Build-time system libraries: JACK headers + `.pc` file (provided by
   `pipewire-jack` or the official `libjack` package), plus `pkgconf`.
   No other system deps — the GUI stack is pure-Rust.
+- `ffmpeg` (optional) for MP3/OGG export.
 - A JACK-compatible audio server:
   - **PipeWire** (recommended): just install `pipewire` + `pipewire-jack`.
   - or classic **jack2** (`jackd`).
@@ -94,15 +112,27 @@ binding, independent/dependent loop modes, and an easy quantize tool.
 The app opens its JACK client with `NO_START`, so it will never spawn a server
 for you — if none is running it shows an error and stays idle.
 
-## Build & run
+## Install
+
+**Arch Linux** — once published, from the AUR:
 
 ```sh
-cargo build --release
-./target/release/simplooper
-# or: cargo run
+yay -S simplooper        # or paru -S simplooper
 ```
 
-### Using the GUI
+**Any distro** — build from source (prereqs per distro in
+[docs/INSTALL.md](docs/INSTALL.md)):
+
+```sh
+git clone https://github.com/actually-god/simplooper
+cd simplooper
+cargo build --release
+./target/release/simplooper
+```
+
+## Using the GUI
+
+Full walkthrough in [docs/USAGE.md](docs/USAGE.md). The short version:
 
 1. Wait for `JACK ready` in the top bar (client name + sample rate).
 2. Click the **hamburger** (top-left) to open settings; under **INPUTS** tick
@@ -131,7 +161,9 @@ Each loop owns an independent effect chain. Click the loop's **FX** button:
   leaving the app.
 - **Chain display** — enabled effects appear to the right of the FX button
   (left-to-right = chain order), each with a labelled slider per parameter,
-  per loop. Parameter values persist with the config, keyed per script.
+  per loop; the effect's name button opens its editor window (auto sliders,
+  or a scripted custom GUI). Parameter values persist with the config,
+  keyed per script.
 
 Signal order per loop: recorded audio × volume × gain, then effects in
 chain order. The same chain runs when exporting/rendering a loop.
@@ -141,13 +173,16 @@ Writing an effect: copy `template.rs` (it ships in the effects folder and in
 Rust file that `include!`s `effect_api.rs` (written into the folder for you)
 and provides three `extern "C"` functions (`create` / `process` /
 `destroy`), a `static DESC: EffectInfoV1` description block, and the
-one-line `simplooper_effect_info` entry point. Only `name` is required text;
-`author`, `description`, and up to 8 parameters are optional. The template's
-comments document every field, how to add/remove parameters, and the
-validity rules (allocation-free, non-blocking, `depth 0`-style pass-through
-not required but polite). Effects are compiled with
-`rustc --edition 2021 --crate-type cdylib` — so **rustc must be installed**
-to use custom effects; a missing compiler just lists scripts with a hint.
+one-line `simplooper_effect_info` entry point; an optional
+`simplooper_effect_gui` entry point adds a scripted custom editor. Only
+`name` is required text; `author`, `description`, and up to
+**32 parameters** are optional. The template's comments document every
+field, how to add/remove parameters, and the validity rules (allocation-free,
+non-blocking, `depth 0`-style pass-through not required but polite). Effects
+are compiled with `rustc --edition 2021 --crate-type cdylib` — so **rustc
+must be installed** to use custom effects; a missing compiler just lists
+scripts with a hint. Working examples in the repo: `effects/parametric_eq.rs`
+and `effects/space_echo.rs` (custom scripted window).
 
 ### MIDI binding
 
@@ -191,7 +226,8 @@ signature numerator/denominator, the number of bars Loop 1 spans, and whether
 to snap each loop to a *beat* or a *bar*. **Quantize all loops** snaps every
 recorded track to that grid. The cut is refined to the nearest zero crossing
 (±5 ms) and the seam gets a short crossfade so clicks are
-avoided.
+avoided. Alternatively tick *quantize to metronome* to derive the grid from
+the metronome's tempo.
 
 ## Architecture
 
@@ -200,8 +236,12 @@ src/
 ├── main.rs    entry point, eframe window setup
 ├── audio.rs   JACK backend + LoopEngine: manager thread, Cmd/Evt channels,
 │              RT process handler (record/overdub/playback inline)
+├── audio_io.rs  import decoding (symphonia) + export (WAV/FLAC native,
+│              MP3/OGG via ffmpeg, resampled with rubato)
+├── config.rs  JSON config: $XDG_CONFIG_HOME/simplooper/config.json
 ├── fx.rs      effects framework: scan/compile/cache/load effect scripts,
 │              ABI validation, per-loop chains, RT-safe parameter relay
+├── fxgui.rs   per-effect editor windows: auto sliders or scripted GUIs
 ├── effect_api.rs  the effect ABI contract (source of truth; also written
 │              into every effects folder for scripts to `include!`)
 ├── midi.rs    MIDI parsing, formatting, MidiBind matching (unit-tested)
@@ -236,47 +276,31 @@ src/
 
 ## Packaging (Arch / AUR)
 
-The repository is laid out to be packaged directly with `makepkg`:
+The Arch `PKGBUILD` **does not live in this repository** (AUR convention: the
+packaging recipe is maintained in its own AUR package repo, `simplooper`,
+building from this project's GitHub **release tag tarball**). Once the package
+is published, see [docs/INSTALL.md](docs/INSTALL.md) for install/build
+instructions.
 
-- `PKGBUILD` — builds with `cargo build --release --locked` and installs the
-  binary, the desktop entry, and the icon into the hicolor theme. Depends on
-  `libjack.so` (the shared library, not a specific package) so it resolves
-  with either JACK implementation: pipewire-jack or official libjack.
-- `simplooper.desktop` — application-menu entry (`Icon=simplooper`).
+Repo-side obligations that keep the package healthy:
+
+- Every release is a **tag** (`git tag v0.1.0 && git push origin v0.1.0`) —
+  the PKGBUILD's `source=` URL points at that tarball, so don't force-move
+  public tags once the AUR package references them; release new versions
+  instead (or re-cut + bump `pkgrel` before anyone can pull).
 - `assets/icon.png` — **placeholder** blank icon; drop the final artwork over
-  this file before release (the PKGBUILD installs whatever is in it).
-- `tests/packaging.sh` — packaging regression test: checks PKGBUILD syntax,
-  required fields, version sync with Cargo.toml, referenced files, desktop
-  entry, icon, and that every dependency is installed or installable from the
-  enabled repos (the failure mode of `makepkg -si`). Add `--full` for a
-  sandboxed makepkg build + package-content verification.
+  this file (the package installs whatever is in it).
+- `simplooper.desktop` — application-menu entry (`Icon=simplooper`).
+- `tests/packaging.sh` — packaging regression test (PKGBUILD syntax, required
+  fields, version sync with Cargo.toml, referenced files, desktop entry,
+  icon, and dependency resolvability — the `makepkg -si` failure class).
+  It reads the PKGBUILD from the AUR checkout:
+  `PKGBUILD_PATH=~/aur/simplooper/PKGBUILD ./tests/packaging.sh --full`.
 
-To build a local `.pkg.tar.zst`:
-
-```sh
-makepkg -si   # in this directory (installs any missing deps, then the package)
-./tests/packaging.sh --full   # optional: verify packaging end-to-end
-```
-
-Where to run `makepkg`: running it inside a copy of this project makes
-makepkg's default source dir `$PWD/src`, which collides with Rust's own
-`src/`. The PKGBUILD copes (it builds from the extracted
-`simplooper-<ver>/` subdirectory by absolute path), but the downloaded
-tarball and extracted tree are left inside `src/` afterwards. A dedicated
-build dir is tidier:
-
-```sh
-mkdir -p ~/build/simplooper && cd ~/build/simplooper
-cp /path/to/repo/PKGBUILD .
-makepkg -si   # fetches the v${pkgver} tag tarball and builds it
-```
-
-Never use `makepkg -C` inside a project copy — `-C` wipes `$PWD/src`, i.e.
-the Rust sources.
-
-The `source=` URL points at the `v${pkgver}` tag on GitHub — cut a tag for
-each release (`git tag v0.1.0 && git push origin v0.1.0`). The sha256 in
-`sha256sums` must match that tarball; recompute it after every tagged release.
+⚠️ Packaging footguns that still apply when testing from an AUR checkout:
+never run `makepkg -C` inside a *copy of this project* (`-C` wipes `$PWD/src`,
+i.e. the Rust sources), and prefer a dedicated build dir over in-tree builds —
+makepkg's default `$srcdir=$PWD/src` collides with Rust's own `src/`.
 
 ## Tests
 
@@ -291,9 +315,13 @@ The e2e suite drives a real JACK client pair: it feeds a controllable source
 (constant or PRNG) into simplooper, records → quantizes → overdubs → plays,
 and discriminates independent vs dependent mode by autocorrelation of the
 captured output. Tests self-skip when no JACK/PipeWire server is running.
+Packaging is covered by `tests/packaging.sh` (see the Packaging section).
 
-Packaging is covered by `tests/packaging.sh` (see the Packaging section):
-run it before submitting to the AUR or after any PKGBUILD change.
+## License
+
+simplooper is distributed under the **MIT license**
+([LICENSE](LICENSE)) — free to use, modify, and redistribute, commercial use
+included, as long as the copyright notice travels with substantial copies.
 
 ## Roadmap (live looping)
 
@@ -301,6 +329,6 @@ run it before submitting to the AUR or after any PKGBUILD change.
 - [x] Loop slots UI: waveform dashboard, per-slot controls
 - [x] Action mapping: MIDI note/CC/PC → any action (live-captured bindings)
 - [x] Quantize to grid (beat/bar) with zero-crossing refinement
-- [ ] Per-slot send/return levels, mute/solo
 - [x] Keyboard shortcuts for loop actions
 - [x] Undo/redo of loop edits (overdub undo/redo)
+- [ ] Per-slot send/return levels, mute/solo

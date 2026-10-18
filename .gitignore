@@ -1,7 +1,7 @@
 /target
 *.rs.bk
 
-# makepkg artifacts from in-tree builds (see README: Where to run makepkg)
+# makepkg artifacts (e.g. testing an AUR checkout's PKGBUILD in-tree)
 /pkg/
 *.pkg.tar.zst
 /src/simplooper-*/
