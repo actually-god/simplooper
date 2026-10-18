@@ -6,35 +6,48 @@
 # package name that only exists in some distros' repos (a bare `libjack`
 # package does not exist on CachyOS; JACK comes from pipewire-jack there).
 #
+# The PKGBUILD itself lives in the AUR package repo (not in this source
+# repo), so point the script at your AUR checkout:
+#
 # Usage:
-#   ./tests/packaging.sh          fast checks: syntax, metadata, files, deps
-#   ./tests/packaging.sh --full   additionally build the package in a sandbox
+#   PKGBUILD_PATH=~/aur/simplooper/PKGBUILD ./tests/packaging.sh
+#                                 fast checks: syntax, metadata, files, deps
+#   ... ./tests/packaging.sh --full
+#                                 additionally build the package in a sandbox
 #                                 and verify its contents (takes ~2 min)
+#   (PKGBUILD_PATH defaults to ./PKGBUILD for ad-hoc copies)
 #
 # Exits non-zero if any check fails.
 
 set -u
 cd "$(dirname "$0")/.."
 
+PKG="${PKGBUILD_PATH:-PKGBUILD}"
+if [ ! -f "$PKG" ]; then
+  echo "FAIL: PKGBUILD not found at '$PKG' — the PKGBUILD lives in the AUR"
+  echo "      package repo; run with PKGBUILD_PATH=/path/to/aur/checkout/PKGBUILD"
+  exit 1
+fi
+
 fail=0
 note() { printf '== %s\n' "$*"; }
 err()  { printf 'FAIL: %s\n' "$*"; fail=1; }
 
 # --- 1. PKGBUILD syntax + required fields ----------------------------------
-bash -n PKGBUILD || err "PKGBUILD has a bash syntax error"
+bash -n "$PKG" || err "PKGBUILD has a bash syntax error"
 for f in pkgname pkgver pkgrel pkgdesc arch license depends makedepends source sha256sums build package; do
-  grep -qE "^${f}[=(]" PKGBUILD || err "PKGBUILD missing field: $f"
+  grep -qE "^${f}[=(]" "$PKG" || err "PKGBUILD missing field: $f"
 done
 
 # --- 2. version sync --------------------------------------------------------
 cargo_ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-pkgbuild_ver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+pkgbuild_ver=$(sed -n 's/^pkgver=//p' "$PKG")
 [ "$cargo_ver" = "$pkgbuild_ver" ] \
   || err "pkgver '$pkgbuild_ver' != Cargo.toml version '$cargo_ver'"
 
 # --- 3. source/checksum arrays match ----------------------------------------
-src_line=$(grep '^source=' PKGBUILD | sed 's/  #.*$//')
-sha_line=$(grep '^sha256sums=' PKGBUILD | sed 's/  #.*$//')
+src_line=$(grep '^source=' "$PKG" | sed 's/  #.*$//')
+sha_line=$(grep '^sha256sums=' "$PKG" | sed 's/  #.*$//')
 n_src=$(printf '%s' "$src_line" | tr -cd '"' | wc -c)
 n_sha=$(printf '%s' "$sha_line" | tr -cd "'" | wc -c)
 [ $((n_src / 2)) -eq $((n_sha / 2)) ] \
@@ -59,7 +72,7 @@ file assets/icon.png | grep -q "PNG image data, 256 x 256" \
 # A dep is OK if it is satisfied by an installed package (by name or via its
 # Provides field) or installable from the enabled repos — exactly what
 # `makepkg -si` does, checked here without needing sudo.
-all_deps=$(sed -n 's/^depends=(\(.*\))$/\1/p; s/^makedepends=(\(.*\))$/\1/p' PKGBUILD | tr '\n' ' ')
+all_deps=$(sed -n 's/^depends=(\(.*\))$/\1/p; s/^makedepends=(\(.*\))$/\1/p' "$PKG" | tr '\n' ' ')
 [ -n "$all_deps" ] || err "could not parse depends/makedepends from PKGBUILD"
 
 installed_names_provides=$(pacman -Qii 2>/dev/null | awk '
@@ -84,9 +97,9 @@ done
 # GitHub tag tarballs extract into a top-level ${pkgname}-${pkgver}/ dir, and
 # running makepkg inside a project copy makes $srcdir=$PWD/src — so
 # build()/package() must reference the extracted dir by absolute path.
-grep -q 'cd "\${srcdir}/\${pkgname}-\${pkgver}"' PKGBUILD \
+grep -q 'cd "\${srcdir}/\${pkgname}-\${pkgver}"' "$PKG" \
   || err "build() must cd into \${srcdir}/\${pkgname}-\${pkgver} (GitHub tarballs have a top-level dir)"
-sed -n '/^package()/,$p' PKGBUILD | grep -q '\${srcdir}' \
+sed -n '/^package()/,$p' "$PKG" | grep -q '\${srcdir}' \
   || err "package() must reference \${srcdir} (install from absolute paths, not CWD-relative)"
 
 # --- 9. optional full build ---------------------------------------------------
@@ -106,7 +119,7 @@ if [ "${1:-}" = "--full" ]; then
   tar czf "$tmp/proj/simplooper-${pkgbuild_ver}.tar.gz" -C "$tmp/stage" "simplooper-${pkgbuild_ver}" \
     || { err "could not create source tarball"; }
   sum=$(sha256sum "$tmp/proj/simplooper-${pkgbuild_ver}.tar.gz" | cut -d' ' -f1)
-  cp PKGBUILD "$tmp/proj/PKGBUILD"
+  cp "$PKG" "$tmp/proj/PKGBUILD"
   sed -i "s|^source=.*|source=(\"simplooper-${pkgbuild_ver}.tar.gz\")|" "$tmp/proj/PKGBUILD"
   sed -i "s|^sha256sums=.*|sha256sums=('$sum')|" "$tmp/proj/PKGBUILD"
   # --nodeps: dep resolvability was already verified in step 7; we must not
