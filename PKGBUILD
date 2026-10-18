@@ -5,11 +5,11 @@
 pkgname=simplooper
 # Keep in sync with Cargo.toml
 pkgver=0.1.0
-# Bumped for the re-cut v0.1.0 tag (per-loop effects framework:
-# runtime-compiled Rust effect scripts, per-loop FX chains with GUI
-# sliders, effects window with folder browsing/reordering, template
-# effect): 0.1.0-12 upgrades existing 0.1.0-11 installs.
-pkgrel=12
+# Bumped for the re-cut v0.1.0 tag (dB readouts centred on the vol/gain
+# sliders with raw MIDI values beside them, select next/prev loop clamped
+# to loops 1..16 instead of wrapping, latency compensation re-spec'd as a
+# record-start skip): 0.1.0-13 upgrades existing 0.1.0-12 installs.
+pkgrel=13
 pkgdesc="Lightweight JACK audio looper: 16 quantized loops, MIDI and keyboard control"
 arch=(x86_64)
 url="https://github.com/actually-god/simplooper"
@@ -30,7 +30,7 @@ optdepends=('rust: build per-loop effect scripts dropped into the effects folder
 # headers + .pc file, `pkgconf` finds it; either JACK implementation works.
 makedepends=(cargo rust pkgconf jack)
 source=("https://github.com/actually-god/simplooper/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('0359baca12bbad4f5be7661bcb8cede0d45a93df6689df97f65f8be635cefe4f')
+sha256sums=('9268f86db6e8f96db7ffab7b6080266ca674e3ee2fe9c45426565474fdc9937d')
 # No check(): the test suite's e2e half drives a live JACK server in real
 # time and self-skips without one, so a build-time run would test nothing
 # new on build machines and double compile time on top of the release build.
