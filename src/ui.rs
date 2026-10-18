@@ -704,10 +704,10 @@ impl App {
                 self.metro_on = !self.metro_on;
                 self.send_metro();
             }
-            MidiAction::SelectNext => self.selected = (self.selected + 1) % MAX_LOOPS,
-            MidiAction::SelectPrev => {
-                self.selected = (self.selected + MAX_LOOPS - 1) % MAX_LOOPS;
-            }
+            // Selection NEVER wraps: it stops at loop 1 and loop 16, so the
+            // selection frame can't jump off-screen past the first/last row.
+            MidiAction::SelectNext => self.selected = (self.selected + 1).min(MAX_LOOPS - 1),
+            MidiAction::SelectPrev => self.selected = self.selected.saturating_sub(1),
             MidiAction::UndoOverdub => self.backend.cmd(Cmd::UndoOverdub),
             MidiAction::RedoOverdub => self.backend.cmd(Cmd::RedoOverdub),
             // Value-driven knob actions fire only through the MIDI path
@@ -1198,11 +1198,12 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 });
                 ui.label(
                     RichText::new(
-                        "Delays the INCOMING signal (recording + monitoring) so your playing \
-                         lands on the already-recorded loop grid; the output mix (loops, \
-                         metronome, monitors) stays exactly on grid. Use it to cancel the \
-                         fixed input delay of your interface/DAW chain — negative problems \
-                         from output-side delay are gone: loops never drift.",
+                        "Each fresh recording discards its first this-many milliseconds of \
+                         input, trimming the silence gap between pressing REC and that button \
+                         click reaching your mic. Set it to your system's capture latency and \
+                         the click lands exactly on the loop start — the loop begins with the \
+                         hit, not with dead air. Monitoring, overdubs and the output mix are \
+                         never delayed.",
                     )
                         .weak()
                         .small(),
@@ -2003,39 +2004,62 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         ui.vertical(|ui| {
             let w = (ui.available_width() * 0.24).clamp(180.0, 300.0);
             ui.set_width(w);
+            // Left text: raw MIDI value (0..=127, what a bound knob sends);
+            // the level itself is shown as dB centred on the slider.
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("vol  {:>8}", db_str(vol_amp(app.trk_vol[i]))))
-                        .monospace()
-                        .small(),
+                    RichText::new(format!("vol  {:>8}", app.trk_vol[i])).monospace().small(),
                 );
                 let mut v = app.trk_vol[i];
                 let rv = ui
-                    .add_sized(egui::vec2(w - 92.0, 0.0), Slider::new(&mut v, 0..=127).text(" "))
+                    .add_sized(
+                        egui::vec2(w - 92.0, 0.0),
+                        Slider::new(&mut v, 0..=127).show_value(false),
+                    )
                     .on_hover_text(
-                        "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+                        "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. Number on the left is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
                     );
                 if rv.changed() {
                     app.set_trk_vol(i, v);
                     app.levels_dirty = true;
                 }
+                // dB readout drawn centred on the slider itself.
+                let db = db_str(vol_amp(app.trk_vol[i]));
+                let f = egui::TextStyle::Small.resolve(ui.style());
+                ui.painter().text(
+                    rv.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    db,
+                    f,
+                    ui.visuals().weak_text_color(),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("gain {:>8}", db_str(gain_amp(app.trk_gain[i]))))
-                        .monospace()
-                        .small(),
+                    RichText::new(format!("gain {:>8}", app.trk_gain[i])).monospace().small(),
                 );
                 let mut g = app.trk_gain[i];
                 let rg = ui
-                    .add_sized(egui::vec2(w - 92.0, 0.0), Slider::new(&mut g, 0..=127).text(" "))
+                    .add_sized(
+                        egui::vec2(w - 92.0, 0.0),
+                        Slider::new(&mut g, 0..=127).show_value(false),
+                    )
                     .on_hover_text(
-                        "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+                        "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Number on the left is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
                     );
                 if rg.changed() {
                     app.set_trk_gain(i, g);
                     app.levels_dirty = true;
                 }
+                let db = db_str(gain_amp(app.trk_gain[i]));
+                let f = egui::TextStyle::Small.resolve(ui.style());
+                ui.painter().text(
+                    rg.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    db,
+                    f,
+                    ui.visuals().weak_text_color(),
+                );
             });
         });
 
@@ -2526,6 +2550,22 @@ mod tests {
         assert!((gain_amp(127) - 3.199).abs() < 0.01);
         assert!(gain_amp(40) < 1.0 && gain_amp(40) > 0.0);
         assert_eq!(db_str(1.0), "+0.0 dB");
+    }
+
+    #[test]
+    fn selection_clamps_at_loop_1_and_loop_16() {
+        // select next/prev must stop at the first/last loop: the selection
+        // frame may never wrap around and jump off the visible list.
+        let mut app = test_app("sel-clamp");
+        app.selected = 0;
+        app.fire_midi_action(MidiAction::SelectPrev);
+        assert_eq!(app.selected, 0, "prev at loop 1 stays");
+        for _ in 0..(MAX_LOOPS + 3) {
+            app.fire_midi_action(MidiAction::SelectNext);
+        }
+        assert_eq!(app.selected, MAX_LOOPS - 1, "next stops at loop 16");
+        app.fire_midi_action(MidiAction::SelectPrev);
+        assert_eq!(app.selected, MAX_LOOPS - 2);
     }
 
     /// The effects window's rows (toggle → chain order → live instances)

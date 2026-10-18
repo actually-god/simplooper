@@ -163,10 +163,12 @@ pub enum Cmd {
     /// the loops keep playing forever (changing N while playing restarts the
     /// ensemble from there).
     SetRootLoops(u32),
-    /// Delay the INPUT (the dry mix feeding monitoring and recording) by `ms`
-    /// milliseconds to compensate for the existing delay in the total audio
-    /// loop: playing along to the loop you hear then lands on the loop grid,
-    /// and the output mix is never delayed further. Clamped to 0..=1000 ms.
+    /// Latency compensation: every FRESH recording discards its first `ms`
+    /// milliseconds of input, trimming the silence gap between pressing the
+    /// record button and that button click reaching the mic. Set to your
+    /// system's capture latency and the click lands exactly on the loop
+    /// start. Monitoring, overdubs and the output mix are never delayed.
+    /// Clamped to 0..=1000 ms.
     SetLatency { ms: f32 },
     /// Metronome: on/off, tempo in BPM, subdivision in clicks per beat
     /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...), and beats
@@ -317,9 +319,16 @@ pub struct LoopEngine {
     master_pos: AtomicU64,
     /// Dependent-mode ensemble length in units of the longest loop (>= 1).
     root_loops: AtomicU32,
-    /// Input delay in samples (latency compensation; 0 = off). Delays the
-    /// dry input mix (monitoring + recording) — never the output.
+    /// Latency compensation in samples (0 = off): every fresh recording
+    /// discards its first `latency` input samples (armed in `start_rec`,
+    /// consumed in `rec_sample`) so the click of pressing the record button
+    /// — caught a few ms late by the mic — becomes the FIRST sample of the
+    /// loop instead of landing a few ms into it. Monitoring, overdubs and
+    /// the output mix are never delayed.
     latency: AtomicU32,
+    /// Per-track count of leading input samples still to discard for the
+    /// current take; armed from `latency` by `start_rec`.
+    rec_skip: [AtomicU32; MAX_LOOPS],
     /// Per-track playback volume (linear amplitude as f32 bits; 1.0 = 0 dB).
     /// Applied to the loop's output contribution only — recorded/overdubbed
     /// content always stays at raw input level.
@@ -358,6 +367,7 @@ impl LoopEngine {
             master_pos: AtomicU64::new(0),
             root_loops: AtomicU32::new(1),
             latency: AtomicU32::new(0),
+            rec_skip: core::array::from_fn(|_| AtomicU32::new(0)),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             fx: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| TrackFx::default()))),
@@ -388,6 +398,15 @@ impl LoopEngine {
     /// every consumer (UI waveform, playback reads) assumes len <= CAP.
     #[inline]
     pub fn rec_sample(&self, i: usize, v: f32) -> bool {
+        // Latency compensation: a fresh take discards its first `latency`
+        // input samples (armed in `start_rec`) so the click of the button
+        // that started recording — heard a few ms late through the mic —
+        // becomes the loop's FIRST sample instead of landing ms into it.
+        let skip = self.rec_skip[i].load(Ordering::Relaxed);
+        if skip > 0 {
+            self.rec_skip[i].store(skip - 1, Ordering::Relaxed);
+            return false;
+        }
         let off = self.len[i].load(Ordering::Relaxed) as u64;
         if off < LOOP_CAP as u64 {
             self.write(i, off as u32, v);
@@ -501,12 +520,16 @@ impl LoopEngine {
         (l, self.read_range(i, l).to_vec())
     }
 
-    /// Zero the buffer and arm a fresh capture on track i.
+    /// Zero the buffer, arm the latency-compensation skip and start a fresh
+    /// capture on track i.
     pub fn start_rec(&self, i: usize) {
         self.state[i].store(TR_IDLE, Ordering::Relaxed);
         let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
         buf.fill(0.0f32);
         self.len[i].store(0, Ordering::Relaxed);
+        // Snapshot the compensation at arm time: changing latency mid-take
+        // must never retroactively shift a recording in progress.
+        self.rec_skip[i].store(self.latency.load(Ordering::Relaxed), Ordering::Relaxed);
         self.state[i].store(TR_REC, Ordering::Relaxed);
     }
 
@@ -554,7 +577,8 @@ impl LoopEngine {
         self.root_loops.load(Ordering::Relaxed)
     }
 
-    /// Input delay in samples (0 = latency compensation off).
+    /// Latency compensation in samples (0 = off). Each fresh recording
+    /// discards this many leading input samples.
     pub fn latency_samples(&self) -> u32 {
         self.latency.load(Ordering::Relaxed)
     }
@@ -833,10 +857,9 @@ fn run(
     let mask_in = Arc::new(AtomicU64::new(0));
     let mask_out = Arc::new(AtomicU64::new(0));
     let notif = Notif { tx: evt_tx.clone(), xruns: xruns.clone() };
-    // Sample rate is queryable before activation; the metronome and the
-    // latency delay line are sized from it.
+    // Sample rate is queryable before activation; the metronome grid is
+    // sized from it.
     let sr = client.sample_rate();
-    let delay_n = (sr.max(1) as usize).next_power_of_two();
     let proc = Proc {
         midi_in: midi_port,
         ports: RawPorts { ins: ins_raw, outs: outs_raw },
@@ -854,8 +877,6 @@ fn run(
         prev_mode: 0,
         prev_root: 1,
         sr,
-        delay: vec![0.0f32; delay_n],
-        didx: 0,
         metro_next: 0,
         metro_start: -1,
         metro_beat_start: 0,
@@ -1464,9 +1485,6 @@ struct Proc {
     prev_root: u32,
     /// Engine sample rate (for metronome / latency math).
     sr: u32,
-    /// Latency-compensation delay line (power-of-two size, ring index).
-    delay: Vec<f32>,
-    didx: usize,
     /// Metronome clock: absolute sample of the next click, start sample of
     /// the click currently sounding (-1 = idle), and the beat-grid state:
     /// start sample and length of the current beat, the index of the next
@@ -1649,13 +1667,6 @@ impl ProcessHandler for Proc {
         let (ins, outs) = (&in_bufs[..nin], &out_bufs[..nout]);
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
-        // Latency-compensation INPUT delay (samples, clamped to the line
-        // size). The delay line holds one full second max (see `delay_n`);
-        // the GUI slider is clamped to 0..=1000 ms.
-        let dn = self.delay.len();
-        let dly = (self.engine.latency.load(Ordering::Relaxed) as usize).min(dn - 1);
-        // A delay is only meaningful with a live input connection.
-        let dly_active = dly > 0 && nin > 0;
         // Metronome parameters for this cycle (click is added to the output
         // mix only — never to `dry`, so it can never be recorded into a loop).
         let (metro_on, metro_bpm, metro_sub, metro_num) = self.engine.metro();
@@ -1712,16 +1723,12 @@ impl ProcessHandler for Proc {
             for b in ins {
                 dry += unsafe { *b.add(i) };
             }
-            // Input delay line: `src_in` is the dry input delayed by `dly`
-            // samples — everything downstream of the input (monitoring and
-            // recording/overdubbing) uses it, so latency compensation shifts
-            // the INPUT while the output mix stays exactly on the loop grid.
-            // The line is fed unconditionally so changing latency mid-stream
-            // never gaps or drops.
-            let tap = self.delay[(self.didx + dn - dly) & (dn - 1)];
-            self.delay[self.didx] = dry;
-            self.didx = (self.didx + 1) & (dn - 1);
-            let src_in = if dly_active { tap } else { dry };
+            // Live input for this sample. Latency compensation is NOT a
+            // running input delay: it only discards the first `latency`
+            // samples of a fresh take (engine `rec_skip`), so monitoring and
+            // overdubs stay exactly aligned with the loop grid while the
+            // button-press silence at a take's start gets trimmed away.
+            let src_in = dry;
 
             // Loop engine step, shared by all output slots.
             let mut play = 0.0f32;
@@ -1860,9 +1867,9 @@ impl ProcessHandler for Proc {
             self.sample_no += 1;
 
             let v = (src_in + play + click) * g;
-            // The output mix is NEVER delayed — latency compensation lives
-            // entirely on the input side (see `src_in` above), so what the
-            // user hears stays exactly on the loop grid.
+            // The output mix is NEVER delayed: what the user hears stays
+            // exactly on the loop grid (latency compensation only trims the
+            // start of a fresh take — see `LoopEngine::rec_sample`).
             let av = v.abs();
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
@@ -2033,6 +2040,52 @@ mod tests {
         assert_eq!(e.len_of(2), 0);
         toggle_record(&e, 2); // REC with no content -> IDLE
         assert_eq!(e.state_of(2), TR_IDLE);
+    }
+
+    /// Latency compensation is a START-of-take skip: a fresh recording
+    /// discards its first `latency` input samples (so the button click that
+    /// started it — a few ms late through the mic — lands at content[0]),
+    /// while everything after the skip is captured live.
+    #[test]
+    fn latency_skips_silence_at_recording_start() {
+        let e = LoopEngine::new();
+        e.latency.store(5, Ordering::Relaxed);
+        toggle_record(&e, 0); // IDLE -> fresh REC arms the skip
+        assert_eq!(e.state_of(0), TR_REC);
+        for k in 1..=10 {
+            assert!(!e.rec_sample(0, k as f32));
+        }
+        // The first 5 samples were discarded; content starts at sample #6 —
+        // exactly the latency-compensated moment.
+        let (len, data) = e.snapshot(0);
+        assert_eq!(len, 5);
+        assert_eq!(data, vec![6.0, 7.0, 8.0, 9.0, 10.0]);
+
+        // A second take re-arms from the current latency, and a latency of 0
+        // records immediately.
+        e.latency.store(0, Ordering::Relaxed);
+        toggle_record(&e, 0); // REC -> PLAY
+        toggle_record(&e, 0); // PLAY -> fresh REC (skip 0)
+        assert!(!e.rec_sample(0, 42.0));
+        assert_eq!(e.len_of(0), 1);
+        assert_eq!(e.read(0, 0), 42.0);
+    }
+
+    /// Changing the latency mid-take must not retroactively shift the
+    /// recording in progress: the skip is armed at start_rec time.
+    #[test]
+    fn latency_change_mid_take_does_not_shift_recording() {
+        let e = LoopEngine::new();
+        e.latency.store(3, Ordering::Relaxed);
+        toggle_record(&e, 0);
+        assert!(!e.rec_sample(0, 1.0)); // consumes one armed skip
+        e.latency.store(5000, Ordering::Relaxed); // huge change mid-take
+        assert!(!e.rec_sample(0, 2.0)); // armed skip has 2 left
+        assert!(!e.rec_sample(0, 3.0)); // ...and captures nothing more
+        assert!(!e.rec_sample(0, 4.0)); // skip exhausted: capture resumes
+        let (len, data) = e.snapshot(0);
+        assert_eq!(len, 1, "only the samples after the armed 3-sample skip");
+        assert_eq!(data, vec![4.0]);
     }
 
     #[test]

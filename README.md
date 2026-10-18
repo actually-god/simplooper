@@ -18,9 +18,10 @@ binding, independent/dependent loop modes, and an easy quantize tool.
   resurrected.
 - **Dashboard** — the main window is a scrollable stack of sixteen track rows,
   each showing the recorded waveform plus REC / OD / PLAY / CLEAR / IMPORT
-  buttons. Every row also carries per-loop **volume** and **gain** sliders
-  with live dB readouts (volume: 0 = −∞ … 127 = 0 dB; gain: 80 = 0 dB,
-  127 = +10 dB) trimming that loop's playback — recorded audio itself is
+  buttons. Every row also carries per-loop **volume** and **gain** sliders:
+  the slider shows the live **dB** readout centred on it (volume: 0 = −∞ …
+  127 = 0 dB; gain: 80 = 0 dB, 127 = +10 dB), the raw MIDI value sits in the
+  text beside it. They trim that loop's playback — recorded audio itself is
   never re-leveled.
 - **Settings menu** — the three-bar (hamburger) button in the top-left opens
   the settings panel: input/output port selection, master gain, latency
@@ -71,11 +72,13 @@ binding, independent/dependent loop modes, and an easy quantize tool.
   renders. Effects are plain **Rust scripts**: drop a `.rs` file in the
   folder, simplooper compiles it with `rustc` and hot-loads it
   (**Rescan**). See *Effects* below.
-- **Latency compensation** — the settings panel's *latency (ms)* delays the
-  INCOMING signal (recording + monitoring) so your playing lands on the
-  already-recorded loop grid; the output mix (loops, metronome, monitors)
-  stays exactly on grid. Use it to cancel the fixed input delay of an
-  interface/DAW chain without shifting the loops themselves.
+- **Latency compensation** — the settings panel's *latency (ms)* trims the
+  start of every fresh recording: each new take discards its first this-many
+  milliseconds of input, cutting out the silence gap between pressing REC
+  and that button click reaching the mic. Set it to your system's capture
+  latency and the click lands exactly on the loop start — hit record, and
+  the recorded button press *is* the loop's downbeat. Monitoring, overdubs
+  and the output mix are never delayed, so loops never drift.
 
 ## Requirements
 

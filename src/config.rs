@@ -48,9 +48,10 @@ pub struct Config {
     /// GUI zoom factor (egui `zoom_factor`): 1.0 = default UI size, >1 larger.
     #[serde(default = "default_gui_scale")]
     pub gui_scale: f32,
-    /// Input latency compensation in milliseconds: the incoming signal is
-    /// delayed by this much before recording/monitoring, so the dry path
-    /// lines up with already-recorded loops; the output mix stays on grid.
+    /// Latency compensation in milliseconds: each fresh recording discards
+    /// this much input at its start, so the button click that started the
+    /// take lands exactly at the loop start. Monitoring, overdubs and the
+    /// output mix are never delayed.
     #[serde(default)]
     pub latency_ms: f32,
     /// Per-loop playback volume, MIDI-knob style (0..=127; 0 = -inf, 127 =
