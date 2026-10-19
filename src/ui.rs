@@ -7,17 +7,17 @@
 //!   with a waveform of the recorded audio and REC / OD / play / clear buttons
 //! - bottom: MIDI monitor
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::Frame;
 use egui::{Color32, RichText, Sense, Slider};
 
-use crate::audio::{Backend, Cmd, Evt, FxSlot, PortInfo, TrackFx, MAX_LOOPS, TR_OD, TR_PLAY, TR_REC};
-use crate::config::{Config, MidiBinding, TrackFxSave};
+use crate::audio::{Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, TrackFx, MAX_LOOPS, TR_OD, TR_PLAY, TR_REC};
+use crate::config::{Config, MidiAxisCal, MidiBinding, TrackFxSave};
 use crate::fx;
-use crate::midi::{hex, MidiAction, MidiBind, MidiMsg};
+use crate::midi::{hex, scale_axis, MidiAction, MidiBind, MidiMsg};
 use crate::quantize::Unit;
 
 /// One row in the MIDI monitor log.
@@ -120,6 +120,12 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = [
     None, None, // Loop 14
     None, None, // Loop 15
     None, None, // Loop 16
+    // Per-loop pan (loops 1–16): value-driven from MIDI knobs — appended
+    // after volume/gain, so never key-bound either.
+    None, // Loop 1: pan
+    None, None, None, None, None, None, None, // Loops 2–8
+    None, None, None, None, None, None, None, // Loops 9–15
+    None, // Loop 16
 ];
 
 /// Metronome subdivisions: (clicks per beat, display name).
@@ -256,6 +262,44 @@ pub fn db_str(amp: f32) -> String {
     }
 }
 
+/// MIDI value that centres the per-loop pan slider (the 0..=100 text
+/// shows 50 there; pan is an equal-power split between the L / R buses).
+pub const PAN_CENTRE_MIDI: u8 = 64;
+
+/// Pan MIDI value (0..=127) -> the 0..=100 position shown in the text box.
+pub fn pan_text(m: u8) -> u32 {
+    (m as f32 * 100.0 / 127.0).round() as u32
+}
+
+/// 0..=100 text position -> pan MIDI value (0..=127).
+pub fn pan_midi(t: f32) -> u8 {
+    (t.clamp(0.0, 100.0) * 127.0 / 100.0).round() as u8
+}
+
+/// Engine pan position [0, 1] for a MIDI value (hard right at 127).
+pub fn pan01(m: u8) -> f32 {
+    m as f32 / 127.0
+}
+
+/// L/R routing byte of output `i`, defaulting to the mono downmix.
+fn cfg_lr(v: &[u8], i: usize) -> u8 {
+    *v.get(i).unwrap_or(&3)
+}
+
+/// In-flight two-step calibration for one continuous (knob) MIDI binding.
+/// The first message received defines the axis (control type + channel +
+/// CC number); the user then sweeps to the physical minimum, presses
+/// "Lock min", sweeps to the maximum, and presses Finish. `lo`/`hi` track
+/// the latest value seen on each end so a noisy first touch is not fatal.
+struct KnobLearn {
+    slot: usize,
+    bind: MidiBind,
+    has_axis: bool,
+    lo: u8,
+    hi: u8,
+    locked: bool,
+}
+
 pub struct App {
     backend: Backend,
 
@@ -266,17 +310,29 @@ pub struct App {
     avail_in: Vec<PortInfo>,
     avail_out: Vec<PortInfo>,
     sel_in: HashSet<String>,
-    sel_out: HashSet<String>,
+    /// Selected outputs with their stereo routing (bit 0 = L, bit 1 = R);
+    /// absent / 0 = not selected.
+    sel_out: HashMap<String, u8>,
     applied: Option<(usize, usize)>,
     /// Last port selection actually applied via "Apply Selection"; persisted
     /// with the config so it can be restored on the next launch.
-    applied_ports: Option<(Vec<String>, Vec<String>)>,
+    applied_ports: Option<(Vec<String>, Vec<OutSel>)>,
     gain: f32,
     /// Per-loop playback volume, MIDI-knob style (0..=127; 0 = -inf, 127 =
     /// 0 dB). Applied to each loop's contribution to the mix.
     trk_vol: [u8; MAX_LOOPS],
     /// Per-loop gain trim, MIDI-knob style (0..=127; 0 = -inf, 80 = 0 dB).
     trk_gain: [u8; MAX_LOOPS],
+    /// Per-loop stereo pan, MIDI-knob style (0..=127; 0 = hard left,
+    /// 64 = centre, 127 = hard right).
+    trk_pan: [u8; MAX_LOOPS],
+    /// In-progress text for a level value box while it holds keyboard
+    /// focus: (kind, loop) -> draft. Cleared on commit / blur; when a knob
+    /// or slider moves the value meanwhile, the box simply redraws itself.
+    lv_edit: HashMap<(u8, usize), String>,
+    /// Last loop selection propagated to the audio engine (input monitoring
+    /// follows the selected loop's chain/gain/pan). `ui()` diffs it.
+    sel_sent: usize,
     /// Level sliders / MIDI knobs moved since the last config write; flushed
     /// by `ui()` once the pointer is released (knob spam must not thrash the
     /// disk).
@@ -335,6 +391,12 @@ pub struct App {
     learning_slot: Option<usize>,
     /// MIDI slot currently capturing the next NOTE ON / CC / PC message, if any.
     midi_learning_slot: Option<usize>,
+    /// Two-step knob learn in progress for one action slot: capture the
+    /// axis low end, lock it, capture the high end (see `knob_learn_window`).
+    knob_learn: Option<KnobLearn>,
+    /// Per-action knob calibration (volume / gain / pan slots only),
+    /// persisted via Config::midi_axis_cal.
+    knob_cal: Vec<Option<MidiAxisCal>>,
     /// Remote MIDI source ports currently linked into simplooper:midi_in
     /// (auto-detected; shown in the MIDI monitor).
     midi_sources: Vec<String>,
@@ -443,25 +505,50 @@ impl App {
                 midi_binds[MidiAction::idx(b.action)] = b.bind;
             }
         }
+        // Knob calibration: expand the sparse persisted list into one
+        // slot per action.
+        let mut knob_cal: Vec<Option<MidiAxisCal>> = vec![None; N_ACTIONS];
+        for c in &cfg.midi_axis {
+            if let Some(s) = knob_cal.get_mut(usize::from(c.slot)) {
+                *s = Some(*c);
+            }
+        }
         // Per-loop levels: pad the persisted vectors (older configs have
         // none) and push the restored values into the audio engine — the
         // engine atomics are the live source of truth for the RT thread.
         let trk_vol = core::array::from_fn(|i| cfg.trk_vol.get(i).copied().unwrap_or(127));
         let trk_gain =
             core::array::from_fn(|i| cfg.trk_gain.get(i).copied().unwrap_or(GAIN_UNITY_MIDI));
+        let trk_pan =
+            core::array::from_fn(|i| cfg.trk_pan.get(i).copied().unwrap_or(PAN_CENTRE_MIDI));
         for t in 0..MAX_LOOPS {
             backend.engine.set_loop_vol(t, vol_amp(trk_vol[t]));
             backend.engine.set_loop_gain(t, gain_amp(trk_gain[t]));
+            backend.engine.set_loop_pan(t, pan01(trk_pan[t]));
         }
         let root_loops = cfg.root_loops.clamp(1, 64);
         // Restore the last applied port selections so the user doesn't have to
         // re-check the same ports on every launch.
         let sel_in: HashSet<String> = cfg.ports_in.iter().cloned().collect();
-        let sel_out: HashSet<String> = cfg.ports_out.iter().cloned().collect();
+        // Outputs carry their saved L/R routing; entries saved before stereo
+        // existed default to the mono downmix (3) — identical behaviour.
+        let sel_out: HashMap<String, u8> = cfg
+            .ports_out
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), cfg.ports_out_lr.get(i).copied().unwrap_or(3)))
+            .collect();
         let applied_ports = if cfg.ports_in.is_empty() && cfg.ports_out.is_empty() {
             None
         } else {
-            Some((cfg.ports_in, cfg.ports_out))
+            Some((
+                cfg.ports_in,
+                cfg.ports_out
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, n)| (n, cfg_lr(&cfg.ports_out_lr, i)))
+                    .collect(),
+            ))
         };
 
         Self {
@@ -478,6 +565,9 @@ impl App {
             gain: 1.0,
             trk_vol,
             trk_gain,
+            trk_pan,
+            lv_edit: HashMap::new(),
+            sel_sent: usize::MAX,
             levels_dirty: false,
             gui_scale: cfg.gui_scale.clamp(0.7, 1.6),
             show_settings: false,
@@ -512,6 +602,8 @@ impl App {
             short_keys,
             learning_slot: None,
             midi_learning_slot: None,
+            knob_learn: None,
+            knob_cal,
             midi_sources: Vec::new(),
             show_export: false,
             fx_registry,
@@ -559,6 +651,26 @@ impl App {
     pub fn arm_midi_slot(&mut self, idx: usize) {
         self.midi_learning_slot = Some(idx);
         self.learning_slot = None;
+    }
+
+    /// Start the two-step knob learn for continuous slot `idx`: opens a
+    /// sub-window that walks the user through capturing the axis minimum
+    /// and maximum (see [`knob_learn_window`]).
+    pub fn arm_knob_learn(&mut self, idx: usize) {
+        self.midi_learning_slot = None;
+        self.learning_slot = None;
+        self.knob_learn = Some(KnobLearn {
+            slot: idx,
+            bind: MidiBind { ty: 0xff, ch: 0, d1: 0 },
+            has_axis: false,
+            lo: 0,
+            hi: 127,
+            locked: false,
+        });
+        self.status = format!(
+            "knob learn: {}",
+            MidiAction::ALL[idx].label()
+        );
     }
 
     /// Arm the keyboard "press a key" slot for `idx` (cancels any MIDI cell
@@ -648,11 +760,18 @@ impl App {
                 if k == egui::Key::Escape {
                     self.midi_learning_slot = None;
                 } else if k == egui::Key::Delete {
-                    self.midi_binds[slot] = None;
-                    self.midi_learning_slot = None;
-                    self.save_config();
-                    self.status =
-                        format!("cleared MIDI binding: {}", MidiAction::ALL[slot].label());
+                    // A knob-learn in flight takes Delete as "cancel", not
+                    // "clear the old binding".
+                    if let Some(kl) = self.knob_learn.take() {
+                        self.status =
+                            format!("cancelled knob learn: {}", MidiAction::ALL[kl.slot].label());
+                    } else {
+                        self.midi_binds[slot] = None;
+                        self.midi_learning_slot = None;
+                        self.save_config();
+                        self.status =
+                            format!("cleared MIDI binding: {}", MidiAction::ALL[slot].label());
+                    }
                 }
             }
             return; // swallow all keys while a MIDI cell is listening
@@ -717,7 +836,7 @@ impl App {
             MidiAction::RedoOverdub => self.backend.cmd(Cmd::RedoOverdub),
             // Value-driven knob actions fire only through the MIDI path
             // (handle_evt passes the CC value); a key press has no value.
-            MidiAction::VolLoop(_) | MidiAction::GainLoop(_) => {}
+            MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_) => {}
         }
     }
 
@@ -731,6 +850,13 @@ impl App {
     fn set_trk_gain(&mut self, i: usize, v: u8) {
         self.trk_gain[i] = v;
         self.backend.engine.set_loop_gain(i, gain_amp(v));
+    }
+
+    /// Set loop `i`'s stereo pan from a MIDI-range value (0 = hard left,
+    /// 64 = centre, 127 = hard right).
+    fn set_trk_pan(&mut self, i: usize, v: u8) {
+        self.trk_pan[i] = v;
+        self.backend.engine.set_loop_pan(i, pan01(v));
     }
 
     /// Rebuild loop `i`'s live effect chain from its window rows and hand it
@@ -874,6 +1000,12 @@ impl App {
                 .zip(self.midi_binds.iter())
                 .filter_map(|(a, b)| b.map(|bind| MidiBinding { action: *a, bind: Some(bind) }))
                 .collect(),
+            midi_axis: self
+                .knob_cal
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.map(|mut m| { m.slot = i as u16; m }))
+                .collect(),
             root_loops: self.root_loops,
             gui_scale: self.gui_scale,
             latency_ms: self.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0),
@@ -883,9 +1015,19 @@ impl App {
             q_metro: self.q_metro,
             // Only selections that were actually applied get persisted.
             ports_in: self.applied_ports.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
-            ports_out: self.applied_ports.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
+            ports_out: self
+                .applied_ports
+                .as_ref()
+                .map(|p| p.1.iter().map(|(n, _)| n.clone()).collect())
+                .unwrap_or_default(),
+            ports_out_lr: self
+                .applied_ports
+                .as_ref()
+                .map(|p| p.1.iter().map(|(_, lr)| *lr).collect())
+                .unwrap_or_default(),
             trk_vol: self.trk_vol.to_vec(),
             trk_gain: self.trk_gain.to_vec(),
+            trk_pan: self.trk_pan.to_vec(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
             track_fx: (0..MAX_LOOPS)
                 .map(|i| {
@@ -962,14 +1104,51 @@ impl App {
                         if let Some(slot) = self.midi_learning_slot {
                             if self.midi_binds[slot] != Some(bind) {
                                 self.midi_binds[slot] = Some(bind);
+                                // A plain rebind replaces the axis: drop any
+                                // stale min/max calibration for the slot.
+                                self.knob_cal[slot] = None;
                                 self.save_config();
                                 self.status =
                                     format!("bound {} → {}", MidiAction::ALL[slot].label(), bind.label());
                             }
                             self.midi_learning_slot = None;
+                        } else if let Some(kl) = self.knob_learn.as_mut() {
+                            // Two-step knob learn in flight: the control seen
+                            // first defines the axis (type + channel + CC
+                            // number). Every later message must come from the
+                            // same control, else it is rejected with a hint —
+                            // min and max must be the same axis.
+                            if !kl.has_axis {
+                                kl.bind = bind;
+                                kl.has_axis = true;
+                                kl.lo = bind.d1;
+                                self.status = format!(
+                                    "knob {} bound — now move it to MINIMUM, then Lock min",
+                                    bind.label()
+                                );
+                            } else if bind.ty != kl.bind.ty
+                                || bind.ch != kl.bind.ch
+                                || bind.d1 != kl.bind.d1
+                            {
+                                self.status = format!(
+                                    "knob learn: got {} — min and max must come from {} \
+                                     (same channel)",
+                                    bind.label(),
+                                    kl.bind.label()
+                                );
+                            } else if !kl.locked {
+                                kl.lo = bind.d1;
+                            } else {
+                                kl.hi = bind.d1;
+                            }
                         } else {
                             // Value for continuous (knob) bindings: the CC
                             // byte, or note velocity when the note binds.
+                            // The knob wizard may have captured a raw
+                            // min/max other than 0..=127 — rescale through
+                            // the slot's calibration so the control's full
+                            // physical travel maps onto the full program
+                            // range (and inverted wiring is corrected).
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
@@ -980,16 +1159,26 @@ impl App {
                             for i in 0..N_ACTIONS {
                                 if self.midi_binds[i] == Some(bind) {
                                     let a = MidiAction::ALL[i];
+                                    let v = cval.map(|r| match self.knob_cal[i] {
+                                        Some(c) => scale_axis(r, c.lo, c.hi),
+                                        None => r,
+                                    });
                                     match a {
                                         MidiAction::VolLoop(t) => {
-                                            if let Some(v) = cval {
+                                            if let Some(v) = v {
                                                 self.set_trk_vol(t, v);
                                                 self.levels_dirty = true;
                                             }
                                         }
                                         MidiAction::GainLoop(t) => {
-                                            if let Some(v) = cval {
+                                            if let Some(v) = v {
                                                 self.set_trk_gain(t, v);
+                                                self.levels_dirty = true;
+                                            }
+                                        }
+                                        MidiAction::PanLoop(t) => {
+                                            if let Some(v) = v {
+                                                self.set_trk_pan(t, v);
                                                 self.levels_dirty = true;
                                             }
                                         }
@@ -1056,12 +1245,23 @@ impl App {
 
     /// Run the export configured in the dialog (see `export_window`).
     fn do_export(&mut self) {
-        let path = std::path::PathBuf::from(self.export_path.trim());
+        let mut path = std::path::PathBuf::from(self.export_path.trim());
         if path.as_os_str().is_empty() {
             self.status = "export: choose a destination first".into();
             return;
         }
         let fmt = crate::audio_io::ExportFormat::ALL[self.export_fmt];
+        // The selected format drives the extension: the destination is
+        // picked without one, so switching WAV/FLAC/MP3/OGG never requires
+        // re-choosing the location.
+        let ext = fmt.extension();
+        let has_want = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+        if !has_want {
+            path.set_extension(ext);
+        }
         if self.export_whole {
             // Whole-project export only exists in dependent mode — force it on.
             if !self.dependent {
@@ -1114,6 +1314,14 @@ impl eframe::App for App {
         // Push the gain slider value into the audio thread (f32 as bits).
         self.backend.gain.store(self.gain.to_bits(), Ordering::Relaxed);
 
+        // Mirror the GUI selection into the engine every time it changes:
+        // the input monitor runs the selected loop's FX chain + gain + pan.
+        // usize::MAX at boot forces the first frame to send it.
+        if self.sel_sent != self.selected {
+            self.sel_sent = self.selected;
+            self.backend.cmd(Cmd::SetSelected(self.selected));
+        }
+
         // Flush per-loop level changes to the config once the control is
         // released: sliders fire per pixel and MIDI knobs per message, so
         // saving on every change would thrash the disk.
@@ -1138,6 +1346,7 @@ impl eframe::App for App {
         if self.show_export {
             export_window(ui, self);
         }
+        knob_learn_window(ui, self);
         if self.fx_window.is_some() {
             effects_window(ui, self);
         }
@@ -1328,9 +1537,10 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 });
                 // The rows below re-target the dropdown's loop; changing the
                 // selection swaps which slots they edit (labels update too).
-                // Volume/gain are knob bindings: the action fires with the
-                // message VALUE (0..=127), so only CC / note-on drives them.
-                for off in 0..7usize {
+                // Volume / gain / pan are knob bindings: the action fires
+                // with the message VALUE (0..=127), so only CC / note-on
+                // drives them.
+                for off in 0..8usize {
                     let a = match off {
                         0 => MidiAction::RecLoop(app.bind_loop_sel),
                         1 => MidiAction::OdLoop(app.bind_loop_sel),
@@ -1338,7 +1548,8 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         3 => MidiAction::PlayLoop(app.bind_loop_sel),
                         4 => MidiAction::Select(app.bind_loop_sel),
                         5 => MidiAction::VolLoop(app.bind_loop_sel),
-                        _ => MidiAction::GainLoop(app.bind_loop_sel),
+                        6 => MidiAction::GainLoop(app.bind_loop_sel),
+                        _ => MidiAction::PanLoop(app.bind_loop_sel),
                     };
                     bind_row(ui, app, a);
                 }
@@ -1359,17 +1570,27 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     &mut app.sel_in,
                 );
                 ui.add_space(8.0);
-                port_list(
+                port_list_lr(
                     ui,
                     "OUTPUTS",
-                    "remote input ports (sinks)",
+                    "remote input ports (sinks) — tick L and/or R for what each port plays",
                     &app.avail_out,
                     &mut app.sel_out,
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Apply Selection").clicked() {
-                        let ins: Vec<String> = app.sel_in.iter().cloned().collect();
-                        let outs: Vec<String> = app.sel_out.iter().cloned().collect();
+                        // Sort for deterministic slot assignment, so the
+                        // same selection maps to the same out<N> slots and
+                        // JACK connections survive restarts unchanged.
+                        let mut ins: Vec<String> = app.sel_in.iter().cloned().collect();
+                        ins.sort();
+                        let mut outs: Vec<OutSel> = app
+                            .sel_out
+                            .iter()
+                            .filter(|(_, b)| **b != 0)
+                            .map(|(n, b)| (n.clone(), *b))
+                            .collect();
+                        outs.sort();
                         // Remember the applied selection so it is restored on
                         // the next launch (persisted with the other settings).
                         app.applied_ports = Some((ins.clone(), outs.clone()));
@@ -1387,37 +1608,202 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
         });
     }
 
+/// Two-step knob-learn sub-window (opened by the knob buttons in
+/// `bind_row`). The first MIDI message from the control defines the axis;
+/// the user then sweeps to the minimum and locks it, sweeps to the maximum,
+/// and finishes. The captured raw lo/hi is stored per slot and incoming
+/// values are rescaled with `scale_axis`, so a knob wired to a partial
+/// range (or inverted) still covers the full program travel — including
+/// lo > hi, which inverts the axis.
+fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
+    if app.knob_learn.is_none() {
+        return;
+    }
+    egui::Window::new("Learn knob")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ui, |ui| {
+            ui.set_width(360.0);
+            enum Act {
+                None,
+                LockMin,
+                Finish,
+                Cancel,
+                Restart,
+            }
+            let mut act = Act::None;
+            {
+                let kl = app.knob_learn.as_ref().unwrap();
+                let action = MidiAction::ALL[kl.slot].label();
+                ui.label(RichText::new(format!("Bind knob: {action}")).strong());
+                ui.label(
+                    RichText::new(
+                        "Min and max must come from the SAME control on the SAME MIDI \
+                         channel (e.g. CC 0 ch01 then CC 127 ch01) — move only that one \
+                         control while learning.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+                let axis = kl.bind.label();
+                if !kl.has_axis {
+                    ui.label("1. Move your knob / slider to its MINIMUM position.");
+                    ui.label(RichText::new("waiting for the control's first message…").weak().italics());
+                } else {
+                    ui.label(RichText::new(format!("axis: {axis}")).monospace());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("minimum raw value: {}", kl.lo));
+                        if !kl.locked {
+                            if ui.button("Lock min").clicked() {
+                                act = Act::LockMin;
+                            } else {
+                                act = Act::None;
+                            }
+                        } else {
+                            ui.label(RichText::new("(locked)").weak().small());
+                            act = Act::None;
+                        }
+                    });
+                    if kl.locked {
+                        ui.label("3. Move the control to its MAXIMUM position, then Finish.");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("maximum raw value: {}", kl.hi));
+                            let ok = kl.hi != kl.lo;
+                            let fin = ui.add_enabled(ok, egui::Button::new("Finish"));
+                            if fin.clicked() {
+                                act = Act::Finish;
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "2. Keep moving the knob while watching the number above, \
+                                 then press Lock min at the lowest value it sends.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                }
+                if matches!(act, Act::None) {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            act = Act::Cancel;
+                        }
+                        if kl.has_axis && ui.button("Restart").clicked() {
+                            act = Act::Restart;
+                        }
+                    });
+                }
+            }
+            match act {
+                Act::None => {}
+                Act::LockMin => {
+                    let kl = app.knob_learn.as_mut().unwrap();
+                    kl.locked = true;
+                    kl.hi = kl.lo;
+                }
+                Act::Cancel => {
+                    let kl = app.knob_learn.take().unwrap();
+                    app.status =
+                        format!("cancelled knob learn: {}", MidiAction::ALL[kl.slot].label());
+                }
+                Act::Restart => {
+                    let slot = app.knob_learn.as_ref().unwrap().slot;
+                    app.knob_learn = Some(KnobLearn {
+                        slot,
+                        bind: MidiBind { ty: 0xff, ch: 0, d1: 0 },
+                        has_axis: false,
+                        lo: 0,
+                        hi: 127,
+                        locked: false,
+                    });
+                }
+                Act::Finish => {
+                    let kl = app.knob_learn.take().unwrap();
+                    let (slot, lo, hi, bind) = (kl.slot, kl.lo, kl.hi, kl.bind);
+                    app.midi_binds[slot] = Some(bind);
+                    // 0..=127 is the program's native scale: no factor needed.
+                    app.knob_cal[slot] = if lo == 0 && hi == 127 {
+                        None
+                    } else {
+                        Some(MidiAxisCal { slot: slot as u16, lo, hi })
+                    };
+                    app.save_config();
+                    app.status = format!(
+                        "bound {} → {} (raw {}–{}{})",
+                        MidiAction::ALL[slot].label(),
+                        bind.label(),
+                        lo,
+                        hi,
+                        if lo == 0 && hi == 127 {
+                            ""
+                        } else {
+                            ", rescaled to full range"
+                        }
+                    );
+                }
+            }
+        });
+}
+
 /// One row of the bindings table: action label + MIDI capture button +
 /// keyboard button; persists on change. Both columns work like "press a key":
 /// click the cell to arm it, then send the trigger — the next matching input
 /// becomes the binding (click again or Esc cancels).
+///
+/// Continuous (knob) actions bind differently: they need the axis minimum
+/// and maximum, so their button opens the two-step learn window instead of
+/// grabbing the first message that arrives.
 fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
     let idx = MidiAction::idx(a);
     ui.horizontal(|ui| {
         ui.set_min_width(150.0);
         ui.label(RichText::new(a.label()).weak());
 
-        // MIDI binding: live capture (no dropdown — the controller is the menu).
-        let listening = app.midi_learning_slot == Some(idx);
-        let txt = if listening {
+        // MIDI binding: live capture (no dropdown — the controller is the
+        // menu). Knobs get the calibrated two-step flow.
+        let knob = a.is_continuous();
+        let learning_knob = app.knob_learn.as_ref().is_some_and(|k| k.slot == idx);
+        let listening = app.midi_learning_slot == Some(idx) && !learning_knob;
+        let txt = if learning_knob {
+            "learning knob…".to_string()
+        } else if listening {
             "listening…".to_string()
         } else {
             match app.midi_binds[idx] {
-                Some(b) => b.label(),
+                Some(b) => match app.knob_cal.get(idx).copied().flatten() {
+                    // Show the captured raw range next to the axis id.
+                    Some(c) => format!("{}  [{}/{}]", b.label(), c.lo, c.hi),
+                    None => b.label(),
+                },
                 None => "—".to_string(),
             }
         };
         let mut btn = egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(150.0, 0.0));
-        if listening {
+        if listening || learning_knob {
             btn = btn.fill(Color32::from_rgb(60, 90, 120));
         }
-        let resp = ui.add(btn).on_hover_text(
+        let hover = if knob {
+            "Click to open the knob wizard: move the control to its minimum, \
+             lock it, move to the maximum, finish. Captures the full travel of \
+             the knob (min and max must be on the same MIDI channel)."
+        } else {
             "Click to listen: the next NOTE ON / CC / PROGRAM CHANGE \
              from your controller becomes this binding. Click again (or Esc) \
-             to cancel; Delete clears the binding.",
-        );
+             to cancel; Delete clears the binding."
+        };
+        let resp = ui.add(btn).on_hover_text(hover);
         if resp.clicked() {
-            if listening {
+            if learning_knob {
+                app.knob_learn = None;
+            } else if knob {
+                app.arm_knob_learn(idx);
+            } else if listening {
                 app.midi_learning_slot = None;
             } else {
                 app.arm_midi_slot(idx);
@@ -1481,11 +1867,13 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                 let r = ui.add(egui::TextEdit::singleline(&mut app.export_path).desired_width(290.0));
                 app.in_text_edit = app.in_text_edit || r.has_focus();
                 if ui.button("Browse…").clicked() {
-                    let fmt = crate::audio_io::ExportFormat::ALL[app.export_fmt];
+                    // No extension here — the Format dropdown adds it at
+                    // export time (see `do_export`), so changing the format
+                    // never means re-picking the destination.
                     let name = if app.export_whole {
-                        format!("simplooper-project.{}", fmt.extension())
+                        "simplooper-project".to_string()
                     } else {
-                        format!("simplooper-loop-{}.{}", app.selected + 1, fmt.extension())
+                        format!("simplooper-loop-{}", app.selected + 1)
                     };
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("Export destination")
@@ -2049,73 +2437,20 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         }
     });
 
-    // Bottom strip of the loop: one stacked volume+gain element pinned to
-    // the bottom-left, the Effects button right next to it, then every
-    // enabled effect with its own sliders, left to right in chain order.
+    // Bottom strip of the loop: the stacked level element (vol / gain /
+    // pan) pinned to the bottom-left, the Effects button right next to it,
+    // then every enabled effect, left to right in chain order.
     // Gain x volume are always applied first — before any effect.
     ui.horizontal(|ui| {
-        // Stacked level element (vol over gain), each bindable to a MIDI
-        // knob in Settings → per loop bindings.
+        // One row per level control, each bindable to a MIDI knob in
+        // Settings → per loop bindings.
         ui.vertical(|ui| {
-            let w = (ui.available_width() * 0.24).clamp(180.0, 300.0);
+            let w = (ui.available_width() * 0.24).clamp(220.0, 320.0);
             ui.set_width(w);
-            // Left text: raw MIDI value (0..=127, what a bound knob sends);
-            // the level itself is shown as dB centred on the slider.
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("vol  {:>8}", app.trk_vol[i])).monospace().small(),
-                );
-                let mut v = app.trk_vol[i];
-                let rv = ui
-                    .add_sized(
-                        egui::vec2(w - 92.0, 0.0),
-                        Slider::new(&mut v, 0..=127).show_value(false),
-                    )
-                    .on_hover_text(
-                        "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. Number on the left is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
-                    );
-                if rv.changed() {
-                    app.set_trk_vol(i, v);
-                    app.levels_dirty = true;
-                }
-                // dB readout drawn centred on the slider itself.
-                let db = db_str(vol_amp(app.trk_vol[i]));
-                let f = egui::TextStyle::Small.resolve(ui.style());
-                ui.painter().text(
-                    rv.rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    db,
-                    f,
-                    ui.visuals().weak_text_color(),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("gain {:>8}", app.trk_gain[i])).monospace().small(),
-                );
-                let mut g = app.trk_gain[i];
-                let rg = ui
-                    .add_sized(
-                        egui::vec2(w - 92.0, 0.0),
-                        Slider::new(&mut g, 0..=127).show_value(false),
-                    )
-                    .on_hover_text(
-                        "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Number on the left is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
-                    );
-                if rg.changed() {
-                    app.set_trk_gain(i, g);
-                    app.levels_dirty = true;
-                }
-                let db = db_str(gain_amp(app.trk_gain[i]));
-                let f = egui::TextStyle::Small.resolve(ui.style());
-                ui.painter().text(
-                    rg.rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    db,
-                    f,
-                    ui.visuals().weak_text_color(),
-                );
-            });
+            ui.spacing_mut().item_spacing.y = 2.0;
+            level_row(ui, app, i, KIND_VOL);
+            level_row(ui, app, i, KIND_GAIN);
+            level_row(ui, app, i, KIND_PAN);
         });
 
         ui.add_space(6.0);
@@ -2130,6 +2465,143 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         ui.separator();
         fx_buttons(ui, app, i);
     });
+}
+
+// Level-row kinds (index into labels, keys `lv_edit`).
+const KIND_VOL: u8 = 0;
+const KIND_GAIN: u8 = 1;
+const KIND_PAN: u8 = 2;
+
+/// One stacked level row: `label | editable value box (centred) | slider |
+/// raw MIDI readout`. The slider always runs the raw MIDI range 0..=127
+/// (what a bound knob sends); the text box shows the human value — dB for
+/// volume and gain, 0..=100 for pan (50 = centre) — and is typed into
+/// directly, committed with Enter. Text hugs its slider with no filler
+/// padding; every row's slider starts at the same x, so the three line up.
+fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
+    let label = ["vol ", "gain", "pan "][kind as usize];
+    let midi = match kind {
+        KIND_VOL => app.trk_vol[i],
+        KIND_GAIN => app.trk_gain[i],
+        _ => app.trk_pan[i],
+    };
+    let hover = match kind {
+        KIND_VOL => "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+        KIND_GAIN => "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+        _ => "Loop pan: 0 = hard left, 50 = centre, 100 = hard right (equal power across the L/R outputs). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new(label).monospace().small());
+        // Editable value box (number only), centred text, flush against the
+        // slider.
+        let key = (kind, i);
+        let mut txt =
+            app.lv_edit.get(&key).cloned().unwrap_or_else(|| level_display(kind, midi));
+        let rt = ui
+            .add(
+                egui::TextEdit::singleline(&mut txt)
+                    .desired_width(46.0)
+                    .horizontal_align(egui::Align::Center)
+                    .font(egui::TextStyle::Monospace),
+            )
+            .on_hover_text(match kind {
+                KIND_PAN => "Pan position 0..=100 (50 = centre). Press Enter to apply.",
+                _ => "Level in dB (e.g. -6.5). Press Enter to apply.",
+            });
+        // The unit is plain text outside the box — the box holds numbers
+        // only, so typing never has to fight the "dB" suffix.
+        if kind != KIND_PAN {
+            ui.add(
+                egui::Label::new(RichText::new("dB").monospace().weak().small())
+                    .selectable(false),
+            );
+        }
+        app.in_text_edit = app.in_text_edit || rt.has_focus();
+        if rt.has_focus() {
+            app.lv_edit.insert(key, txt.clone());
+        } else {
+            app.lv_edit.remove(&key);
+        }
+        if rt.lost_focus() && ui.input(|u| u.key_pressed(egui::Key::Enter)) {
+            if let Some(v) = level_parse(kind, &txt) {
+                match kind {
+                    KIND_VOL => app.set_trk_vol(i, v),
+                    KIND_GAIN => app.set_trk_gain(i, v),
+                    _ => app.set_trk_pan(i, v),
+                }
+                app.levels_dirty = true;
+            }
+            app.lv_edit.remove(&key);
+        }
+        // Slider: raw MIDI range, no value bubble (the box shows the value).
+        // Sized to the text box's height so the slider track sits exactly at
+        // the text's vertical centre — the rows were misaligned when the
+        // slider kept its own taller default height.
+        let mut v = midi;
+        let sw = (ui.available_width() - if kind == KIND_PAN { 30.0 } else { 50.0 }).max(30.0);
+        let bh = rt.rect.height();
+        let r = ui
+            .add_sized(egui::vec2(sw, bh), Slider::new(&mut v, 0..=127).show_value(false))
+            .on_hover_text(hover);
+        if r.changed() {
+            match kind {
+                KIND_VOL => app.set_trk_vol(i, v),
+                KIND_GAIN => app.set_trk_gain(i, v),
+                _ => app.set_trk_pan(i, v),
+            }
+            app.levels_dirty = true;
+        }
+        ui.add(
+            egui::Label::new(RichText::new(format!("{v:>3}")).monospace().weak().small())
+                .selectable(false),
+        )
+        .on_hover_text("Raw MIDI value (0..=127) sent by a bound knob.");
+    });
+}
+
+/// What a level text box shows when it is not being edited (number only;
+/// the "dB" unit is plain text drawn right after the box).
+fn level_display(kind: u8, midi: u8) -> String {
+    match kind {
+        KIND_VOL => db_num(vol_amp(midi)),
+        KIND_GAIN => db_num(gain_amp(midi)),
+        _ => format!("{}", pan_text(midi)),
+    }
+}
+
+/// Bare dB number for the level text box ("-inf", "+0.0", "-12.3").
+fn db_num(amp: f32) -> String {
+    if amp <= 0.0 {
+        "-inf".into()
+    } else {
+        format!("{:+.1}", 20.0 * amp.log10())
+    }
+}
+
+/// Parse a level text box back to a MIDI value ("−12.3 dB", "-inf", "50").
+/// Volume / gain floor at MIDI 1 for finite values (0 stays reserved for
+/// the exact "-inf"); pan maps 0..=100 -> 0..=127.
+fn level_parse(kind: u8, s: &str) -> Option<u8> {
+    let t: String = s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    let t = t.strip_suffix("db").unwrap_or(&t);
+    match kind {
+        KIND_PAN => t.parse::<f32>().ok().map(pan_midi),
+        _ => {
+            if t == "-inf" {
+                return Some(0);
+            }
+            let db = t.parse::<f32>().ok()?;
+            if !db.is_finite() {
+                return None;
+            }
+            let v = match kind {
+                KIND_VOL => 127.0 + db * (127.0 / 60.0),
+                _ => GAIN_UNITY_MIDI as f32 + db / 0.215,
+            };
+            Some(v.round().clamp(1.0, 127.0) as u8)
+        }
+    }
 }
 
 /// Enabled effects drawn on the loop row as plain name buttons, left to
@@ -2398,6 +2870,50 @@ fn port_list(
     }
 }
 
+/// Like [`port_list`], but each output row carries two checkboxes — the
+/// left and right side of the stereo mix the port plays. Both ticked =
+/// mono downmix `(L + R)/sqrt2` (the classic behaviour); one ticked routes
+/// only that side. Unticking both deselects the port.
+fn port_list_lr(
+    ui: &mut egui::Ui,
+    title: &str,
+    hint: &str,
+    avail: &[PortInfo],
+    sel: &mut HashMap<String, u8>,
+) {
+    ui.label(RichText::new(format!("{}  ({})", title, avail.len())).strong());
+    ui.label(RichText::new(hint).weak().small());
+    if avail.is_empty() {
+        ui.label(RichText::new("no remote audio ports found").weak());
+        return;
+    }
+    let mut last_client = String::new();
+    for p in avail {
+        if p.client != last_client {
+            last_client = p.client.clone();
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("▸ {}", p.client)).strong());
+        }
+        let short = p.name.split(':').nth(1).unwrap_or(&p.name);
+        let entry = sel.get(&p.name).copied().unwrap_or(0u8);
+        let (mut l, mut r) = (entry & 1 != 0, entry & 2 != 0);
+        ui.horizontal(|ui| {
+            let rl = ui.checkbox(&mut l, "L").on_hover_text("play the LEFT side");
+            let rr = ui.checkbox(&mut r, "R").on_hover_text("play the RIGHT side");
+            ui.label(RichText::new(short).strong().small());
+            ui.label(RichText::new(format!("  {}", p.name)).weak().small().monospace());
+            if rl.changed() || rr.changed() {
+                let bits = (l as u8) | ((r as u8) << 1);
+                if bits == 0 {
+                    sel.remove(&p.name);
+                } else {
+                    sel.insert(p.name.clone(), bits);
+                }
+            }
+        });
+    }
+}
+
 fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::bottom("midi")
         .resizable(true)
@@ -2492,6 +3008,61 @@ mod tests {
     }
 
     #[test]
+    fn effect_name_button_opens_the_effects_own_gui() {
+        // The scripted examples ship their own child GUI; clicking an
+        // enabled effect's name button must open that GUI (not the auto
+        // slider window) and paint it through a real egui pass.
+        if !fx::rustc_available() {
+            return; // no compiler in the environment: nothing to load
+        }
+        let mut app = test_app("fxeditorgui");
+        let dir = std::env::temp_dir().join(format!("simplooper-fxgui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fx::API_FILE), fx::API_SRC).unwrap();
+        std::fs::write(dir.join(fx::TEMPLATE_FILE), fx::TEMPLATE_SRC).unwrap();
+        for (name, src) in fx::EXAMPLES {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        app.fx_dir_edit = dir.display().to_string();
+        app.apply_fx_dir();
+
+        for stem in ["parametric_eq", "space_echo"] {
+            assert!(app.fx_registry.gui(stem).is_some(), "{stem} exposes a child GUI");
+            let k = app.fx_entries[0].iter().position(|e| e.stem == stem).unwrap();
+            app.fx_entries[0][k].enabled = true;
+            let stems = app.fx_registry.stems();
+            fx::resort_entries(&mut app.fx_entries[0], &stems);
+            app.rebuild_fx(0);
+            let slot = app.fx_entries[0]
+                .iter()
+                .filter(|e| e.enabled)
+                .position(|e| e.stem == stem)
+                .unwrap();
+            app.open_fx_editor(0, slot);
+            assert!(app.fx_editor.is_some(), "name click opens the editor window");
+            assert!(
+                app.fx_editor.as_ref().is_some_and(|ed| ed.is_custom()),
+                "{stem} must open its own scripted GUI, not auto sliders"
+            );
+            // Paint it: gui_create/gui_draw run inside a real pass; a bad
+            // GUI contract would panic here.
+            let ctx = egui::Context::default();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    app.fx_editor_window(ui);
+                });
+            });
+            // Headless pass: the caller (usually a GPU backend) must consume
+            // the frame's shapes + texture deltas before they are dropped.
+            let _tris = ctx.tessellate(out.shapes, out.pixels_per_point);
+            out.textures_delta.clear();
+            assert!(app.fx_editor.is_some(), "editor stays open after painting");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn delete_clears_midi_binding_while_listening() {
         let mut app = test_app("midi-del");
         app.midi_binds[0] = Some(crate::midi::MidiBind { ty: 0, ch: 0, d1: 60 });
@@ -2565,18 +3136,58 @@ mod tests {
         // Per-loop volume/gain slots were APPENDED after redo-overdub
         // (interleaved vol/gain per loop); they are value-driven and must
         // never carry a keyboard default (a key press carries no value).
-        assert_eq!(N_ACTIONS, 124);
+        assert_eq!(N_ACTIONS, 140);
         for i in 0..MAX_LOOPS {
             assert_eq!(MidiAction::idx(MidiAction::VolLoop(i)), 92 + i * 2);
             assert_eq!(MidiAction::idx(MidiAction::GainLoop(i)), 93 + i * 2);
+            // Pan was APPENDED as a block after all vol/gain slots.
+            assert_eq!(MidiAction::idx(MidiAction::PanLoop(i)), 124 + i);
             assert!(MidiAction::VolLoop(i).is_continuous());
             assert!(MidiAction::GainLoop(i).is_continuous());
+            assert!(MidiAction::PanLoop(i).is_continuous());
             assert_eq!(SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::VolLoop(i))], None);
             assert_eq!(SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::GainLoop(i))], None);
+            assert_eq!(SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PanLoop(i))], None);
         }
         assert!(!MidiAction::RecLoop(0).is_continuous());
         assert_eq!(MidiAction::VolLoop(0).label(), "loop 1: volume (knob)");
         assert_eq!(MidiAction::GainLoop(15).label(), "loop 16: gain (knob)");
+        assert_eq!(MidiAction::PanLoop(0).label(), "loop 1: pan (knob)");
+    }
+
+    #[test]
+    fn pan_mappings_centre_at_50() {
+        // MIDI 64 is the centre default; the text box shows 0..=100.
+        assert_eq!(PAN_CENTRE_MIDI, 64);
+        assert_eq!(pan_text(PAN_CENTRE_MIDI), 50);
+        assert_eq!(pan_midi(50.0), PAN_CENTRE_MIDI); // 50 * 1.27 = 63.5 -> 64
+        assert_eq!(pan_text(0), 0);
+        assert_eq!(pan_text(127), 100);
+        assert_eq!(pan_midi(0.0), 0);
+        assert_eq!(pan_midi(100.0), 127);
+        assert_eq!(pan_midi(150.0), 127, "clamped");
+        // Engine position: hard right at MIDI 127.
+        assert!((pan01(127) - 1.0).abs() < 1e-6);
+        assert!((pan01(0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn level_text_roundtrip() {
+        // dB boxes parse back into the MIDI domain; "-inf" hits silence.
+        assert_eq!(level_parse(KIND_VOL, "+0.0 dB"), Some(127));
+        assert_eq!(level_parse(KIND_VOL, "-inf"), Some(0));
+        assert_eq!(level_parse(KIND_GAIN, "0 dB"), Some(GAIN_UNITY_MIDI));
+        assert_eq!(level_parse(KIND_GAIN, "+10.1 dB"), Some(127));
+        assert_eq!(level_parse(KIND_VOL, "-999"), Some(1), "finite floors at 1");
+        assert_eq!(level_parse(KIND_PAN, "50"), Some(PAN_CENTRE_MIDI));
+        assert_eq!(level_parse(KIND_PAN, "0"), Some(0));
+        assert_eq!(level_parse(KIND_PAN, "junk"), None);
+        // Display strings feed straight back into the parser.
+        for m in [0u8, 1, 40, 80, 127] {
+            let s = level_display(KIND_VOL, m);
+            assert!(level_parse(KIND_VOL, &s).is_some(), "{s}");
+        }
+        assert_eq!(level_display(KIND_PAN, PAN_CENTRE_MIDI), "50");
     }
 
     #[test]

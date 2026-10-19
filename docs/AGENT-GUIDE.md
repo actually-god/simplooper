@@ -36,7 +36,9 @@ display (X11 or Wayland).
 src/            application source (Rust 2021 edition)
   main.rs         entry point, window setup
   lib.rs          crate root: pub mods + loop-engine re-exports
-  audio.rs        JACK backend + realtime LoopEngine (Cmd/Evt channels)
+  audio.rs        JACK backend + realtime LoopEngine (Cmd/Evt channels);
+                  stereo mix buses with per-loop equal-power pan, per-output
+                  L/R routing (Cmd::Apply outs = Vec<(name, bits)>)
   audio_io.rs     import (symphonia: wav/mp3/ogg/flac/m4a/aac/aiff…) +
                   export (WAV/FLAC native; MP3/OGG shell out to ffmpeg)
   config.rs       JSON persistence: $XDG_CONFIG_HOME/simplooper/config.json

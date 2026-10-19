@@ -30,6 +30,19 @@ const MIDI_PORT_SHORT: &str = "midi_in";
 /// Fixed pool of mix slots; `Apply` maps the selected ports onto slots 0..n-1.
 pub const MAX_SLOTS: usize = 16;
 
+/// 1/sqrt(2) — the equal-power centre gain and the mono-downmix scale.
+const F1S2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// Equal-power pan gains `(left, right)` for a position in [0, 1]
+/// (0 = hard left, 0.5 = centre, 1 = hard right). At centre both are
+/// 1/sqrt(2), so the mono downmix `(l + r)/sqrt(2)` of a centred source
+/// is exactly the source — a single (or L+R-routed) output reproduces the
+/// old mono mix unchanged at the default pan.
+pub fn pan_gains(p: f32) -> (f32, f32) {
+    let th = p.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    (th.cos(), th.sin())
+}
+
 /// Number of simultaneous loops (tracks).
 pub const MAX_LOOPS: usize = 16;
 /// Per-track recording capacity: ~60 s @ 48 kHz (~30 s @ 96 kHz).
@@ -107,6 +120,10 @@ pub struct RawMidiMsg {
     pub bytes: Vec<u8>,
 }
 
+/// A selected output port paired with its stereo routing: bit 0 = left
+/// bus, bit 1 = right bus (3 = mono downmix, the default).
+pub type OutSel = (String, u8);
+
 /// Commands from the GUI to the audio manager thread.
 pub enum Cmd {
     /// Re-enumerate remote audio ports and send them back.
@@ -114,7 +131,11 @@ pub enum Cmd {
     /// Connect the selected external ports to mix slots 0..n-1 (disconnecting
     /// whatever was there before). Empty lists stop all audio; MIDI monitoring
     /// keeps running. Selections beyond `MAX_SLOTS` are ignored (with an error).
-    Apply { ins: Vec<String>, outs: Vec<String> },
+    /// Each output carries its stereo routing as bits: 1 = left bus,
+    /// 2 = right bus, 3 = mono downmix `(L + R)/sqrt2` (the default, and the
+    /// bit-exact old mono behaviour for centred mixes). A port routed to both
+    /// gets the downmix, never two conflicting writes.
+    Apply { ins: Vec<String>, outs: Vec<OutSel> },
     /// Toggle recording on a loop track. From IDLE/PLAY this starts a fresh
     /// capture (previous content is discarded); from REC it stops and keeps
     /// the captured loop playing.
@@ -157,6 +178,10 @@ pub enum Cmd {
     /// hold refcounted effect instances created on the GUI thread; the audio
     /// thread picks the new table up on the next cycle without locking.
     SetTrackEffects { i: usize, chain: TrackFx },
+    /// The GUI selection moved to loop `i` (0-based). Input monitoring
+    /// follows the selected loop: its gain, volume, effect chain and pan
+    /// shape the live pass-through.
+    SetSelected(usize),
     /// Dependent-mode ensemble length in units of the longest ("root") loop,
     /// clamped to 1..=64. The ensemble period is N root loops: every track
     /// repeats within the period, and the clock wraps at the period end so
@@ -336,6 +361,12 @@ pub struct LoopEngine {
     /// Per-track playback gain trim (linear amplitude as f32 bits;
     /// 1.0 = 0 dB). Same output-only semantics as `vol`.
     trk_gain: [AtomicU32; MAX_LOOPS],
+    /// Per-track stereo pan position as f32 in [0, 1] (0 = hard left,
+    /// 0.5 = centre). Equal-power split between the L and R mix buses.
+    pan: [AtomicU32; MAX_LOOPS],
+    /// GUI-selected loop (0-based). Live input monitoring rides this
+    /// track's gain x volume, effect chain and pan (see `Proc::process`).
+    selected: AtomicU8,
     /// Per-track live effect chains. The manager thread swaps the whole
     /// table on `SetTrackEffects`; the RT handler refreshes a cached Arc
     /// clone when `fx_gen` changes (try_lock — never blocks).
@@ -370,6 +401,8 @@ impl LoopEngine {
             rec_skip: core::array::from_fn(|_| AtomicU32::new(0)),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
+            selected: AtomicU8::new(0),
             fx: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| TrackFx::default()))),
             fx_gen: AtomicU64::new(0),
             metro_on: AtomicU8::new(0),
@@ -474,6 +507,10 @@ impl LoopEngine {
             // uses FRESH private instances (phase 0) so the live instances
             // the RT thread is advancing are never touched.
             let tamp = self.loop_vol(t) * self.loop_gain(t);
+            // Pan rides the render too: the mono export is the (L + R)/sqrt2
+            // downmix of the panned contribution, matching a mono output port.
+            let (pgl, pgr) = pan_gains(self.loop_pan(t));
+            let pdown = (pgl + pgr) * F1S2;
             let fx: Vec<Arc<crate::fx::Instance>> = {
                 let tb = self.fx.lock().unwrap();
                 tb[t].slots().iter().filter_map(|s| s.inst.spawn_fresh(&s.desc)).collect()
@@ -491,15 +528,15 @@ impl LoopEngine {
                 let end = ((base + max_len as u64) % l) as usize;
                 if end > start {
                     for k in 0..(end - start) {
-                        out[(base + k as u64) as usize] += mix(buf[start + k]);
+                        out[(base + k as u64) as usize] += mix(buf[start + k]) * pdown;
                     }
                 } else {
                     let first = (l - start as u64) as usize;
                     for k in 0..first {
-                        out[(base + k as u64) as usize] += mix(buf[start + k]);
+                        out[(base + k as u64) as usize] += mix(buf[start + k]) * pdown;
                     }
                     for k in 0..end {
-                        out[(base + first as u64 + k as u64) as usize] += mix(buf[k]);
+                        out[(base + first as u64 + k as u64) as usize] += mix(buf[k]) * pdown;
                     }
                 }
             }
@@ -601,6 +638,16 @@ impl LoopEngine {
     /// Set track `i`'s gain trim (linear amplitude; 0 = silence).
     pub fn set_loop_gain(&self, i: usize, amp: f32) {
         self.trk_gain[i].store(amp.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Per-track pan position ([0, 1]; 0.5 = centre).
+    pub fn loop_pan(&self, i: usize) -> f32 {
+        f32::from_bits(self.pan[i].load(Ordering::Relaxed))
+    }
+
+    /// Set track `i`'s pan position, clamped to [0, 1].
+    pub fn set_loop_pan(&self, i: usize, p: f32) {
+        self.pan[i].store(p.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Replace track `i`'s live effect chain (manager thread).
@@ -855,7 +902,9 @@ fn run(
     };
 
     let mask_in = Arc::new(AtomicU64::new(0));
-    let mask_out = Arc::new(AtomicU64::new(0));
+    // Output slots carry independent L / R bits (see `Cmd::Apply`).
+    let mask_out_l = Arc::new(AtomicU64::new(0));
+    let mask_out_r = Arc::new(AtomicU64::new(0));
     let notif = Notif { tx: evt_tx.clone(), xruns: xruns.clone() };
     // Sample rate is queryable before activation; the metronome grid is
     // sized from it.
@@ -864,7 +913,8 @@ fn run(
         midi_in: midi_port,
         ports: RawPorts { ins: ins_raw, outs: outs_raw },
         mask_in: mask_in.clone(),
-        mask_out: mask_out.clone(),
+        mask_out_l: mask_out_l.clone(),
+        mask_out_r: mask_out_r.clone(),
         tx: evt_tx.clone(),
         midi_drops,
         gain: gain.clone(),
@@ -919,7 +969,7 @@ fn run(
 
     // What each slot is currently connected to (manager-thread state only).
     let mut cur_in: Vec<Option<String>> = vec![None; MAX_SLOTS];
-    let mut cur_out: Vec<Option<String>> = vec![None; MAX_SLOTS];
+    let mut cur_out: Vec<Option<(String, u8)>> = vec![None; MAX_SLOTS];
 
     // Overdub undo/redo history (manager-thread state only).
     let mut hist = OdHistory::default();
@@ -935,7 +985,8 @@ fn run(
                     &mut cur_in,
                     &mut cur_out,
                     &mask_in,
-                    &mask_out,
+                    &mask_out_l,
+                    &mask_out_r,
                     &evt_tx,
                 );
             }
@@ -1070,6 +1121,9 @@ fn run(
             }
             Ok(Cmd::SetTrackEffects { i, chain }) => {
                 engine.set_track_fx(i.min(MAX_LOOPS - 1), chain);
+            }
+            Ok(Cmd::SetSelected(i)) => {
+                engine.selected.store(i.min(MAX_LOOPS - 1) as u8, Ordering::Relaxed);
             }
             Ok(Cmd::SetRootLoops(n)) => {
                 engine.root_loops.store(n.clamp(1, 64), Ordering::Relaxed);
@@ -1206,11 +1260,12 @@ fn connect_retry(client: &Client, src: &str, dst: &str) -> Result<(), jack::Erro
 fn apply_layout(
     client: &Client,
     ins: &[String],
-    outs: &[String],
+    outs: &[(String, u8)],
     cur_in: &mut [Option<String>],
-    cur_out: &mut [Option<String>],
+    cur_out: &mut [Option<(String, u8)>],
     mask_in: &AtomicU64,
-    mask_out: &AtomicU64,
+    mask_out_l: &AtomicU64,
+    mask_out_r: &AtomicU64,
     tx: &SyncSender<Evt>,
 ) {
     if ins.len() > MAX_SLOTS || outs.len() > MAX_SLOTS {
@@ -1261,7 +1316,28 @@ fn apply_layout(
 
     let mut applied_out = 0usize;
     for (i, slot) in cur_out.iter_mut().enumerate() {
-        let new_out = outs.get(i).cloned();
+        // Route bits: 1 = L bus, 2 = R bus; 0 counts as both (mono downmix
+        // — the historical behaviour, and the default for fresh selections).
+        let new_out = outs.get(i).map(|(n, lr)| (n.clone(), if lr & 3 == 0 { 3 } else { lr & 3 }));
+        let same_name = slot.as_ref().map(|s| &s.0) == new_out.as_ref().map(|s| &s.0);
+        if same_name && slot.is_some() {
+            // Still connected to the same port: only the L/R routing can
+            // have moved — retarget the masks without touching the link.
+            if let Some((_, lr)) = &new_out {
+                if slot.as_ref().map(|s| s.1) != Some(*lr) {
+                    mask_out_l.fetch_and(!(1u64 << i), Ordering::Relaxed);
+                    mask_out_r.fetch_and(!(1u64 << i), Ordering::Relaxed);
+                    if lr & 1 != 0 {
+                        mask_out_l.fetch_or(1u64 << i, Ordering::Relaxed);
+                    }
+                    if lr & 2 != 0 {
+                        mask_out_r.fetch_or(1u64 << i, Ordering::Relaxed);
+                    }
+                    *slot = new_out;
+                }
+            }
+            continue;
+        }
         if *slot == new_out {
             continue;
         }
@@ -1276,13 +1352,19 @@ fn apply_layout(
                     )));
                 }
             }
-            mask_out.fetch_and(!(1u64 << i), Ordering::Relaxed);
+            mask_out_l.fetch_and(!(1u64 << i), Ordering::Relaxed);
+            mask_out_r.fetch_and(!(1u64 << i), Ordering::Relaxed);
         }
-        if let Some(dst) = new_out {
+        if let Some((dst, lr)) = new_out {
             match connect_retry(client, &pool_name, &dst) {
                 Ok(()) => {
-                    mask_out.fetch_or(1u64 << i, Ordering::Relaxed);
-                    *slot = Some(dst);
+                    if lr & 1 != 0 {
+                        mask_out_l.fetch_or(1u64 << i, Ordering::Relaxed);
+                    }
+                    if lr & 2 != 0 {
+                        mask_out_r.fetch_or(1u64 << i, Ordering::Relaxed);
+                    }
+                    *slot = Some((dst, lr));
                     applied_out += 1;
                 }
                 Err(e) => {
@@ -1464,7 +1546,8 @@ struct Proc {
     midi_in: Port<MidiIn>,
     ports: RawPorts,
     mask_in: Arc<AtomicU64>,
-    mask_out: Arc<AtomicU64>,
+    mask_out_l: Arc<AtomicU64>,
+    mask_out_r: Arc<AtomicU64>,
     tx: SyncSender<Evt>,
     midi_drops: Arc<AtomicU64>,
     gain: Arc<AtomicU32>,
@@ -1562,7 +1645,8 @@ impl ProcessHandler for Proc {
         }
 
         let in_mask = self.mask_in.load(Ordering::Relaxed);
-        let out_mask = self.mask_out.load(Ordering::Relaxed);
+        let out_mask_l = self.mask_out_l.load(Ordering::Relaxed);
+        let out_mask_r = self.mask_out_r.load(Ordering::Relaxed);
 
         // Per-cycle snapshot of the loop engine (atomics are only read here).
         let st_now: [u8; MAX_LOOPS] = core::array::from_fn(|i| {
@@ -1593,10 +1677,21 @@ impl ProcessHandler for Proc {
         // mix level rides the slider while recorded content stays at raw
         // input level (overdub writes below always use the undamped `src_in`).
         let mut amp = [1.0f32; MAX_LOOPS];
-        for (a, t) in amp.iter_mut().zip(0..MAX_LOOPS) {
+        // Equal-power pan gains per track, snapshotted with the trim.
+        let mut pgl = [F1S2; MAX_LOOPS];
+        let mut pgr = [F1S2; MAX_LOOPS];
+        for (t, a) in amp.iter_mut().enumerate() {
             *a = f32::from_bits(self.engine.vol[t].load(Ordering::Relaxed))
                 * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
+            let (l, r) = pan_gains(f32::from_bits(self.engine.pan[t].load(Ordering::Relaxed)));
+            pgl[t] = l;
+            pgr[t] = r;
         }
+        // Input monitoring follows the selected loop: its gain x volume,
+        // effect chain and pan shape the live pass-through (recording and
+        // overdubs still capture the raw, unprocessed `src_in`).
+        let sel = (self.engine.selected.load(Ordering::Relaxed) as usize).min(MAX_LOOPS - 1);
+        let (mon_amp, mon_l, mon_r) = (amp[sel], pgl[sel], pgr[sel]);
         // Compact list of the non-IDLE tracks: the sample loop iterates only
         // these instead of all MAX_LOOPS slots per sample.
         let mut active: [u8; MAX_LOOPS] = [0u8; MAX_LOOPS];
@@ -1609,7 +1704,7 @@ impl ProcessHandler for Proc {
         }
         let any_loop_active = nact > 0;
 
-        if in_mask == 0 && out_mask == 0 && !any_loop_active {
+        if in_mask == 0 && (out_mask_l | out_mask_r) == 0 && !any_loop_active {
             return Control::Continue; // nothing connected: idle
         }
 
@@ -1651,20 +1746,40 @@ impl ProcessHandler for Proc {
                 }
             }
         }
-        // Cache output buffers too: the mix is computed once per sample and
-        // written to every enabled slot.
-        let mut out_bufs: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
-        let mut nout = 0usize;
+        // Cache output buffers too: the stereo mix is computed once per
+        // sample and written to every enabled slot according to its routing
+        // — left bus, right bus, or the mono downmix (both bits).
+        let mut out_bufs_l: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
+        let mut out_bufs_r: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
+        let mut out_bufs_m: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
+        let (mut nl, mut nr, mut nm) = (0usize, 0usize, 0usize);
         for s in 0..MAX_SLOTS {
-            if out_mask & (1u64 << s) != 0 {
-                let p = self.ports.outs[s];
-                if !p.is_null() {
-                    out_bufs[nout] = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32 };
-                    nout += 1;
+            let l = out_mask_l & (1u64 << s) != 0;
+            let r = out_mask_r & (1u64 << s) != 0;
+            if !(l || r) {
+                continue;
+            }
+            let p = self.ports.outs[s];
+            if p.is_null() {
+                continue;
+            }
+            let b = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32 };
+            match (l, r) {
+                (true, false) => {
+                    out_bufs_l[nl] = b;
+                    nl += 1;
+                }
+                (false, true) => {
+                    out_bufs_r[nr] = b;
+                    nr += 1;
+                }
+                _ => {
+                    out_bufs_m[nm] = b;
+                    nm += 1;
                 }
             }
         }
-        let (ins, outs) = (&in_bufs[..nin], &out_bufs[..nout]);
+        let ins = &in_bufs[..nin];
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
         // Metronome parameters for this cycle (click is added to the output
@@ -1730,8 +1845,10 @@ impl ProcessHandler for Proc {
             // button-press silence at a take's start gets trimmed away.
             let src_in = dry;
 
-            // Loop engine step, shared by all output slots.
-            let mut play = 0.0f32;
+            // Loop engine step: the panned contribution, shared by all
+            // output slots (each slot takes L, R or the mono downmix).
+            let mut play_l = 0.0f32;
+            let mut play_r = 0.0f32;
             if any_loop_active {
                 // Ensemble position in dependent mode (before advancing).
                 let p = if period > 0 { self.master_pos % period } else { 0 };
@@ -1761,7 +1878,9 @@ impl ProcessHandler for Proc {
                                 // (OD sums live input onto the take in place).
                                 let old = self.engine.read(t, off as u32);
                                 // Effects (if any) run after gain x volume.
-                                play += self.fx_mix(t, old * amp[t]);
+                                let m = self.fx_mix(t, old * amp[t]);
+                                play_l += m * pgl[t];
+                                play_r += m * pgr[t];
                                 if st == TR_OD {
                                     // Additive overdub: layer the live input
                                     // on top of the existing recording at its
@@ -1772,7 +1891,9 @@ impl ProcessHandler for Proc {
                             } else {
                                 let off = self.pos[t] % l;
                                 let old = self.engine.read(t, off as u32);
-                                play += self.fx_mix(t, old * amp[t]);
+                                let m = self.fx_mix(t, old * amp[t]);
+                                play_l += m * pgl[t];
+                                play_r += m * pgr[t];
                                 if st == TR_OD {
                                     self.engine.write(t, off as u32, old + src_in);
                                 }
@@ -1866,16 +1987,31 @@ impl ProcessHandler for Proc {
             }
             self.sample_no += 1;
 
-            let v = (src_in + play + click) * g;
+            // Live input rides the selected loop's chain/trim/pan; the click
+            // always sits dead centre. At unity trim and centre pan the L/R
+            // pair still sums to the historical unity mono mix.
+            let mon = self.fx_mix(sel, src_in * mon_amp);
+            let clickc = click * F1S2;
+            let v_l = (mon * mon_l + clickc + play_l) * g;
+            let v_r = (mon * mon_r + clickc + play_r) * g;
             // The output mix is NEVER delayed: what the user hears stays
             // exactly on the loop grid (latency compensation only trims the
             // start of a fresh take — see `LoopEngine::rec_sample`).
-            let av = v.abs();
+            let av = v_l.abs().max(v_r.abs());
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
             }
-            for b in outs {
-                unsafe { *b.add(i) = v };
+            if nm > 0 {
+                let v_m = (v_l + v_r) * F1S2;
+                for b in &out_bufs_m[..nm] {
+                    unsafe { *b.add(i) = v_m };
+                }
+            }
+            for b in &out_bufs_l[..nl] {
+                unsafe { *b.add(i) = v_l };
+            }
+            for b in &out_bufs_r[..nr] {
+                unsafe { *b.add(i) = v_r };
             }
         }
         // Continuous ensemble: at the period end the clock simply wraps and
@@ -1925,6 +2061,40 @@ mod tests {
 
     /// The ensemble render must run each track's effect chain (on private
     /// instances, leaving the live ones untouched) after the vol x gain trim.
+    #[test]
+    fn pan_gains_are_equal_power_and_mono_safe() {
+        // Hard positions.
+        let (l, r) = pan_gains(0.0);
+        assert!((l - 1.0).abs() < 1e-6 && r.abs() < 1e-6, "0 = hard left");
+        let (l, r) = pan_gains(1.0);
+        assert!(l.abs() < 1e-6 && (r - 1.0).abs() < 1e-6, "1 = hard right");
+        // Centre: 1/sqrt2 on both buses, so the (L + R)/sqrt2 downmix of a
+        // centred source is exactly unity — the historical mono mix intact.
+        let (l, r) = pan_gains(0.5);
+        assert!((l - F1S2).abs() < 1e-6 && (r - F1S2).abs() < 1e-6);
+        assert!(((l + r) * F1S2 - 1.0).abs() < 1e-4);
+        // Constant power across the whole field; clamped outside [0, 1].
+        for k in 0..=16 {
+            let p = k as f32 / 16.0;
+            let (l, r) = pan_gains(p);
+            assert!((l * l + r * r - 1.0).abs() < 1e-3, "power at p={p}");
+        }
+        assert_eq!(pan_gains(-2.0), pan_gains(0.0));
+        assert_eq!(pan_gains(9.0), pan_gains(1.0));
+    }
+
+    #[test]
+    fn loop_pan_defaults_centre_and_clamps() {
+        let e = LoopEngine::new();
+        assert!((e.loop_pan(3) - 0.5).abs() < 1e-9, "default is centre");
+        e.set_loop_pan(3, 0.25);
+        assert!((e.loop_pan(3) - 0.25).abs() < 1e-6);
+        e.set_loop_pan(3, 4.0);
+        assert!((e.loop_pan(3) - 1.0).abs() < 1e-6, "clamped to full right");
+        e.set_loop_pan(3, -1.0);
+        assert_eq!(e.loop_pan(3), 0.0, "clamped to full left");
+    }
+
     #[test]
     fn render_ensemble_applies_effect_chain() {
         if !crate::fx::rustc_available() {

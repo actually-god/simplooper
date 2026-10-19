@@ -130,9 +130,10 @@ fn e2e_audio_mixing() {
         .unwrap();
 
     // Apply the layout through the backend's command channel.
+    // Route 3 = mono downmix (the historical output behaviour).
     b.cmd(Cmd::Apply {
         ins: vec![format!("{client_name}:out_a"), format!("{client_name}:out_b")],
-        outs: vec![format!("{client_name}:sink")],
+        outs: vec![(format!("{client_name}:sink"), 3)],
     });
     assert!(
         wait_for(
@@ -510,7 +511,7 @@ fn e2e_loop_engine() {
 
     b.cmd(Cmd::Apply {
         ins: vec![format!("{src_name}:out_a")],
-        outs: vec![format!("{src_name}:sink")],
+        outs: vec![(format!("{src_name}:sink"), 3)],
     });
     let mut applied = None;
     for _ in 0..200 {
@@ -841,7 +842,7 @@ fn e2e_overdub_undo() {
 
     b.cmd(Cmd::Apply {
         ins: vec![format!("{src_name}:out_a")],
-        outs: vec![format!("{src_name}:sink")],
+        outs: vec![(format!("{src_name}:sink"), 3)],
     });
     assert!(
         wait_for(
@@ -1040,7 +1041,7 @@ fn e2e_metronome() {
         .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
         .unwrap();
 
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![format!("{src_name}:sink")] });
+    b.cmd(Cmd::Apply { ins: vec![], outs: vec![(format!("{src_name}:sink"), 3)] });
     assert!(
         wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
             .is_some(),
@@ -1133,6 +1134,220 @@ fn e2e_metronome() {
         "metronome still clicking after stop"
     );
 
+    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    let _ = active;
+}
+
+// ------------------------------------------------------------------ export --
+
+/// The Export button's whole path: engine content -> Cmd::ExportTrack ->
+/// file on disk, extension appended from the format (the picker path never
+/// carries one), plus the "no recording" error for empty loops.
+struct ConstSrcProc {
+    out: Port<AudioOut>,
+}
+
+impl ProcessHandler for ConstSrcProc {
+    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+        self.out.as_mut_slice(ps).fill(0.25);
+        Control::Continue
+    }
+}
+
+#[test]
+fn e2e_export_writes_file() {
+    use simplooper::audio_io::ExportFormat;
+    let _g = e2e_lock();
+    let Some((b, _cn, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let (client, _status) = Client::new("export_src", ClientOptions::NO_START_SERVER)
+        .expect("no JACK server");
+    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async((), ConstSrcProc { out: out_a })
+        .unwrap();
+
+    b.cmd(Cmd::Apply { ins: vec![format!("{src_name}:out_a")], outs: vec![] });
+    let mut applied = None;
+    for _ in 0..200 {
+        match b.evt_rx.try_recv() {
+            Ok(Evt::Applied { ins, outs }) => {
+                applied = Some((ins, outs));
+                break;
+            }
+            Ok(Evt::Error(msg)) => eprintln!("apply error: {msg}"),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    assert!(matches!(applied, Some((1, 0))), "input not applied: {applied:?}");
+
+    // Record ~300 ms into loop 0.
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_REC),
+            Duration::from_secs(2)
+        )
+        .is_some(),
+        "loop 0 never entered REC"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    std::thread::sleep(Duration::from_millis(150));
+
+    let dir = std::env::temp_dir().join(format!("simplooper-e2e-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let stem = dir.join("take");
+
+    b.cmd(Cmd::ExportTrack { i: 0, path: stem.clone(), fmt: ExportFormat::Wav });
+    let got = wait_for(
+        &b,
+        |e| matches!(e, Evt::Notice(m) if m.contains("exported")),
+        Duration::from_secs(5),
+    );
+    assert!(got.is_some(), "no export Notice: empty loop recorded?");
+    let file = stem.with_extension("wav"); // extension from the format
+    let bytes = std::fs::read(&file).expect("exported wav must exist on disk");
+    assert!(bytes.starts_with(b"RIFF"), "exported file is not a WAV");
+    // Some real audio must be in there (≥ ~50 ms), plus the 44-byte header.
+    let min = 44 + (sr as f32 * 0.05) as usize * 4;
+    assert!(bytes.len() > min, "wav too small: {} bytes", bytes.len());
+
+    // Empty loop must produce an explicit error, not silence.
+    b.cmd(Cmd::ExportTrack { i: 7, path: dir.join("none"), fmt: ExportFormat::Wav });
+    let err = wait_for(
+        &b,
+        |e| matches!(e, Evt::Error(m) if m.contains("no recording")),
+        Duration::from_secs(2),
+    );
+    assert!(err.is_some(), "empty-loop export must report 'no recording'");
+    assert!(!dir.join("none.wav").exists(), "no file may be written for an empty loop");
+
+    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = active;
+}
+
+// -------------------------------------------------------------- monitoring --
+
+/// Live input pass-through follows the SELECTED loop: input x (vol x gain)
+/// of the selected loop, equal-power panned across the routed outputs.
+/// Nothing needs to be recording for this to hold — that is the whole point
+/// of "monitoring rides the selection".
+#[test]
+fn e2e_selected_loop_monitoring() {
+    let _g = e2e_lock();
+    let Some((b, _cn, _sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 16;
+    let ring_l: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_r: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+
+    struct MonCapProc {
+        out: Port<AudioOut>,
+        sink_l: Port<AudioIn>,
+        sink_r: Port<AudioIn>,
+        rl: Arc<Vec<AtomicU32>>,
+        rr: Arc<Vec<AtomicU32>>,
+        widx: Arc<AtomicU64>,
+    }
+    impl ProcessHandler for MonCapProc {
+        fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+            self.out.as_mut_slice(ps).fill(0.5);
+            let l = self.sink_l.as_slice(ps);
+            let r = self.sink_r.as_slice(ps);
+            let base = self.widx.load(Ordering::Relaxed) as usize;
+            for (i, s) in l.iter().enumerate() {
+                self.rl[(base + i) % self.rl.len()].store(s.to_bits(), Ordering::Relaxed);
+            }
+            for (i, s) in r.iter().enumerate() {
+                self.rr[(base + i) % self.rr.len()].store(s.to_bits(), Ordering::Relaxed);
+            }
+            self.widx.fetch_add(ps.n_frames() as u64, Ordering::Relaxed);
+            Control::Continue
+        }
+    }
+
+    let (client, _status) = Client::new("mon_test", ClientOptions::NO_START_SERVER)
+        .expect("no JACK server");
+    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            MonCapProc {
+                out: out_a,
+                sink_l,
+                sink_r,
+                rl: ring_l.clone(),
+                rr: ring_r.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+
+    // Selected loop 0 at vol 0.5, gain 1.0, pan hard right (1.0):
+    // expect L = 0, R = 0.5 x 0.5 = 0.25 on the monitored signal.
+    b.engine.set_loop_vol(0, 0.5);
+    b.engine.set_loop_gain(0, 1.0);
+    b.engine.set_loop_pan(0, 1.0);
+    b.cmd(Cmd::SetSelected(0));
+    b.cmd(Cmd::Apply {
+        ins: vec![format!("{src_name}:out_a")],
+        outs: vec![(format!("{src_name}:sink_l"), 1), (format!("{src_name}:sink_r"), 2)],
+    });
+    assert!(
+        wait_for(&b, |e| matches!(e, Evt::Applied { .. }), Duration::from_secs(5)).is_some(),
+        "layout not applied"
+    );
+
+    let expect = |ring: &Arc<Vec<AtomicU32>>, want: f32, what: &str| {
+        let mut seen = None;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(30));
+            if let Some(x) = read_ring(ring, &widx, 480, Duration::from_millis(200)) {
+                let m = x.iter().sum::<f32>() / x.len() as f32;
+                seen = Some(m);
+                if (m - want).abs() < 0.02 {
+                    return;
+                }
+            }
+        }
+        panic!("{what}: want mean {want}, last saw {seen:?}");
+    };
+    expect(&ring_l, 0.0, "left bus (pan hard right)");
+    expect(&ring_r, 0.25, "right bus (input x selected-loop vol)");
+
+    // Switching the selection to loop 1 (untouched: vol 1, gain 1, centre)
+    // re-shapes monitoring immediately: both buses at 0.5 x 0.7071 ≈ 0.354.
+    b.engine.set_loop_vol(1, 1.0);
+    b.engine.set_loop_gain(1, 1.0);
+    b.engine.set_loop_pan(1, 0.5);
+    b.cmd(Cmd::SetSelected(1));
+    let want = 0.5f32 * std::f32::consts::FRAC_1_SQRT_2;
+    expect(&ring_l, want, "left bus after selection switch");
+    expect(&ring_r, want, "right bus after selection switch");
+
+    // Silence via volume must silence monitoring too.
+    b.engine.set_loop_vol(1, 0.0);
+    expect(&ring_l, 0.0, "left bus after vol 0");
+    expect(&ring_r, 0.0, "right bus after vol 0");
+
+    b.engine.set_loop_vol(0, 1.0);
+    b.engine.set_loop_pan(0, 0.5);
     b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
     let _ = active;
 }

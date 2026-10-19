@@ -26,12 +26,18 @@ when you quit.
 3. Click the **hamburger ☰** (top-left) → settings panel:
    - **INPUTS** — tick the remote output ports you want to record (your mic /
      instrument chain). Multiple inputs are summed into every loop.
-   - **OUTPUTS** — tick your speakers / monitor mix.
+   - **OUTPUTS** — for each port tick **L**, **R** or both: `L` plays only
+     the left side of the stereo mix, `R` only the right, and both play a
+     mono downmix of the two (the classic behaviour — that's the default
+     for previously saved selections too).
    - **Apply Selection**. Your choice is remembered and re-applied
      automatically on every launch, including when the JACK graph rebuilds.
 4. While selected, inputs are also passed straight through to the outputs
    (× *master gain*), independent of the loop engine — you always hear
-   yourself live.
+   yourself live. Live input **monitoring** rides the *selected* loop's
+   chain: its gain × volume × effect chain × pan shape the pass-through, so
+   you hear exactly what that loop's chain will do to your signal.
+   Recording and overdubs still capture the raw, unprocessed input.
 
 ## The main window
 
@@ -46,10 +52,11 @@ The window is a scrollable stack of **16 track rows**. Each row is one loop
 | **PLAY** | toggle playback of the loop |
 | **CLEAR** | zero the buffer |
 | **IMPORT** | load an audio file into the loop (see [Import & export](#import--export)) |
-| **volume** slider | playback trim: 0 = −∞ … 127 = 0 dB (raw MIDI value shown beside it, live dB centred on the slider) |
-| **gain** slider | input/output gain trim: 80 = 0 dB … 127 = +10 dB |
+| **vol** | playback trim: 0 = −∞ … 127 = 0 dB. The text box shows the level in dB — type a value (e.g. `-6.5`) and press Enter; the number at the right of the slider is the raw MIDI value |
+| **gain** | gain trim: 0 = −∞ … 80 = 0 dB … 127 = +10 dB. Same editable dB box + raw MIDI readout |
+| **pan** | stereo pan: 0 = hard left, **50 = centre**, 100 = hard right (equal power across the L/R output buses). Editable 0–100 text box + raw MIDI readout; bindable to a knob like vol/gain |
 | **FX** | open the effects window for this loop (see [Per-loop effects](#per-loop-effects)) |
-| effect chips | enabled effects appear right of FX, left-to-right in chain order, with live parameter sliders |
+| effect buttons | enabled effects appear right of FX, left-to-right in chain order, as name buttons — clicking one opens that effect's controls window (auto-generated sliders, or the effect's own scripted GUI) |
 
 Above the rows: **UNDO**/**REDO** (last overdub), the **dependent** checkbox
 (loop mode), the metronome bar, the quantizer, and **EXPORT**.
@@ -149,8 +156,16 @@ keyboard/pedalboard to it (PipeWire picks up MIDI hardware automatically).
 blue, *listening…*) → send a **Note On/Off, CC, or Program Change**. The
 first message of the matching kind becomes the binding. Velocity / CC value
 is ignored for trigger actions (pedals and knobs fire anywhere) — the
-per-loop **volume (knob)** / **gain (knob)** bindings are the exception and
-act on the value (0–127: 0 = silence, 127 = max).
+per-loop **volume (knob)** / **gain (knob)** / **pan (knob)** bindings are
+the exception and act on the value (0–127: 0 = silence / hard left,
+127 = max / hard right).
+
+**Knob calibration**: controllers with a limited or backwards travel can be
+learned — start a knob slot's calibration, sweep the physical control to its
+minimum and press **Lock min**, sweep it to the maximum and press **Finish**.
+The control's range is then stretched onto the full 0–127 program range
+(a backwards-wired knob is inverted automatically), so the extremes of your
+hardware mean the extremes in simplooper.
 
 - Click the cell again or press `Esc` to cancel; press `Del` while a cell is
   listening to clear that binding.
@@ -160,8 +175,8 @@ act on the value (0–127: 0 = silence, 127 = max).
 **All bindable actions** (keyboard or MIDI): record / overdub / clear /
 play-stop / import on the *selected* loop, export, select loop 1–16, select
 next/previous (clamped), per-loop record / overdub / clear / play-stop
-(all 16), per-loop volume / gain (knob), dependent toggle, metronome toggle,
-overdub undo / redo.
+(all 16), per-loop volume / gain / pan (knob), dependent toggle, metronome
+toggle, overdub undo / redo.
 
 ## Per-loop effects
 

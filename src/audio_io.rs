@@ -156,6 +156,22 @@ pub fn export(path: &Path, rate: u32, samples: &[f32], fmt: ExportFormat) -> Res
     if samples.is_empty() {
         return Err("nothing to export (no recorded audio)".into());
     }
+    // The format drives the extension: a destination picked without one (or
+    // with a stale one) is corrected here, so every caller writes a file
+    // whose suffix matches its contents and changing the format never means
+    // re-picking the location.
+    let ext = fmt.extension();
+    let ok_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+    let owned;
+    let path = if ok_ext {
+        path
+    } else {
+        owned = path.with_extension(ext);
+        owned.as_path()
+    };
     match fmt {
         ExportFormat::Wav => write_wav(path, rate, samples),
         ExportFormat::Flac => write_flac(path, rate, samples),
@@ -241,5 +257,56 @@ fn encode_with_ffmpeg(
         Err(e) => Err(format!(
             "MP3/OGG export needs ffmpeg on PATH, but it could not be run: {e}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_stem(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("simplooper-export-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn export_wav_writes_readable_file() {
+        // A 440 Hz second of audio; export must create the file (adding the
+        // format's extension to an extension-less destination) and it must
+        // decode back to roughly the same length — this is what the GUI's
+        // Export button ultimately relies on.
+        let sr = 48_000;
+        let samples: Vec<f32> =
+            (0..sr).map(|n| (n as f32 * 0.0914).sin() * 0.5).collect();
+        let path = tmp_stem("wav");
+        export(&path, sr, &samples, ExportFormat::Wav).expect("wav export");
+        let file = path.with_extension("wav");
+        let bytes = std::fs::read(&file).expect("wav file must exist on disk");
+        assert!(bytes.starts_with(b"RIFF"), "must be a RIFF container");
+        let mono = decode_to_mono(&file, sr).expect("exported wav must decode back");
+        assert!((mono.len() as i64 - sr as i64).abs() <= 1, "decoded length {:?}", mono.len());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn export_flac_writes_file() {
+        let sr = 48_000;
+        let samples: Vec<f32> =
+            (0..sr).map(|n| (n as f32 * 0.0914).sin() * 0.5).collect();
+        let path = tmp_stem("flac");
+        export(&path, sr, &samples, ExportFormat::Flac).expect("flac export");
+        let file = path.with_extension("flac");
+        let bytes = std::fs::read(&file).expect("flac file must exist on disk");
+        assert!(bytes.starts_with(b"fLaC"), "must be a FLAC stream");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn export_rejects_empty_audio() {
+        let path = tmp_stem("empty");
+        assert!(export(&path, 48_000, &[], ExportFormat::Wav).is_err());
     }
 }

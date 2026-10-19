@@ -113,8 +113,13 @@ impl Biquad {
                 (a + 1.0) - (a - 1.0) * cw - 2.0 * sab * alpha_s,
             ),
             3 => (
+                // RBJ peaking: the DENOMINATOR must use alpha/A, not
+                // alpha*A. With A in both halves b(z) == a(z)-flipped,
+                // i.e. a flat all-pass whose poles sit OUTSIDE the unit
+                // circle for any real gain — the filter did nothing
+                // except blow up (the "everything is 0 or peaking" bug).
                 1.0 + alpha * a, -2.0 * cw, 1.0 - alpha * a,
-                1.0 - alpha * a, -2.0 * cw, 1.0 + alpha * a,
+                1.0 - alpha / a, -2.0 * cw, 1.0 + alpha / a,
             ),
             4 => ((1.0 - cw) / 2.0, 1.0 - cw, (1.0 - cw) / 2.0, 1.0 + alpha, -2.0 * cw, 1.0 - alpha),
             5 => ((1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0, 1.0 + alpha, -2.0 * cw, 1.0 - alpha),
@@ -203,10 +208,11 @@ impl ParametricEq {
     fn new(sample_rate: f64) -> Self {
         let sr = if sample_rate.is_finite() && sample_rate > 1.0 { sample_rate } else { 48000.0 };
         let an_release = (-(1.0 / (sr * 0.08))).exp(); // ~80 ms peak decay
-        // Analyser: constant-Q band passes log-spaced 30 Hz … 18 kHz.
+        // Analyser: constant-Q band passes log-spaced 20 Hz … 20 kHz
+        // (the full human range, matching the graph's F_LO..F_HI axis).
         let mut an: [AnBand; NANALY] = core::array::from_fn(|_| AnBand { bq: Biquad::new(), env: 0.0 });
         for (i, a) in an.iter_mut().enumerate() {
-            let f = 30.0f32 * 600.0f32.powf(i as f32 / (NANALY - 1) as f32);
+            let f = 20.0f32 * (20000.0f32 / 20.0f32).powf(i as f32 / (NANALY - 1) as f32);
             a.bq.cache_valid = false;
             a.bq.set_params(T_BANDPASS, f, 0.0, 2.2, sr);
             a.bq.b0 = a.bq.tb0; a.bq.b1 = a.bq.tb1; a.bq.b2 = a.bq.tb2;
@@ -418,41 +424,64 @@ extern "C" fn gui_draw(
             }
             db += 6.0;
         }
-        // vertical frequency grid: minor ×2..×9 per decade, major + label at
-        // 100 / 1k / 10k.
-        let mut decade = 100.0f32;
-        while decade <= 10000.0 {
-            let xm = gx + f2x(decade, gw);
+        // Vertical frequency grid: minor ×2..×9 per decade, majors with
+        // labels at 20, 50, 100, 200, 500, 1k, 2k, 5k, 10k, 20k — the full
+        // human range on both edges of the axis.
+        const MAJORS: [f32; 10] = [20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0];
+        for f in MAJORS {
+            let xm = (gx + f2x(f, gw)).min(gx + gw);
             (api.line)(c, xm, gy, xm, gy + gph, 1.0, 0.27, 0.29, 0.34, 1.0);
-            let lab = if decade >= 1000.0 { format!("{}k", decade / 1000.0) } else { format!("{}", decade as i32) };
+            let lab = if f >= 1000.0 { format!("{}k", f / 1000.0) } else { format!("{}", f as i32) };
             let s = std::ffi::CString::new(lab).unwrap();
-            (api.text)(c, xm, gy + gph + 9.0, 9.0, 1, 0.55, 0.55, 0.6, 1.0, s.as_ptr());
+            // Keep the edge labels inside the graph.
+            let tx = (xm - 6.0).max(gx + 1.0).min(gx + gw - 18.0);
+            (api.text)(c, tx, gy + gph + 9.0, 9.0, 1, 0.55, 0.55, 0.6, 1.0, s.as_ptr());
+        }
+        let mut decade = 10.0f32;
+        while decade <= 100000.0 {
             let mut k = 2.0f32;
             while k <= 9.0 {
                 let f = decade * k;
-                if f <= F_HI * 1.9 {
+                if f > F_LO && f < F_HI {
                     let x = gx + f2x(f, gw);
                     (api.line)(c, x, gy, x, gy + gph, 1.0, 0.18, 0.20, 0.24, 1.0);
                 }
                 k += 1.0;
             }
-            decade *= 100.0;
+            decade *= 10.0;
         }
     }
 
-    // ---- live spectrum -----------------------------------------------------
+    // ---- live spectrum (vertical bars, loud = tall) ------------------------
+    // One bar per analyser band spanning its slice of the x axis, drawn from
+    // the bottom up on a 0 dBFS .. −90 dB scale (top of the graph = 0 dBFS).
     if gs.show_spec && !state.is_null() {
         let st = unsafe { &*(state as *mut ParametricEq) };
-        let mut pts: Vec<f32> = Vec::with_capacity(NANALY * 2);
-        for (i, lev) in st.levels.iter().enumerate() {
-            let lin = f32::from_bits(lev.load(Relaxed)) as f64;
+        let freq = |i: usize| F_LO * (F_HI / F_LO).powf(i as f32 / (NANALY - 1) as f32);
+        for i in 0..NANALY {
+            let lin = f32::from_bits(st.levels[i].load(Relaxed)) as f64;
             let db = 20.0 * lin.max(1e-7).log10(); // −∞..0 dBFS-ish
-            let f = 30.0f32 * (18000.0f32 / 30.0).powf(i as f32 / (NANALY - 1) as f32);
-            let up = ((-db).clamp(0.0, 90.0) / 90.0) as f32; // 0 dB → top
-            pts.push(gx + f2x(f, gw));
-            pts.push(gy + gph - up * gph);
+            let up = ((-db).clamp(0.0, 90.0) / 90.0) as f32;
+            if up <= 0.004 {
+                continue;
+            }
+            // Bar spans from the midpoint to the previous band to the
+            // midpoint to the next band (edge bands clamp to the graph).
+            let f_lo = if i == 0 { F_LO } else { (freq(i - 1) * freq(i)).sqrt() };
+            let f_hi = if i + 1 == NANALY { F_HI } else { (freq(i) * freq(i + 1)).sqrt() };
+            let x0 = gx + f2x(f_lo, gw);
+            let x1 = gx + f2x(f_hi, gw);
+            let h = up * gph;
+            unsafe {
+                (api.rect_filled)(c, x0 + 0.5, gy + gph - h, (x1 - x0 - 1.0).max(1.0), h, 0.30, 0.85, 0.55, 0.55);
+            }
         }
-        unsafe { (api.polyline)(c, pts.as_ptr(), pts.len() as u32 / 2, 0, 1.2, 0.30, 0.85, 0.55, 0.65) };
+        // Right-hand scale ticks for the analyser's own dB axis.
+        for (dbf, lab) in [(0.0f32, "0"), (-45.0, "-45"), (-90.0, "-90")] {
+            let y = gy + gph - ((-dbf) / 90.0) * gph;
+            let s = std::ffi::CString::new(lab.to_string()).unwrap();
+            unsafe { (api.text)(c, gx + gw - 16.0, y, 8.0, 1, 0.30, 0.85, 0.55, 0.8, s.as_ptr()) };
+        }
     }
 
     // ---- response curve (cascade of the six biquads at current params) ----

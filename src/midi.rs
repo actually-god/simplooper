@@ -246,6 +246,29 @@ impl MidiBind {
     }
 }
 
+/// Rescale a raw controller value from a learned axis range onto 0..=127.
+///
+/// `lo`/`hi` are the raw values captured at the control's minimum and
+/// maximum positions. A full-range knob (`0`, `127`) is the identity; a
+/// knob that only ever sends, say, 9..=110 is stretched so 9 still means
+/// "fully off" and 110 "fully on". A control wired backwards (min sends the
+/// HIGHER number) scales inverted, which is exactly right — the axis still
+/// reads low→high as the user moves the control.
+pub fn scale_axis(raw: u8, lo: u8, hi: u8) -> u8 {
+    if lo == hi {
+        // Degenerate calibration (min == max): no usable span. Treat the
+        // raw value as already being in program space.
+        return raw;
+    }
+    let (lo, hi) = (i32::from(lo), i32::from(hi));
+    let span = hi - lo; // negative when the axis is wired inverted
+    let num = (i32::from(raw) - lo) * 127;
+    // Integer round-to-nearest; works for either sign of span because
+    // truncating division rounds toward zero.
+    let q = (num + span / 2) / span;
+    q.clamp(0, 127) as u8
+}
+
 /// A bindable *action* a MIDI trigger can fire. Mirrors the keyboard
 /// shortcuts (selected-track actions) plus direct per-loop actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -287,6 +310,10 @@ pub enum MidiAction {
     /// Set loop `i`'s gain trim from a continuous controller (0 = -inf dB,
     /// 80 = 0 dB, 127 = +10 dB). Value semantics as [`MidiAction::VolLoop`].
     GainLoop(usize),
+    /// Set loop `i`'s stereo pan from a continuous controller (0 = hard
+    /// left, 64 = centre, 127 = hard right; equal-power law). Value
+    /// semantics as [`MidiAction::VolLoop`].
+    PanLoop(usize),
 }
 
 impl MidiAction {
@@ -296,7 +323,7 @@ impl MidiAction {
     /// loops (the settings panel shows these through a loop dropdown), then
     /// dependent mode, metronome, and next/previous selection. New actions
     /// must be APPENDED (the persisted `shortcuts` vector is positional).
-    pub const ALL: [MidiAction; 124] = [
+    pub const ALL: [MidiAction; 140] = [
         MidiAction::RecSelected,
         MidiAction::OdSelected,
         MidiAction::ClearSelected,
@@ -426,6 +453,24 @@ impl MidiAction {
         MidiAction::GainLoop(14),
         MidiAction::VolLoop(15),
         MidiAction::GainLoop(15),
+        // APPENDED 2026-10: per-loop pan, appended as a block so the
+        // existing vol/gain slot indices never move.
+        MidiAction::PanLoop(0),
+        MidiAction::PanLoop(1),
+        MidiAction::PanLoop(2),
+        MidiAction::PanLoop(3),
+        MidiAction::PanLoop(4),
+        MidiAction::PanLoop(5),
+        MidiAction::PanLoop(6),
+        MidiAction::PanLoop(7),
+        MidiAction::PanLoop(8),
+        MidiAction::PanLoop(9),
+        MidiAction::PanLoop(10),
+        MidiAction::PanLoop(11),
+        MidiAction::PanLoop(12),
+        MidiAction::PanLoop(13),
+        MidiAction::PanLoop(14),
+        MidiAction::PanLoop(15),
     ];
 
     /// Position of `a` in [`MidiAction::ALL`] (binding-table index).
@@ -455,6 +500,7 @@ impl MidiAction {
             MidiAction::RedoOverdub => "redo overdub".into(),
             MidiAction::VolLoop(i) => format!("loop {}: volume (knob)", i + 1),
             MidiAction::GainLoop(i) => format!("loop {}: gain (knob)", i + 1),
+            MidiAction::PanLoop(i) => format!("loop {}: pan (knob)", i + 1),
         }
     }
 
@@ -462,7 +508,7 @@ impl MidiAction {
     /// the message's second data byte and keyboard bindings can never fire
     /// them (a key press carries no value).
     pub fn is_continuous(self) -> bool {
-        matches!(self, MidiAction::VolLoop(_) | MidiAction::GainLoop(_))
+        matches!(self, MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_))
     }
 }
 
@@ -527,6 +573,37 @@ mod tests {
         assert_eq!(note_name(60), "C4");
         assert_eq!(note_name(0), "C-1");
         assert_eq!(note_name(127), "G9");
+    }
+
+    #[test]
+    fn scale_axis_full_range_is_identity() {
+        for v in 0..=127u8 {
+            assert_eq!(scale_axis(v, 0, 127), v);
+        }
+    }
+
+    #[test]
+    fn scale_axis_stretches_partial_travel() {
+        // A slider wired 9..=110 still spans the program's whole range.
+        assert_eq!(scale_axis(9, 9, 110), 0);
+        assert_eq!(scale_axis(110, 9, 110), 127);
+        let mid = scale_axis(60, 9, 110);
+        assert!((mid as i16 - 64).abs() <= 1, "midpoint got {mid}");
+        // Out-of-travel values clamp, they never wrap or go negative.
+        assert_eq!(scale_axis(0, 9, 110), 0);
+        assert_eq!(scale_axis(127, 9, 110), 127);
+    }
+
+    #[test]
+    fn scale_axis_handles_inverted_wiring() {
+        // Min position sending the HIGHER number just inverts the axis.
+        assert_eq!(scale_axis(110, 110, 9), 0);
+        assert_eq!(scale_axis(9, 110, 9), 127);
+    }
+
+    #[test]
+    fn scale_axis_degenerate_passthrough() {
+        assert_eq!(scale_axis(64, 42, 42), 64);
     }
 
     #[test]

@@ -18,6 +18,16 @@ pub struct MidiBinding {
     pub bind: Option<MidiBind>,
 }
 
+/// Axis calibration for one continuous (knob/slider) binding slot: the raw
+/// controller values captured when the user swept the control to its minimum
+/// and maximum. Values between are scaled onto the program's 0..=127 space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiAxisCal {
+    pub slot: u16,
+    pub lo: u8,
+    pub hi: u8,
+}
+
 /// One enabled effect in a loop's saved chain (script stem + slider values,
 /// in chain order). The stem is the key: dropping scripts is always safe.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +46,10 @@ pub struct Config {
     /// MIDI bindings (only bound actions are stored).
     #[serde(default)]
     pub midi: Vec<MidiBinding>,
+    /// Axis calibrations for continuous bindings (knob min/max sweep).
+    /// Slots without an entry use the controller's full 0..=127 travel.
+    #[serde(default)]
+    pub midi_axis: Vec<MidiAxisCal>,
     /// Dependent-mode ensemble length in units of the longest loop (>= 1).
     #[serde(default = "default_root_loops")]
     pub root_loops: u32,
@@ -45,6 +59,11 @@ pub struct Config {
     pub ports_in: Vec<String>,
     #[serde(default)]
     pub ports_out: Vec<String>,
+    /// Stereo routing for `ports_out` (same order): bit 0 = left bus,
+    /// bit 1 = right bus (3 = mono downmix). Missing/short vectors fall
+    /// back to 3 — pre-stereo configs keep their exact mono behaviour.
+    #[serde(default)]
+    pub ports_out_lr: Vec<u8>,
     /// GUI zoom factor (egui `zoom_factor`): 1.0 = default UI size, >1 larger.
     #[serde(default = "default_gui_scale")]
     pub gui_scale: f32,
@@ -62,6 +81,10 @@ pub struct Config {
     /// 127 = +10 dB). Missing entries fall back to 80 (unity).
     #[serde(default)]
     pub trk_gain: Vec<u8>,
+    /// Per-loop stereo pan, MIDI-knob style (0..=127; 0 = hard left,
+    /// 64 = centre, 127 = hard right). Missing entries fall back to 64.
+    #[serde(default)]
+    pub trk_pan: Vec<u8>,
     /// Metronome tempo in BPM.
     #[serde(default = "default_metro_bpm")]
     pub metro_bpm: u32,
@@ -90,15 +113,18 @@ impl Default for Config {
         Config {
             shortcuts: Vec::new(),
             midi: Vec::new(),
+            midi_axis: Vec::new(),
             // Must match serde's field default — the derived `Default` would
             // give 0, which the UI clamps but is not a valid ensemble length.
             root_loops: default_root_loops(),
             ports_in: Vec::new(),
             ports_out: Vec::new(),
+            ports_out_lr: Vec::new(),
             gui_scale: default_gui_scale(),
             latency_ms: 0.0,
             trk_vol: Vec::new(),
             trk_gain: Vec::new(),
+            trk_pan: Vec::new(),
             metro_bpm: default_metro_bpm(),
             metro_sub: default_metro_sub(),
             metro_num: default_metro_num(),
@@ -182,9 +208,11 @@ mod tests {
                 action: MidiAction::RecLoop(0),
                 bind: Some(MidiBind { ty: 0, ch: 1, d1: 60 }),
             }],
+            midi_axis: Vec::new(),
             root_loops: 3,
             ports_in: vec!["remote:out_1".into()],
             ports_out: vec!["remote:in_1".into(), "remote:in_2".into()],
+            ports_out_lr: vec![1, 2],
             gui_scale: 1.25,
             latency_ms: 12.5,
             metro_bpm: 96,
@@ -193,6 +221,7 @@ mod tests {
             q_metro: true,
             trk_vol: vec![127, 100],
             trk_gain: vec![80, 60],
+            trk_pan: vec![64, 20],
             fx_dir: "/tmp/effects".into(),
             track_fx: vec![vec![TrackFxSave { stem: "template".into(), params: vec![0.5, 4.0] }]],
         };
@@ -209,8 +238,10 @@ mod tests {
         assert!(back.q_metro);
         assert_eq!(back.ports_in, cfg.ports_in);
         assert_eq!(back.ports_out, cfg.ports_out);
+        assert_eq!(back.ports_out_lr, cfg.ports_out_lr);
         assert_eq!(back.trk_vol, cfg.trk_vol);
         assert_eq!(back.trk_gain, cfg.trk_gain);
+        assert_eq!(back.trk_pan, cfg.trk_pan);
         assert_eq!(back.fx_dir, "/tmp/effects");
         assert_eq!(back.track_fx[0][0].stem, "template");
         assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);
@@ -232,5 +263,7 @@ mod tests {
         // and App::new falls them back to 127 (vol) / 80 (gain).
         assert!(back.trk_vol.is_empty());
         assert!(back.trk_gain.is_empty());
+        assert!(back.trk_pan.is_empty());
+        assert!(back.ports_out_lr.is_empty());
     }
 }

@@ -260,11 +260,14 @@ impl Instance {
                 .copied()
                 .or(d.map(|p| p.default))
                 .unwrap_or(0.0);
+            // Clamp to the DECLARED range, never at 0: bipolar params
+            // (EQ band gain -24..+24 dB) must survive loading a saved
+            // negative value — the same trap `set_param` already fixed.
             let v = match d {
                 Some(p) => v.clamp(p.min, p.max),
                 None => v,
             };
-            AtomicU32::new(v.clamp(0.0, f32::MAX).to_bits())
+            AtomicU32::new(v.to_bits())
         });
         Some(Arc::new(Self {
             fns,
@@ -303,9 +306,15 @@ impl Instance {
     }
 
     /// Ride one slider (GUI thread; audio picks it up next block).
+    /// Values keep their sign — many params are bipolar (EQ band gain runs
+    /// -24..+24 dB) — only non-finite writes are ignored. Range clamping is
+    /// the caller's job (fxgui clamps by the declared param bounds).
     pub fn set_param(&self, k: usize, v: f32) {
         if let Some(p) = self.params.get(k) {
-            p.store(v.clamp(0.0, f32::MAX).to_bits(), Ordering::Relaxed);
+            if !v.is_finite() {
+                return;
+            }
+            p.store(v.to_bits(), Ordering::Relaxed);
             self.param_gen.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -885,6 +894,63 @@ mod tests {
         assert!(reg.gui("parametric_eq").is_some(), "EQ must expose a child GUI");
         assert!(reg.gui("space_echo").is_some(), "space echo must expose a child GUI");
         assert!(reg.gui("template").is_none(), "template keeps the auto slider window");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bipolar_params_survive_loading() {
+        // Band gain on the EQ is bipolar (-24..+24 dB). Both the initial
+        // seed (loading a saved chain) and live slider moves must keep
+        // negative values — a `clamp(0, ..)` here made the EQ "do nothing"
+        // for cuts, the original user complaint.
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("bipolar");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let inst = reg
+            .create_instance("parametric_eq", 48000.0, &[1.0, 1000.0, -12.0, 1.0])
+            .expect("eq instance");
+        assert_eq!(inst.param(2), -12.0, "saved -12 dB gain must load");
+        inst.set_param(2, -6.5);
+        assert_eq!(inst.param(2), -6.5, "live set must keep the sign");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn space_echo_holds_a_wet_tail() {
+        // After a single impulse, a wet echo must keep producing decaying
+        // output for at least one delay time — proof the effect state and
+        // feedback run at the instance level (what the serial chain feeds
+        // through to whatever slot comes next).
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("echotail");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        // time .25 s, fb .5, tone 8 k, wobble 0, rate 0, decay .5, damp 8 k, wet 1, out 1
+        let inst = reg
+            .create_instance(
+                "space_echo",
+                48000.0,
+                &[0.25, 0.5, 8000.0, 0.0, 0.05, 0.5, 8000.0, 1.0, 1.0],
+            )
+            .expect("echo instance");
+        let _ = inst.process_private(1.0);
+        // Energy strictly after the impulse: the tail. Windows are wide
+        // enough to bracket wherever the first tap lands (the delay line
+        // reserves headroom beyond `time`).
+        let win: Vec<f32> = (0..8)
+            .map(|_| (0..4800).map(|_| inst.process_private(0.0).abs()).sum())
+            .collect();
+        let total: f32 = win.iter().sum();
+        assert!(total > 1e-3, "wet echo produced no tail (sum {total})");
+        let peak = win.iter().cloned().fold(0.0f32, f32::max);
+        assert!(win[7] < peak, "tail must decay: {win:?}");
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
