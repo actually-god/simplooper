@@ -92,7 +92,9 @@ concurrent e2e runs starve each other's JACK clients ("ensemble stalled").
    checkbox is the INDEPENDENT switch — ticked = independent, the engine
    `dependent` flag keeps its old meaning; keybinds are gated globally on
    egui's `text_edit_focused()`, not per-widget flags; EQ graph vertical axis
-   is log-scaled, −∞ bottom / +6 dB top, gains clamp −24..+6). Code aligns
+   is log-scaled, −∞ bottom / +6 dB top, gains clamp −120..+6 (−120 dB =
+   effective −∞: within 0.3 % of the bottom edge; handle centres clamp by
+   half the 8 px node so the body never leaves the window). Code aligns
    to them; changing behavior means deliberately updating tests + docs.
 4. **Audio server**: keep `NO_START`; never auto-spawn jackd or bypass JACK.
 5. **Packaging**: the AUR `PKGBUILD` (separate repo) fetches the GitHub

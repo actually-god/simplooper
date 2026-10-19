@@ -196,7 +196,8 @@ are compiled with `rustc --edition 2021 --crate-type cdylib` — so **rustc
 must be installed** to use custom effects; a missing compiler just lists
 scripts with a hint. Working examples in the repo: `effects/parametric_eq.rs`
 (6-band EQ with response curve + 240-band live spectrum, draggable band
-handles on a logarithmic dB axis (−∞ at the bottom edge, +6 dB ceiling),
+handles on a logarithmic dB axis (−∞ at the bottom edge reachable by drag,
++6 dB ceiling),
 B1 lowpass / B6 highpass quick toggles, and its own window) and
 `effects/space_echo.rs` (**Echo + Reverb**: animated echo window, independent
 echo/reverb levels, a **tone** knob voicing the whole wet path, factory
