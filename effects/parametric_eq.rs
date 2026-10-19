@@ -9,7 +9,9 @@
 // one shine is the OPTIONAL child GUI (`simplooper_effect_gui` below):
 //
 //   * the live |H(f)| response curve of the whole band cascade,
-//   * a 24-band live spectrum of the incoming audio behind the curve,
+//   * a 240-band live spectrum of the incoming audio behind the curve
+//     (vertical bars growing UP from the bottom: silence = no bar,
+//     0 dBFS = full height, on a 0 … −90 dB scale),
 //   * draggable band handles, per-band controls, hover frequency readout.
 //
 // The GUI lives in this same script and talks to audio through two things
@@ -56,10 +58,10 @@ const BAND_DEFS: [[f32; 4]; NBANDS] = [
     [T_HISHELF, 11000.0, 0.0, 0.71],
 ];
 
-/// The spectrum analyser: 24 log-spaced constant-Q band passes with peak
+/// The spectrum analyser: 240 log-spaced constant-Q band passes with peak
 /// followers, published as atomic linear levels the GUI samples. Runs on
 /// the audio thread ONLY while the editor window is open.
-const NANALY: usize = 24;
+const NANALY: usize = 240;
 
 // ---------------------------------------------------------------------------
 // Biquad (RBJ Audio-EQ-Cookbook), Direct Form II transposed, f64 state.
@@ -93,8 +95,12 @@ impl Biquad {
         let alpha = sw / (2.0 * q);
         let a = (10.0_f64).powf(gain / 40.0); // peaking/shelf amplitude
         let sab = a.sqrt();
-        // shelf slope in Q form (cookbook's S↔Q note): α = sin·√((A+1/A)(1/Q−1)+2)
-        let alpha_s = sw * ((a + 1.0 / a) * (1.0 / q - 1.0) + 2.0).max(0.0).sqrt();
+        // Shelf slope: the plain-Q alpha (same alpha as every other type).
+        // The cookbook's shelf-SLOPE form alpha = sin·√((A+1/A)(1/S−1)+2)
+        // goes imaginary for S > ~2 at high gain — clamped to 0 it parked
+        // the shelf poles EXACTLY on the unit circle (perpetual ringing).
+        // sin/(2Q) is stable for every Q in the slider range.
+        let alpha_s = alpha;
         let (b0, b1, b2, a0, a1, a2) = match typ {
             1 => (
                 a * ((a + 1.0) - (a - 1.0) * cw + 2.0 * sab * alpha_s),
@@ -113,13 +119,15 @@ impl Biquad {
                 (a + 1.0) - (a - 1.0) * cw - 2.0 * sab * alpha_s,
             ),
             3 => (
-                // RBJ peaking: the DENOMINATOR must use alpha/A, not
-                // alpha*A. With A in both halves b(z) == a(z)-flipped,
-                // i.e. a flat all-pass whose poles sit OUTSIDE the unit
-                // circle for any real gain — the filter did nothing
-                // except blow up (the "everything is 0 or peaking" bug).
+                // RBJ peaking: b = (1 + αA, −2cos, 1 − αA),
+                //          a = (1 + α/A, −2cos, 1 − α/A) — the SAME
+                // (1 ± α/A) shape as the other types' denominators.
+                // Swapping the signs to (1 − α/A … 1 + α/A) puts the poles
+                // at radius √((1+α/A)/(1−α/A)) > 1: the band self-oscillates
+                // to ±inf for ANY nonzero alpha — even at 0 dB gain — which
+                // is what made the whole EQ peg the output at inf.
                 1.0 + alpha * a, -2.0 * cw, 1.0 - alpha * a,
-                1.0 - alpha / a, -2.0 * cw, 1.0 + alpha / a,
+                1.0 + alpha / a, -2.0 * cw, 1.0 - alpha / a,
             ),
             4 => ((1.0 - cw) / 2.0, 1.0 - cw, (1.0 - cw) / 2.0, 1.0 + alpha, -2.0 * cw, 1.0 - alpha),
             5 => ((1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0, 1.0 + alpha, -2.0 * cw, 1.0 - alpha),
@@ -452,16 +460,19 @@ extern "C" fn gui_draw(
         }
     }
 
-    // ---- live spectrum (vertical bars, loud = tall) ------------------------
-    // One bar per analyser band spanning its slice of the x axis, drawn from
-    // the bottom up on a 0 dBFS .. −90 dB scale (top of the graph = 0 dBFS).
+    // ---- live spectrum (vertical bars, bottom-up, loud = tall) -----------
+    // One bar per analyser band spanning its slice of the x axis. Bars grow
+    // UP from the bottom on a 0 dBFS .. −90 dB scale: silence = NO bar,
+    // 0 dBFS = full height (top of the graph). The old mapping inverted this
+    // (silence painted a full-height bar and signal "subtracted" from it).
     if gs.show_spec && !state.is_null() {
         let st = unsafe { &*(state as *mut ParametricEq) };
         let freq = |i: usize| F_LO * (F_HI / F_LO).powf(i as f32 / (NANALY - 1) as f32);
         for i in 0..NANALY {
             let lin = f32::from_bits(st.levels[i].load(Relaxed)) as f64;
             let db = 20.0 * lin.max(1e-7).log10(); // −∞..0 dBFS-ish
-            let up = ((-db).clamp(0.0, 90.0) / 90.0) as f32;
+            // −90 dB -> 0 (no bar), 0 dB -> 1 (full height).
+            let up = ((db + 90.0) / 90.0).clamp(0.0, 1.0) as f32;
             if up <= 0.004 {
                 continue;
             }
@@ -476,11 +487,12 @@ extern "C" fn gui_draw(
                 (api.rect_filled)(c, x0 + 0.5, gy + gph - h, (x1 - x0 - 1.0).max(1.0), h, 0.30, 0.85, 0.55, 0.55);
             }
         }
-        // Right-hand scale ticks for the analyser's own dB axis.
+        // Right-hand scale ticks for the analyser's own dB axis (0 dBFS at
+        // the TOP — full-height bars reach it — down to −90 at the bottom).
         for (dbf, lab) in [(0.0f32, "0"), (-45.0, "-45"), (-90.0, "-90")] {
-            let y = gy + gph - ((-dbf) / 90.0) * gph;
+            let y = gy + ((-dbf) / 90.0) * gph;
             let s = std::ffi::CString::new(lab.to_string()).unwrap();
-            unsafe { (api.text)(c, gx + gw - 16.0, y, 8.0, 1, 0.30, 0.85, 0.55, 0.8, s.as_ptr()) };
+            unsafe { (api.text)(c, gx + gw - 16.0, (y - 4.0).max(gy + 1.0), 8.0, 1, 0.30, 0.85, 0.55, 0.8, s.as_ptr()) };
         }
     }
 

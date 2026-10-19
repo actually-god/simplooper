@@ -262,18 +262,27 @@ pub fn db_str(amp: f32) -> String {
     }
 }
 
-/// MIDI value that centres the per-loop pan slider (the 0..=100 text
-/// shows 50 there; pan is an equal-power split between the L / R buses).
+/// MIDI value that centres the per-loop pan slider (the -100..=100 text
+/// shows 0 there; pan is an equal-power split between the L / R buses).
 pub const PAN_CENTRE_MIDI: u8 = 64;
 
-/// Pan MIDI value (0..=127) -> the 0..=100 position shown in the text box.
-pub fn pan_text(m: u8) -> u32 {
+/// Pan MIDI value (0..=127) -> the -100..=100 position shown in the text
+/// box: -100 = hard left, 0 = centre, +100 = hard right. (The old scale was
+/// 0..=100 with 50 centre; this is that position doubled and shifted, so
+/// every old position maps 1:1 — 0 -> -100, 50 -> 0, 100 -> 100.)
+pub fn pan_text(m: u8) -> i32 {
+    (pan_text_old(m) as i32) * 2 - 100
+}
+
+/// The legacy 0..=100 position (50 = centre), kept as the intermediate so
+/// centre lands exactly on 0 for the MIDI centre value.
+fn pan_text_old(m: u8) -> u32 {
     (m as f32 * 100.0 / 127.0).round() as u32
 }
 
-/// 0..=100 text position -> pan MIDI value (0..=127).
+/// -100..=100 text position -> pan MIDI value (0..=127).
 pub fn pan_midi(t: f32) -> u8 {
-    (t.clamp(0.0, 100.0) * 127.0 / 100.0).round() as u8
+    (((t.clamp(-100.0, 100.0) + 100.0) * 0.5) * 127.0 / 100.0).round() as u8
 }
 
 /// Engine pan position [0, 1] for a MIDI value (hard right at 127).
@@ -1118,12 +1127,23 @@ impl App {
                             // number). Every later message must come from the
                             // same control, else it is rejected with a hint —
                             // min and max must be the same axis.
+                            //
+                            // The raw VALUE shown/learned is the message's
+                            // data byte (CC value / note velocity) — NOT
+                            // MidiBind.d1, which is the CC/NOTE NUMBER (the
+                            // axis identity, constant across a sweep; using
+                            // it froze both numbers at the first message).
+                            let cval = match &msg {
+                                MidiMsg::ControlChange { value, .. } => Some(*value),
+                                MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => Some(*velocity),
+                                _ => None,
+                            };
                             if !kl.has_axis {
                                 kl.bind = bind;
                                 kl.has_axis = true;
-                                kl.lo = bind.d1;
+                                kl.lo = cval.unwrap_or(kl.lo);
                                 self.status = format!(
-                                    "knob {} bound — now move it to MINIMUM, then Lock min",
+                                    "knob {} bound — sweep it to MINIMUM (the number follows every message), then Lock min",
                                     bind.label()
                                 );
                             } else if bind.ty != kl.bind.ty
@@ -1136,10 +1156,15 @@ impl App {
                                     bind.label(),
                                     kl.bind.label()
                                 );
-                            } else if !kl.locked {
-                                kl.lo = bind.d1;
-                            } else {
-                                kl.hi = bind.d1;
+                            } else if let Some(v) = cval {
+                                // Constant listeners: the number tracks the
+                                // MOST RECENT message from this control until
+                                // Lock min / Finish freezes it.
+                                if !kl.locked {
+                                    kl.lo = v;
+                                } else {
+                                    kl.hi = v;
+                                }
                             }
                         } else {
                             // Value for continuous (knob) bindings: the CC
@@ -1640,8 +1665,8 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                 ui.label(
                     RichText::new(
                         "Min and max must come from the SAME control on the SAME MIDI \
-                         channel (e.g. CC 0 ch01 then CC 127 ch01) — move only that one \
-                         control while learning.",
+                         channel (move one physical knob all the way left, then all the \
+                         way right) — the number below follows every message it sends.",
                     )
                     .weak()
                     .small(),
@@ -1680,8 +1705,8 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                     } else {
                         ui.label(
                             RichText::new(
-                                "2. Keep moving the knob while watching the number above, \
-                                 then press Lock min at the lowest value it sends.",
+                                "2. The number above follows every message the control sends — \
+                                 keep sweeping it, then press Lock min at its lowest position.",
                             )
                             .weak()
                             .small(),
@@ -2016,17 +2041,17 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                     ui.add_enabled_ui(desc.is_some(), |ui| {
                         ui.label(txt).on_hover_text(hover);
                         if e.enabled {
-                            if ui.button("▲").on_hover_text("Move earlier in the chain").clicked() {
+                            if arrow_button(ui, true).clicked() {
                                 act = Some((1, k));
                             }
-                            if ui.button("▼").on_hover_text("Move later in the chain").clicked() {
+                            if arrow_button(ui, false).clicked() {
                                 act = Some((2, k));
                             }
                         }
                     });
                     if let Some(t) = &err {
                         let short: String = t.chars().take(72).collect();
-                        ui.label(RichText::new(format!("✗ {short}")).color(Color32::from_rgb(220, 120, 120)).small());
+                        ui.label(RichText::new(format!("× {short}")).color(Color32::from_rgb(220, 120, 120)).small());
                     }
                 });
             }
@@ -2043,7 +2068,7 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                     let t = it.error.clone().unwrap_or_else(|| "invalid".into());
                     let short: String = t.chars().take(140).collect();
                     ui.label(
-                        RichText::new(format!("✗ {}", short.replace('\n', " · ")))
+                        RichText::new(format!("× {}", short.replace('\n', " · ")))
                             .color(Color32::from_rgb(220, 120, 120))
                             .small(),
                     )
@@ -2076,6 +2101,36 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
             );
         });
     app.fx_window = if open { Some(loop_i) } else { None };
+}
+
+/// Small ↑/↓ reorder button with a DRAWN arrow. egui's default font stack
+/// (Ubuntu-Light/NotoEmoji/emoji-icon-font) has no arrow or triangle glyphs
+/// at all — "▲"/"▼" (and even "↑"/"↓") render as hollow tofu boxes — so the
+/// icon is vector-painted into the button rect instead.
+fn arrow_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
+    let resp = ui
+        .add(egui::Button::new(" ").min_size(egui::vec2(20.0, 16.0)))
+        .on_hover_text(if up {
+            "Move earlier in the chain"
+        } else {
+            "Move later in the chain"
+        });
+    let c = resp.rect.center();
+    let col = if resp.hovered() {
+        ui.visuals().widgets.active.fg_stroke.color
+    } else {
+        ui.visuals().widgets.noninteractive.fg_stroke.color
+    };
+    let s = egui::Stroke::new(1.4, col);
+    let p = ui.painter();
+    // shaft
+    p.line_segment([egui::pos2(c.x, c.y - 4.0), egui::pos2(c.x, c.y + 4.5)], s);
+    // head (tip up or down)
+    let tip = if up { c.y - 4.5 } else { c.y + 4.5 };
+    let jaw = if up { tip + 3.5 } else { tip - 3.5 };
+    p.line_segment([egui::pos2(c.x, tip), egui::pos2(c.x - 3.5, jaw)], s);
+    p.line_segment([egui::pos2(c.x, tip), egui::pos2(c.x + 3.5, jaw)], s);
+    resp
 }
 
 fn central_panels(ui: &mut egui::Ui, app: &mut App) {
@@ -2430,7 +2485,7 @@ fn track_row_inner(ui: &mut egui::Ui, app: &mut App, i: usize, dep_period: Optio
         }
 
         let r_imp = ui
-            .add(egui::Button::new(RichText::new("⇩ IMP").monospace()))
+            .add(egui::Button::new(RichText::new("IMP").monospace()))
             .on_hover_text("Import a recording into this loop (I).");
         if r_imp.clicked() {
             app.import_loop(i);
@@ -2475,7 +2530,7 @@ const KIND_PAN: u8 = 2;
 /// One stacked level row: `label | editable value box (centred) | slider |
 /// raw MIDI readout`. The slider always runs the raw MIDI range 0..=127
 /// (what a bound knob sends); the text box shows the human value — dB for
-/// volume and gain, 0..=100 for pan (50 = centre) — and is typed into
+/// volume and gain, -100..=100 for pan (0 = centre) — and is typed into
 /// directly, committed with Enter. Text hugs its slider with no filler
 /// padding; every row's slider starts at the same x, so the three line up.
 fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
@@ -2488,7 +2543,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
     let hover = match kind {
         KIND_VOL => "Loop playback volume: 0 = silence (-inf dB), 127 = 0 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
         KIND_GAIN => "Loop gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
-        _ => "Loop pan: 0 = hard left, 50 = centre, 100 = hard right (equal power across the L/R outputs). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
+        _ => "Loop pan: -100 = hard left, 0 = centre, +100 = hard right (equal power across the L/R outputs). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per loop.",
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -2506,7 +2561,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                     .font(egui::TextStyle::Monospace),
             )
             .on_hover_text(match kind {
-                KIND_PAN => "Pan position 0..=100 (50 = centre). Press Enter to apply.",
+                KIND_PAN => "Pan position -100..=100 (0 = centre). Press Enter to apply.",
                 _ => "Level in dB (e.g. -6.5). Press Enter to apply.",
             });
         // The unit is plain text outside the box — the box holds numbers
@@ -2581,7 +2636,7 @@ fn db_num(amp: f32) -> String {
 
 /// Parse a level text box back to a MIDI value ("−12.3 dB", "-inf", "50").
 /// Volume / gain floor at MIDI 1 for finite values (0 stays reserved for
-/// the exact "-inf"); pan maps 0..=100 -> 0..=127.
+/// the exact "-inf"); pan maps -100..=100 -> 0..=127.
 fn level_parse(kind: u8, s: &str) -> Option<u8> {
     let t: String = s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
     let t = t.strip_suffix("db").unwrap_or(&t);
@@ -3119,6 +3174,54 @@ mod tests {
     }
 
     #[test]
+    fn knob_learn_numbers_follow_every_message_until_locked() {
+        // The learn window's min/max readouts must track the LATEST value
+        // the control sends, not freeze after the first message (the bug:
+        // MidiBind.d1 — the CC number, constant across a sweep — was stored
+        // as the raw min/max, so both numbers never moved and Finish could
+        // never fire). "Lock min" freezes the minimum; the maximum then
+        // listens until Finish.
+        let mut app = test_app("knob-learn");
+        let slot = MidiAction::idx(MidiAction::VolLoop(0));
+        assert!(MidiAction::VolLoop(0).is_continuous());
+        app.arm_knob_learn(slot);
+        fn cc(app: &mut App, ch: u8, v: u8) {
+            app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | ch, 7, v] }))
+        }
+        cc(&mut app, 1, 90);
+        {
+            let kl = app.knob_learn.as_ref().expect("axis armed");
+            assert!(kl.has_axis);
+            assert_eq!(kl.lo, 90, "first message seeds the readout");
+            assert_eq!(kl.bind.d1, 7, "axis identity is the CC number");
+        }
+        for v in [40u8, 12, 30, 8] {
+            cc(&mut app, 1, v);
+            assert_eq!(app.knob_learn.as_ref().unwrap().lo, v, "min must follow every message");
+        }
+        // "Lock min" at the lowest position: freezes lo, seeds hi.
+        {
+            let kl = app.knob_learn.as_mut().unwrap();
+            kl.locked = true;
+            kl.hi = kl.lo;
+        }
+        for v in [20u8, 70, 111, 127] {
+            cc(&mut app, 1, v);
+            let kl = app.knob_learn.as_ref().unwrap();
+            assert_eq!(kl.hi, v, "max must follow every message after the lock");
+            assert_eq!(kl.lo, 8, "locked min must not move");
+        }
+        // A message from a DIFFERENT control (here: another channel) is
+        // rejected and must not contaminate either end.
+        cc(&mut app, 2, 55);
+        {
+            let kl = app.knob_learn.as_ref().unwrap();
+            assert_eq!(kl.hi, 127, "off-axis message rejected");
+            assert_eq!(kl.lo, 8, "off-axis message rejected");
+        }
+    }
+
+    #[test]
     fn undo_redo_slots_keep_their_positions_when_knobs_are_appended() {
         // The persisted shortcut table is positional: undo/redo must keep
         // their original slots even though the per-loop volume/gain knobs
@@ -3156,16 +3259,27 @@ mod tests {
     }
 
     #[test]
-    fn pan_mappings_centre_at_50() {
-        // MIDI 64 is the centre default; the text box shows 0..=100.
+    fn pan_mappings_centre_at_zero() {
+        // MIDI 64 is the centre default; the text box shows -100..=100
+        // (0 = centre; the old 0..=100/50-centre scale maps 1:1 onto it).
         assert_eq!(PAN_CENTRE_MIDI, 64);
-        assert_eq!(pan_text(PAN_CENTRE_MIDI), 50);
-        assert_eq!(pan_midi(50.0), PAN_CENTRE_MIDI); // 50 * 1.27 = 63.5 -> 64
-        assert_eq!(pan_text(0), 0);
+        assert_eq!(pan_text(PAN_CENTRE_MIDI), 0);
+        assert_eq!(pan_midi(0.0), PAN_CENTRE_MIDI); // centre -> 63.5 -> 64
+        assert_eq!(pan_text(0), -100);
         assert_eq!(pan_text(127), 100);
-        assert_eq!(pan_midi(0.0), 0);
+        assert_eq!(pan_midi(-100.0), 0);
         assert_eq!(pan_midi(100.0), 127);
+        assert_eq!(pan_midi(-150.0), 0, "clamped");
         assert_eq!(pan_midi(150.0), 127, "clamped");
+        // The old translation points: 0 -> -100, 50 -> 0, 100 -> 100.
+        assert_eq!(pan_midi(-100.0), 0);
+        assert_eq!(pan_midi(0.0), 64);
+        assert_eq!(pan_midi(100.0), 127);
+        // Every MIDI position survives the text round trip (±1).
+        for m in 0u8..=127 {
+            let back = pan_midi(pan_text(m) as f32);
+            assert!(back.abs_diff(m) <= 1, "midi {m} -> text {} -> {back}", pan_text(m));
+        }
         // Engine position: hard right at MIDI 127.
         assert!((pan01(127) - 1.0).abs() < 1e-6);
         assert!((pan01(0) - 0.0).abs() < 1e-9);
@@ -3179,15 +3293,17 @@ mod tests {
         assert_eq!(level_parse(KIND_GAIN, "0 dB"), Some(GAIN_UNITY_MIDI));
         assert_eq!(level_parse(KIND_GAIN, "+10.1 dB"), Some(127));
         assert_eq!(level_parse(KIND_VOL, "-999"), Some(1), "finite floors at 1");
-        assert_eq!(level_parse(KIND_PAN, "50"), Some(PAN_CENTRE_MIDI));
-        assert_eq!(level_parse(KIND_PAN, "0"), Some(0));
+        assert_eq!(level_parse(KIND_PAN, "-999"), Some(0), "clamped hard left");
+        assert_eq!(level_parse(KIND_PAN, "0"), Some(PAN_CENTRE_MIDI), "0 = centre");
+        assert_eq!(level_parse(KIND_PAN, "100"), Some(127), "hard right");
         assert_eq!(level_parse(KIND_PAN, "junk"), None);
         // Display strings feed straight back into the parser.
         for m in [0u8, 1, 40, 80, 127] {
             let s = level_display(KIND_VOL, m);
             assert!(level_parse(KIND_VOL, &s).is_some(), "{s}");
         }
-        assert_eq!(level_display(KIND_PAN, PAN_CENTRE_MIDI), "50");
+        assert_eq!(level_display(KIND_PAN, PAN_CENTRE_MIDI), "0");
+        assert_eq!(level_display(KIND_PAN, 0), "-100");
     }
 
     #[test]

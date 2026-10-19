@@ -26,11 +26,11 @@ import/export, and runtime-compiled per-loop effects.
 - **Dashboard** — the main window is a scrollable stack of sixteen track rows,
   each showing the recorded waveform plus REC / OD / PLAY / CLEAR / IMPORT
   buttons. Every row also carries per-loop **vol**, **gain** and **pan**
-  controls: the text boxes are editable (type a dB value or pan 0–100 and
+  controls: the text boxes are editable (type a dB value or a pan position from -100 to 100 and
   press Enter), the number beside each slider is the raw MIDI value. Volume
   trims playback (0 = −∞ … 127 = 0 dB), gain trims in/out (80 = 0 dB,
   127 = +10 dB), and pan positions the loop across the stereo L/R buses
-  (0 = hard left, 50 = centre, 100 = hard right, equal power). They only
+  (-100 = hard left, 0 = centre, +100 = hard right, equal power). They only
   shape playback/monitoring — recorded audio itself is never re-leveled.
 - **Settings menu** — the three-bar (hamburger) button in the top-left opens
   the settings panel: input/output port selection (each output gets **L**,
@@ -93,7 +93,7 @@ import/export, and runtime-compiled per-loop effects.
   points at an effects folder (text box + **browse**; default
   `~/.local/share/simplooper/effects`, created and seeded with a documented
   template on first run), lists every valid script with a toggle (default
-  off), and lets enabled effects be reordered with ▲▼ — they snap to the top
+  off), and lets enabled effects be reordered with ↑↓ arrow buttons — they snap to the top
   and the top-to-bottom order *is* the audio chain order. Effects run
   after the vol × gain trim, in GUI chain order, both live and in export
   renders. Effects are plain **Rust scripts**: drop a `.rs` file in the
@@ -166,7 +166,7 @@ Each loop owns an independent effect chain. Click the loop's **FX** button:
   `template.rs` + the ABI contract file.
 - **The list** — one row per script found: a toggle (default off), the
   effect's display name, and hover text with author/description. Switching
-  a script on snaps it to the top block; ▲▼ inside that block reorder the
+  a script on snaps it to the top block; ↑↓ arrow buttons inside that block reorder the
   chain. Scripts that fail to compile or load are listed dimmed with the
   compiler's error, so an effect author can fix and **Rescan** without
   leaving the app.
@@ -193,7 +193,9 @@ non-blocking, `depth 0`-style pass-through not required but polite). Effects
 are compiled with `rustc --edition 2021 --crate-type cdylib` — so **rustc
 must be installed** to use custom effects; a missing compiler just lists
 scripts with a hint. Working examples in the repo: `effects/parametric_eq.rs`
-and `effects/space_echo.rs` (custom scripted window).
+(6-band EQ with response curve + 240-band live spectrum in its own window) and
+`effects/space_echo.rs` (animated echo window with factory space presets:
+practice hall, auditorium, opera house, cathedral).
 
 ### MIDI binding
 

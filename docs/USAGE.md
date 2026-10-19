@@ -54,7 +54,7 @@ The window is a scrollable stack of **16 track rows**. Each row is one loop
 | **IMPORT** | load an audio file into the loop (see [Import & export](#import--export)) |
 | **vol** | playback trim: 0 = −∞ … 127 = 0 dB. The text box shows the level in dB — type a value (e.g. `-6.5`) and press Enter; the number at the right of the slider is the raw MIDI value |
 | **gain** | gain trim: 0 = −∞ … 80 = 0 dB … 127 = +10 dB. Same editable dB box + raw MIDI readout |
-| **pan** | stereo pan: 0 = hard left, **50 = centre**, 100 = hard right (equal power across the L/R output buses). Editable 0–100 text box + raw MIDI readout; bindable to a knob like vol/gain |
+| **pan** | stereo pan: -100 = hard left, **0 = centre**, +100 = hard right (equal power across the L/R output buses). Editable -100..100 text box + raw MIDI readout; bindable to a knob like vol/gain |
 | **FX** | open the effects window for this loop (see [Per-loop effects](#per-loop-effects)) |
 | effect buttons | enabled effects appear right of FX, left-to-right in chain order, as name buttons — clicking one opens that effect's controls window (auto-generated sliders, or the effect's own scripted GUI) |
 
@@ -161,8 +161,10 @@ the exception and act on the value (0–127: 0 = silence / hard left,
 127 = max / hard right).
 
 **Knob calibration**: controllers with a limited or backwards travel can be
-learned — start a knob slot's calibration, sweep the physical control to its
-minimum and press **Lock min**, sweep it to the maximum and press **Finish**.
+learned — start a knob slot's calibration and sweep the physical control: the
+window shows its most recent raw value live, so you can hunt for the travel
+limits. Press **Lock min** at the lowest position (the minimum stops
+following), sweep to the maximum, press **Finish**.
 The control's range is then stretched onto the full 0–127 program range
 (a backwards-wired knob is inverted automatically), so the extremes of your
 hardware mean the extremes in simplooper.
@@ -190,8 +192,8 @@ The **FX** window on each row:
   and the ABI contract file on first run). Type a path or **browse**, then
   **Set**. **Rescan** re-reads the folder after you edit a script.
 - **The list** — one row per script: toggle (default off), display name,
-  hover text with author/description. Enabled effects snap to the top; ▲▼
-  reorder the chain — top-to-bottom **is** the audio chain order. Scripts
+  hover text with author/description. Enabled effects snap to the top; ↑↓
+  arrow buttons reorder the chain — top-to-bottom **is** the audio chain order. Scripts
   that fail to compile stay visible, dimmed, with the compiler error.
 - The main window shows enabled effects as chips with live sliders; each
   effect chip also opens an **editor window** — automatic (one labelled
@@ -208,8 +210,9 @@ of the repo), rename, edit. It `include!`s the ABI contract
 author, description, and up to **32 parameters** optional; an optional
 custom GUI entry point). simplooper compiles scripts with
 `rustc --edition 2021 --crate-type cdylib` — so **rustc must be installed**
-to use custom effects. Examples ship in the repo: `parametric_eq.rs` and
-`space_echo.rs` (the latter shows a custom scripted window). Keep `process()`
+to use custom effects. Examples ship in the repo: `parametric_eq.rs` (response
+curve + 240-band spectrum GUI) and `space_echo.rs` (animated echo window with
+factory space presets — practice hall, auditorium, opera house, cathedral). Keep `process()`
 allocation-free and non-blocking — it runs in the realtime audio path.
 
 ## Latency compensation

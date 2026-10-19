@@ -11,7 +11,9 @@
 // Params are ordinary effect params, so the auto slider window works too;
 // the child GUI below is a scripted canvas showing the echo pattern
 // (tick spacing = time, fade = feedback, jitter = wobble) over a reverb
-// tail wedge, plus an input level history trace and the knob row.
+// tail wedge, plus an input level history trace (bottom-up: silence at the
+// floor), a factory row of space presets (Default, Practice Hall,
+// Auditorium, Opera House, Cathedral) and the knob row.
 // ---------------------------------------------------------------------------
 
 include!("effect_api.rs");
@@ -29,6 +31,18 @@ const P_DAMP: usize = 6; // reverb damping, Hz (log)
 const P_MIX: usize = 7; // wet mix 0..1
 const P_OUT: usize = 8; // output trim 0..2
 const NPARAMS: u32 = 9;
+
+/// Factory space presets — name + the 9 params (same order as PARAMS).
+/// The first entry is the plugin default; the rest mimic rooms of growing
+/// size: bright small hall → auditorium → opera house → vast cathedral.
+/// (Time/feedbk shape the slap echo, decay/damp the reverb tail.)
+const PRESETS: [(&str, [f32; NPARAMS as usize]); 5] = [
+    ("Default", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0]),
+    ("Practice Hall", [0.09, 0.45, 6500.0, 0.05, 0.5, 0.62, 7000.0, 0.22, 1.0]),
+    ("Auditorium", [0.22, 0.55, 4800.0, 0.1, 0.35, 0.78, 4200.0, 0.38, 0.98]),
+    ("Opera House", [0.36, 0.6, 3600.0, 0.15, 0.28, 0.86, 3000.0, 0.45, 0.95]),
+    ("Cathedral", [0.9, 0.78, 1800.0, 0.25, 0.14, 0.94, 1500.0, 0.55, 0.88]),
+];
 
 // ---------------------------------------------------------------------------
 // Delay line with cubic (Hermite) fractional read.
@@ -319,7 +333,7 @@ extern "C" fn gui_draw(
 
     let w = fr.width;
     let h = fr.height;
-    let canvas_h = (h - 116.0).max(100.0);
+    let canvas_h = (h - 132.0).max(100.0);
 
     // ---- level history ----------------------------------------------------
     let lvl = if !state.is_null() {
@@ -332,14 +346,16 @@ extern "C" fn gui_draw(
 
     unsafe {
         (api.rect_filled)(c, 8.0, 8.0, w - 16.0, canvas_h, 0.09, 0.10, 0.13, 1.0);
-        // history trace
+        // history trace — bottom-up like the EQ's analyser: silence sits at
+        // the floor, louder input climbs toward the top (0 dBFS). The old
+        // mapping was inverted (silence pinned the trace to the top edge).
         let cw = w - 16.0;
         let mut pts: Vec<f32> = Vec::with_capacity(HIST * 2);
         for (i, v) in gs.hist.iter().enumerate() {
             let db = 20.0f32 * (v.max(1e-6)).log10(); // -120..0
-            let y = ((-db) / 60.0).clamp(0.0, 1.0);
+            let up = 1.0 - ((-db) / 60.0).clamp(0.0, 1.0);
             pts.push(8.0 + (i as f32 / (HIST - 1) as f32) * cw);
-            pts.push(8.0 + canvas_h - y.min(1.0) * canvas_h * 0.98);
+            pts.push(8.0 + canvas_h - up.max(0.0) * canvas_h * 0.98);
         }
         (api.polyline)(c, pts.as_ptr(), pts.len() as u32 / 2, 0, 1.4, 0.30, 0.85, 0.55, 0.85);
 
@@ -389,7 +405,8 @@ extern "C" fn gui_draw(
         (api.rect_filled)(c, 12.0, 8.0 + canvas_h - 10.0 - lv, 6.0, lv, 0.30, 0.85, 0.55, 0.9);
 
         // ---- knob row ----------------------------------------------------
-        let ky = canvas_h + 22.0;
+        // (ky starts high in the strip: the preset row lives at its bottom.)
+        let ky = canvas_h + 6.0;
         let row = |i: usize, label: &str, idx: usize, min: f32, max: f32, curve: f32, fmt: &str| {
             let mut v = gp(idx as u32);
             let shown = match fmt {
@@ -414,6 +431,20 @@ extern "C" fn gui_draw(
         row(6, "damp", P_DAMP, 200.0, 16000.0, 0.0, "khz");
         row(7, "mix", P_MIX, 0.0, 1.0, 1.0, "pct");
         row(8, "out", P_OUT, 0.0, 2.0, 1.0, "db");
+
+        // ---- factory space presets ------------------------------------
+        // One click applies all nine params (rooms of growing size).
+        let py = canvas_h + 94.0;
+        let s = std::ffi::CString::new("spaces:").unwrap();
+        (api.text)(c, 8.0, py + 5.0, 10.0, 0, 0.7, 0.7, 0.75, 1.0, s.as_ptr());
+        for (pi, (name, vals)) in PRESETS.iter().enumerate() {
+            let s = std::ffi::CString::new(*name).unwrap();
+            if (api.button)(c, 58.0 + pi as f32 * 122.0, py, 118.0, s.as_ptr()) != 0 {
+                for (k, v) in vals.iter().enumerate() {
+                    sp(k as u32, *v);
+                }
+            }
+        }
     }
 }
 
@@ -437,7 +468,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     name: c"Space Echo".as_ptr(),
     author: c"simplooper".as_ptr(),
     description:
-        c"Modulated feedback delay feeding an FDN reverb; damped loops, wobble LFO, animated echo-pattern window.".as_ptr(),
+        c"Modulated feedback delay feeding an FDN reverb; damped loops, wobble LFO, animated echo-pattern window, factory space presets (practice hall .. cathedral).".as_ptr(),
     n_params: NPARAMS,
     params: PARAMS.as_ptr(),
     create,
@@ -448,7 +479,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 pub static GUI: EffectGuiV1 = EffectGuiV1 {
     abi: SIMPLOOPER_EFFECT_GUI_ABI,
     want_width: 760.0,
-    want_height: 400.0,
+    want_height: 424.0,
     create: gui_create,
     draw: gui_draw,
     destroy: gui_destroy,

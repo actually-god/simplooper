@@ -956,6 +956,84 @@ mod tests {
     }
 
     #[test]
+    fn eq_peaking_bands_are_stable_and_correct() {
+        // The peaking (bell) denominator must be (1 + α/A, −2cos, 1 − α/A).
+        // A sign swap there (1 − α/A … 1 + α/A) parks the poles OUTSIDE the
+        // unit circle, so a peaking band self-oscillates to ±inf for ANY
+        // nonzero alpha — even at 0 dB gain. With four peaking bands at the
+        // EQ's defaults, enabling it pegged the output meter at inf.
+        // Also covers the shelf-slope α: the shelf-SLOPE form goes
+        // imaginary at high gain + high Q; clamped to 0 it parked shelf
+        // poles exactly ON the unit circle (perpetual ringing).
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("eqstab");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let flat_off = [0.0f32, 1000.0, 0.0, 1.0];
+        let mut vals = Vec::new();
+        vals.extend_from_slice(&flat_off); // band 1: off
+        for _ in 1..6 {
+            vals.extend_from_slice(&flat_off);
+        }
+        vals.extend_from_slice(&[1.0, 1.0]); // mix, out
+        // 1) defaults-equivalent cascade + impulse: finite, near pass-through.
+        let inst = reg.create_instance("parametric_eq", 48000.0, &vals).expect("eq");
+        // impulse + settle, then a sine; the pass-through must keep the
+        // impulse energy at ~1 head, dead-silent tail, and unity sine gain.
+        let head: f32 = (0..240).map(|_| inst.process_private(1.0).abs()).fold(0.0, f32::max);
+        let tail: f32 = (0..4560).map(|_| inst.process_private(0.0).abs()).fold(0.0, f32::max);
+        assert!(head > 0.5 && tail < 0.05, "flat EQ impulse head {head} tail {tail}");
+        let out: Vec<f32> = (0..48000)
+            .map(|i| {
+                let x = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin() * 0.3;
+                inst.process_private(x + if i % 7 == 0 { 0.05 } else { -0.05 })
+            })
+            .collect();
+        assert!(out.iter().all(|y| y.is_finite()), "non-finite EQ output");
+        let peak = out.iter().fold(0.0f32, |a, y| a.max(y.abs()));
+        assert!((0.25..0.5).contains(&peak), "flat EQ must pass ~unity, peak {peak}");
+        // 2) a +6 dB peaking band at 1 kHz must lift a 1 kHz sine by ~2×.
+        let mut vals = vals.clone();
+        vals[0] = 3.0; // peaking
+        vals[2] = 6.0; // +6 dB
+        let inst = reg.create_instance("parametric_eq", 48000.0, &vals).unwrap();
+        let mut sum = 0.0f64;
+        let mut n = 0.0f64;
+        for i in 0..48000u64 {
+            let x = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin();
+            let y = inst.process_private(x) as f64;
+            assert!(y.is_finite(), "peaking band produced {y}");
+            if i > 9600 {
+                sum += y * y;
+                n += 1.0;
+            }
+        }
+        let rms = (sum / n).sqrt() as f32;
+        let want = 0.707 * 10.0f32.powf(6.0 / 20.0); // sine RMS × gain
+        assert!((rms / want - 1.0).abs() < 0.04, "peaking +6 dB: rms {rms}, expected ~{want}");
+        // 3) high-Q/high-gain shelves: impulse must DIE AWAY, not ring forever.
+        let mut vals = vals.clone();
+        vals[0] = 1.0; // low shelf
+        vals[2] = 24.0;
+        vals[3] = 8.0; // Q 8 — the shelf-S formula went imaginary here
+        vals[20] = 2.0; // high shelf
+        vals[22] = 24.0;
+        vals[23] = 8.0;
+        let inst = reg.create_instance("parametric_eq", 48000.0, &vals).unwrap();
+        // A resonant shelf peaks ~tens of ms after the impulse (band build-up
+        // + coefficient glide); the OLD clamped-alpha shelf kept ringing
+        // forever instead. Head = first 100 ms, tail = the next 2.5 s.
+        let head: f32 = (0..4800).map(|_| inst.process_private(1.0).abs()).fold(0.0, f32::max);
+        let tail: f32 = (0..120000).map(|_| inst.process_private(0.0).abs()).fold(0.0, f32::max);
+        assert!(head > 1.0, "resonant shelf produced no response: {head}");
+        assert!(tail < head * 0.01, "shelf ringing forever: tail {tail} vs head {head}");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sanitize_keeps_crate_names_legal() {
         assert_eq!(sanitize_crate_name("my-effect 2"), "fx_my_effect_2");
         assert_eq!(sanitize_crate_name("api"), "fx_api");
