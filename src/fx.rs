@@ -138,19 +138,28 @@ fn seed_api(dir: &Path) {
             let _ = std::fs::write(&p, API_SRC);
         }
     }
-    // A brand-new effects folder also gets the documented template and the
-    // bundled examples, so the Effects window opens with something
-    // switchable instead of nothing. Never written over: once the user
-    // edits a file, it belongs to them.
+    // The template is written once for a brand-new folder.
     let fresh = !has_scripts(dir);
     let t = dir.join(TEMPLATE_FILE);
     if fresh && !t.exists() {
         let _ = std::fs::write(&t, TEMPLATE_SRC);
     }
-    if fresh {
-        for (name, src) in EXAMPLES {
-            let p = dir.join(name);
-            if !p.exists() {
+    // Bundled examples are UPDATED with every app release, not just seeded
+    // once: the previous write-only-if-absent rule meant plugin fixes shipped
+    // in later releases never reached an existing install — users ran the
+    // day-one scripts forever ("EQ still has all bugs" while the repo copy
+    // was fixed). A file about to change is copied to `<name>.rs.bak`
+    // (single generation) first, so nothing is lost; a user customization
+    // that must survive updates belongs under its own file name.
+    for (name, src) in EXAMPLES {
+        let p = dir.join(name);
+        match std::fs::read_to_string(&p) {
+            Ok(cur) if cur == *src => {}
+            Ok(cur) => {
+                let _ = std::fs::write(p.with_extension("rs.bak"), cur.as_bytes());
+                let _ = std::fs::write(&p, src);
+            }
+            Err(_) => {
                 let _ = std::fs::write(&p, src);
             }
         }
@@ -863,6 +872,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn bundled_scripts_update_in_place_with_backup() {
+        // A stale copy of a bundled script is refreshed on seed (app fixes
+        // must reach existing installs), and the outgoing contents survive
+        // as `<name>.rs.bak`.
+        let dir = temp_dir("seedupdate");
+        std::fs::write(dir.join(API_FILE), API_SRC).unwrap();
+        let (name, src) = EXAMPLES[0];
+        let p = dir.join(name);
+        std::fs::write(&p, "// old stale copy\n").unwrap();
+        seed_api(&dir);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), *src, "{name} not refreshed");
+        assert_eq!(std::fs::read_to_string(p.with_extension("rs.bak")).unwrap(), "// old stale copy\n");
+        // A current copy is left untouched (and no spurious backup).
+        let bak = p.with_extension("rs.bak");
+        std::fs::remove_file(&bak).unwrap();
+        seed_api(&dir);
+        assert!(!bak.exists(), "unchanged script must not be re-backed-up");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
