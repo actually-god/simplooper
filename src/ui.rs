@@ -3060,11 +3060,19 @@ mod tests {
 
     /// App with config isolated to a per-test temp dir (never the user's).
     fn test_app(tag: &str) -> App {
+        // Set-once: set_var mutates glibc `environ` (realloc), and the audio
+        // backend threads earlier tests left running read env vars — even a
+        // single concurrent getenv during a set_var is the same UB that
+        // surfaced as `corrupted size vs. prev_size`. The NULL-audio flag is
+        // identical for every test, so it only ever needs one write.
+        static NULL_ENV: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        NULL_ENV.get_or_init(|| std::env::set_var("SIMPLOOPER_NULL_AUDIO", "1"));
+        // XDG_CONFIG_HOME changes per test; no other thread reads it (null
+        // mode never reaches the JACK client), and the suite is pinned to
+        // RUST_TEST_THREADS=1 (.cargo/config.toml).
         let dir =
             std::env::temp_dir().join(format!("simplooper-test-{}-{}", std::process::id(), tag));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
-        // No PipeWire-JACK clients in headless tests (see run()'s null mode).
-        std::env::set_var("SIMPLOOPER_NULL_AUDIO", "1");
         App::new(crate::audio::Backend::start())
     }
 
@@ -3120,6 +3128,161 @@ mod tests {
             out.textures_delta.clear();
             assert!(app.fx_editor.is_some(), "editor stays open after painting");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eq_strip_widgets_and_fine_curve_react() {
+        // Headless regression for the three "EQ does nothing" complaints:
+        // 1. the selected band's FREQ KNOB must write the frequency param;
+        // 2. the response curve must visibly change when that param moves
+        //    (it is one high-resolution antialiased path, 800 pts);
+        // 3. no label may contain a glyph egui's fonts lack ('\u{25B8}', '\u{00B7}')
+        //    — those hollow boxes read as broken checkboxes.
+        if !fx::rustc_available() {
+            return;
+        }
+        let mut app = test_app("eqstrip");
+        let dir = std::env::temp_dir().join(format!("sp-strip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fx::API_FILE), fx::API_SRC).unwrap();
+        std::fs::write(dir.join(fx::TEMPLATE_FILE), fx::TEMPLATE_SRC).unwrap();
+        for (name, src) in fx::EXAMPLES {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        app.fx_dir_edit = dir.display().to_string();
+        app.apply_fx_dir();
+        app.fx_entries[0].iter_mut().for_each(|e| e.enabled = false);
+        let k = app.fx_entries[0].iter().position(|e| e.stem == "parametric_eq").unwrap();
+        app.fx_entries[0][k].enabled = true;
+        app.rebuild_fx(0);
+        app.open_fx_editor(0, 0);
+        let inst = app.fx_editor.as_ref().unwrap().inst.clone();
+        let ctx = egui::Context::default();
+        let mut t = 0.0f64;
+        let mut frame = |evs: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
+            let mut ri = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1920.0, 1080.0),
+                )),
+                time: Some({
+                    t += 0.1;
+                    t
+                }),
+                ..Default::default()
+            };
+            ri.events = evs;
+            let app: &mut App = unsafe { &mut *(&mut app as *mut App) };
+            let mut out = ctx.run_ui(ri, |c| {
+                app.fx_editor_window(c);
+            });
+            let shapes = out.shapes.clone();
+            ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            out.textures_delta.clear();
+            shapes
+        };
+        let moved = |p: egui::Pos2| egui::Event::PointerMoved(p);
+        let down = |p: egui::Pos2| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let up = |p: egui::Pos2| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        frame(vec![]);
+        frame(vec![]);
+        let shapes = frame(vec![moved(egui::pos2(100.0, 476.0))]);
+
+        // (3) no tofu glyphs in any painted label.
+        for cs in &shapes {
+            if let egui::Shape::Text(t) = &cs.shape {
+                let s = t.galley.text();
+                assert!(
+                    !s.contains('\u{25B8}') && !s.contains('\u{00B7}'),
+                    "label {s:?} contains a glyph the default fonts lack"
+                );
+            }
+        }
+
+        // (1) drag the freq knob (first knob circle below the graph) up 30 px.
+        let mut knob: Option<egui::Pos2> = None;
+        for cs in &shapes {
+            if let egui::Shape::Circle(cc) = &cs.shape {
+                if cc.center.y > 400.0 && cc.center.x < 500.0 {
+                    let c = cc.center;
+                    if knob.map_or(true, |k| c.x < k.x) {
+                        knob = Some(c);
+                    }
+                }
+            }
+        }
+        let kp = knob.expect("freq knob circle painted");
+        let skip_knob = std::env::var("EQP").is_ok();
+        let f0 = inst.param(1);
+        if !skip_knob {
+            frame(vec![moved(kp)]);
+            frame(vec![down(kp)]);
+            frame(vec![moved(kp + egui::vec2(0.0, -30.0))]);
+            frame(vec![up(kp + egui::vec2(0.0, -30.0))]);
+        }
+        let f1 = inst.param(1);
+        assert!(skip_knob || f0 != f1, "dragging the freq knob must change the freq param");
+
+        // (2) the fine curve must actually move when the freq param moves.
+        // Minimal-pattern bisection.
+        match std::env::var("EQMIN").ok().as_deref() {
+            Some("1") => { inst.set_param(1, 80.0); frame(vec![]); }
+            Some("2") => { inst.set_param(1, 80.0); frame(vec![]); frame(vec![]); }
+            Some("3") => { inst.set_param(1, 80.0); frame(vec![]); inst.set_param(1, 3000.0); frame(vec![]); }
+            Some("4") => {
+                inst.set_param(1, 80.0); frame(vec![]);
+                let s = frame(vec![]);
+                println!("EQMIN4 shapes={}", s.len());
+                inst.set_param(1, 3000.0); frame(vec![]);
+                let _s2 = frame(vec![]);
+            }
+            Some("5") => { frame(vec![]); frame(vec![]); frame(vec![]); frame(vec![]); }
+            _ => {}
+        }
+        let mut curve_at = |freq: f32| -> Vec<(f32, f32)> {
+            inst.set_param(1, freq);
+            frame(vec![]);
+            let shapes = frame(vec![]);
+            shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Path(pth) if pth.points.len() > 400 => {
+                        Some(pth.points.iter().map(|p| (p.x, p.y)).collect::<Vec<(f32, f32)>>())
+                    }
+                    _ => None,
+                })
+                .max_by_key(|pts| pts.len())
+                .expect("high-resolution response curve (single path)")
+        };
+        // A shelf/peak at 0 dB is mathematically FLAT — moving its corner
+        // frequency changes nothing visible. Give B1 real gain first.
+        inst.set_param(2, 6.0);
+        let skip_curve = std::env::var("EQC").is_ok();
+        let c1 = if skip_knob || skip_curve { Vec::new() } else { curve_at(80.0) };
+        let c2 = if skip_knob || skip_curve { Vec::new() } else { curve_at(3000.0) };
+        if !skip_knob && !skip_curve {
+            assert!(c1.len() >= 800, "curve should sample >= 800 points, got {}", c1.len());
+            let moved_px: f32 = c1.iter().zip(c2.iter()).map(|(a, b)| (a.1 - b.1).abs()).sum();
+            assert!(moved_px > 200.0, "curve must visibly change when B1 freq moves (sum {moved_px})");
+        }
+        if std::env::var("EQNODROP").is_ok() {
+            std::mem::forget(inst);
+        } else {
+            drop(inst);
+        }
+        app.fx_editor = None;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

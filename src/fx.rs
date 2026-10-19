@@ -223,7 +223,13 @@ struct EffectFns {
 
 /// Owning wrapper for a loaded library (raw handle inside ⇒ manual impls;
 /// only ever touched while building instances or dropping them).
-struct LibHandle(libloading::Library);
+struct LibHandle(std::mem::ManuallyDrop<libloading::Library>);
+// Intentional leak: dropping libloading::Library calls dlclose, and closing
+// a plugin that embeds its own Rust std runtime frees that runtime's TLS
+// entries and lazy pool bookkeeping while the process's own teardown
+// destructors are still running — dangling references land as
+// `corrupted size vs. prev_size` heap aborts at shutdown (reproduced in the
+// headless EQ test). Effects are few and small; keep them mapped for good.
 unsafe impl Send for LibHandle {}
 unsafe impl Sync for LibHandle {}
 
@@ -559,7 +565,7 @@ impl Registry {
             self.prune_stale(stem, &so);
         }
         let lib = match unsafe { libloading::Library::new(&so) } {
-            Ok(l) => Arc::new(LibHandle(l)),
+            Ok(l) => Arc::new(LibHandle(std::mem::ManuallyDrop::new(l))),
             Err(e) => return mk(format!("could not load {}: {e}", so.display())),
         };
         match unsafe { validate(&lib.0) } {

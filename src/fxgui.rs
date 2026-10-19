@@ -231,14 +231,17 @@ extern "C" fn tr_polyline(
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let pts = unsafe { core::slice::from_raw_parts(xy, n as usize * 2) };
     let stroke = Stroke::new(stroke_w(width), rgba(r, g, b, a));
-    let segs = if closed != 0 { n as usize } else { n as usize - 1 };
-    for i in 0..segs {
-        let j = (i + 1) % n as usize;
-        br.ui.painter().line_segment(
-            [br.pos(pts[i * 2], pts[i * 2 + 1]), br.pos(pts[j * 2], pts[j * 2 + 1])],
-            stroke,
-        );
-    }
+    // One stroked path, not n-1 segments: a single PathShape stays one cheap
+    // item whether the caller sends 80 points or 3000, and the tessellator
+    // joins it continuously instead of drawing 799 separate butt-capped
+    // sticks (which is what made the response curve look faceted).
+    let path = egui::epaint::PathShape {
+        points: (0..n as usize).map(|i| br.pos(pts[i * 2], pts[i * 2 + 1])).collect(),
+        closed: closed != 0,
+        fill: Color32::TRANSPARENT,
+        stroke: stroke.into(),
+    };
+    br.ui.painter().add(path);
 }
 
 extern "C" fn tr_rect_filled(ctx: *mut c_void, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32) {

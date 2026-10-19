@@ -396,7 +396,7 @@ fn fmt_hz(f: f32) -> String {
 }
 
 /// Curve sample count for the response trace.
-const CURVE_PTS: usize = 180;
+const CURVE_PTS: usize = 800;
 
 extern "C" fn gui_draw(
     gs: *mut core::ffi::c_void,
@@ -621,26 +621,32 @@ extern "C" fn gui_draw(
     let sy = gy + gph + 22.0;
     unsafe {
         // Band buttons.
-        let bw = 46.0f32;
+        // No '▸' or '·' in labels: egui's default fonts lack those glyphs
+        // and they render as hollow boxes (looked like broken checkboxes).
+        // Selection is marked with a vector bar; disabled bands say "off".
+        let bw = 56.0f32;
         let x0 = 8.0f32;
         for bi in 0..NBANDS {
             let typ = gp((bi * 4) as u32) as i32;
             let on = typ != 0;
-            let lab = format!("{} B{}{}", if gs.sel == bi { "▸" } else { " " }, bi + 1, if on { "" } else { "·" });
+            let lab = format!("B{}{}", bi + 1, if on { "" } else { " off" });
             let s = std::ffi::CString::new(lab).unwrap();
             if (api.button)(c, x0 + bi as f32 * bw, sy, bw - 4.0, s.as_ptr()) != 0 {
                 gs.sel = bi;
             }
+            if gs.sel == bi {
+                (api.rect_filled)(c, x0 + bi as f32 * bw - 3.0, sy + 3.0, 2.5, 14.0, 1.0, 0.75, 0.30, 1.0);
+            }
         }
         // Spectrum toggle + reset.
-        let bx = x0 + NBANDS as f32 * bw;
+        let bx = x0 + NBANDS as f32 * bw + 14.0;
         let mut spec = if gs.show_spec { 1.0f32 } else { 0.0f32 };
         let s = std::ffi::CString::new("spectrum").unwrap();
         if (api.checkbox)(c, bx, sy + 4.0, s.as_ptr(), &mut spec) != 0 {
             gs.show_spec = spec != 0.0;
         }
         let s = std::ffi::CString::new("reset").unwrap();
-        if (api.button)(c, bx + 86.0, sy, 56.0, s.as_ptr()) != 0 {
+        if (api.button)(c, bx + 106.0, sy, 56.0, s.as_ptr()) != 0 {
             for bi in 0..NBANDS {
                 let d = BAND_DEFS[bi];
                 sp((bi * 4) as u32, d[0]);
@@ -657,12 +663,12 @@ extern "C" fn gui_draw(
         let b6 = (NBANDS - 1) as u32 * 4;
         let lp_on = gp(0) as i32 == 4;
         let s = std::ffi::CString::new(format!("B1 lp {}", if lp_on { "on" } else { "off" })).unwrap();
-        if (api.button)(c, bx + 152.0, sy, 78.0, s.as_ptr()) != 0 {
+        if (api.button)(c, bx + 172.0, sy, 78.0, s.as_ptr()) != 0 {
             sp(0, if lp_on { BAND_DEFS[0][0] } else { 4.0 });
         }
         let hp_on = gp(b6) as i32 == 5;
         let s = std::ffi::CString::new(format!("B6 hp {}", if hp_on { "on" } else { "off" })).unwrap();
-        if (api.button)(c, bx + 234.0, sy, 78.0, s.as_ptr()) != 0 {
+        if (api.button)(c, bx + 258.0, sy, 78.0, s.as_ptr()) != 0 {
             sp(b6, if hp_on { BAND_DEFS[NBANDS - 1][0] } else { 5.0 });
         }
 
@@ -678,7 +684,7 @@ extern "C" fn gui_draw(
 
         let mut cx = 130.0f32;
         // Type button: cycles on click.
-        let s = std::ffi::CString::new(format!("type ▸ {}", TYPE_SHORT[typ.clamp(0, 7) as usize])).unwrap();
+        let s = std::ffi::CString::new(format!("type: {}", TYPE_SHORT[typ.clamp(0, 7) as usize])).unwrap();
         if (api.button)(c, cx, by, 96.0, s.as_ptr()) != 0 {
             sp(base as u32, ((typ + 1) % 8) as f32);
         }
