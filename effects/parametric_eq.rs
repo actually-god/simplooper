@@ -533,7 +533,10 @@ extern "C" fn gui_draw(
         let mut pts: Vec<f32> = Vec::with_capacity(CURVE_PTS * 2);
         for i in 0..CURVE_PTS {
             let f = F_LO * (F_HI / F_LO).powf(i as f32 / (CURVE_PTS - 1) as f32);
-            let wf = core::f64::consts::TAU * f as f64;
+            // mag() wants the DIGITAL angular frequency (rad/sample):
+            // evaluating at TAU*f wrapped around the unit circle hundreds
+            // of times and aliased every bell into random-looking spikes.
+            let wf = core::f64::consts::TAU * (f as f64 / sr as f64);
             let mut mag = 1.0f64;
             for b in disp.iter() {
                 mag *= b.mag(wf);
@@ -617,36 +620,46 @@ extern "C" fn gui_draw(
         }
     }
 
-    // ---- control strip -----------------------------------------------------
-    let sy = gy + gph + 22.0;
+    // ---- control strip: measured grid ------------------------------------
+    // Row 1: B1..B6 | spectrum | reset | B1 lp | B6 hp
+    // Row 2: band label | type | on | freq/gain/Q knobs (mix/out right).
+    // Every x advance is the widget\'s MEASURED width and checkboxes share
+    // the buttons\' vertical centre — fixed magic offsets ("bx + 86.0")
+    // drifted into "severely misaligned" rows as soon as any label grew a
+    // character.
+    let sy = gy + gph + 20.0;
+    let y2 = sy + 30.0;
+    let tw = |sz: f32, s: &str| -> f32 {
+        let cs = std::ffi::CString::new(s).unwrap();
+        unsafe { (api.text_width)(c, sz, cs.as_ptr()) }
+    };
+    let bw = 46.0f32;
     unsafe {
-        // Band buttons.
-        // No '▸' or '·' in labels: egui's default fonts lack those glyphs
-        // and they render as hollow boxes (looked like broken checkboxes).
-        // Selection is marked with a vector bar; disabled bands say "off".
-        let bw = 56.0f32;
         let x0 = 8.0f32;
         for bi in 0..NBANDS {
             let typ = gp((bi * 4) as u32) as i32;
-            let on = typ != 0;
-            let lab = format!("B{}{}", bi + 1, if on { "" } else { " off" });
+            let lab = format!(
+                "{}B{}{}",
+                if gs.sel == bi { "> " } else { "" },
+                bi + 1,
+                if typ != 0 { "" } else { "-" }
+            );
             let s = std::ffi::CString::new(lab).unwrap();
             if (api.button)(c, x0 + bi as f32 * bw, sy, bw - 4.0, s.as_ptr()) != 0 {
                 gs.sel = bi;
             }
-            if gs.sel == bi {
-                (api.rect_filled)(c, x0 + bi as f32 * bw - 3.0, sy + 3.0, 2.5, 14.0, 1.0, 0.75, 0.30, 1.0);
-            }
         }
-        // Spectrum toggle + reset.
-        let bx = x0 + NBANDS as f32 * bw + 14.0;
+        let mut cx = x0 + NBANDS as f32 * bw + 8.0;
+        let spec_w = 16.0 + tw(13.0, "spectrum");
         let mut spec = if gs.show_spec { 1.0f32 } else { 0.0f32 };
         let s = std::ffi::CString::new("spectrum").unwrap();
-        if (api.checkbox)(c, bx, sy + 4.0, s.as_ptr(), &mut spec) != 0 {
+        if (api.checkbox)(c, cx, sy + 4.0, s.as_ptr(), &mut spec) != 0 {
             gs.show_spec = spec != 0.0;
         }
+        cx += spec_w + 12.0;
+        let rw = 16.0 + tw(11.0, "reset");
         let s = std::ffi::CString::new("reset").unwrap();
-        if (api.button)(c, bx + 106.0, sy, 56.0, s.as_ptr()) != 0 {
+        if (api.button)(c, cx, sy, rw, s.as_ptr()) != 0 {
             for bi in 0..NBANDS {
                 let d = BAND_DEFS[bi];
                 sp((bi * 4) as u32, d[0]);
@@ -657,79 +670,75 @@ extern "C" fn gui_draw(
             sp(P_MIX as u32, 1.0);
             sp(P_OUT as u32, 1.0);
         }
-        // Edge-filter quick toggles: one click drops a lowpass on B1 /
-        // highpass on B6 (the usual LP/HP positions); clicking again puts
-        // the band's default shelf back.
+        cx += rw + 12.0;
         let b6 = (NBANDS - 1) as u32 * 4;
         let lp_on = gp(0) as i32 == 4;
-        let s = std::ffi::CString::new(format!("B1 lp {}", if lp_on { "on" } else { "off" })).unwrap();
-        if (api.button)(c, bx + 172.0, sy, 78.0, s.as_ptr()) != 0 {
+        let lab = format!("B1 lp {}", if lp_on { "on" } else { "off" });
+        let lw = 16.0 + tw(11.0, &lab);
+        let s = std::ffi::CString::new(lab).unwrap();
+        if (api.button)(c, cx, sy, lw, s.as_ptr()) != 0 {
             sp(0, if lp_on { BAND_DEFS[0][0] } else { 4.0 });
         }
+        cx += lw + 10.0;
         let hp_on = gp(b6) as i32 == 5;
-        let s = std::ffi::CString::new(format!("B6 hp {}", if hp_on { "on" } else { "off" })).unwrap();
-        if (api.button)(c, bx + 258.0, sy, 78.0, s.as_ptr()) != 0 {
+        let lab = format!("B6 hp {}", if hp_on { "on" } else { "off" });
+        let hw = 16.0 + tw(11.0, &lab);
+        let s = std::ffi::CString::new(lab).unwrap();
+        if (api.button)(c, cx, sy, hw, s.as_ptr()) != 0 {
             sp(b6, if hp_on { BAND_DEFS[NBANDS - 1][0] } else { 5.0 });
         }
 
-        // Selected-band controls.
-        let by = sy + 30.0;
+        // Row 2: selected band controls.
         let sel = gs.sel.min(NBANDS - 1);
         let base = sel * 4;
         let typ = gp(base as u32) as i32;
         let uses_gain = uses_gain(typ);
-        let uses_q = true;
-        let s = std::ffi::CString::new(format!("B{}: {}", sel + 1, TYPE_NAMES[typ.clamp(0, 7) as usize])).unwrap();
-        (api.text)(c, 12.0, by + 10.0, 12.0, 0, 0.85, 0.85, 0.9, 1.0, s.as_ptr());
-
-        let mut cx = 130.0f32;
-        // Type button: cycles on click.
-        let s = std::ffi::CString::new(format!("type: {}", TYPE_SHORT[typ.clamp(0, 7) as usize])).unwrap();
-        if (api.button)(c, cx, by, 96.0, s.as_ptr()) != 0 {
+        let band_lab = format!("B{}: {}", sel + 1, TYPE_NAMES[typ.clamp(0, 7) as usize]);
+        let s = std::ffi::CString::new(band_lab.clone()).unwrap();
+        (api.text)(c, 10.0, y2 + 6.0, 12.0, 0, 0.85, 0.85, 0.9, 1.0, s.as_ptr());
+        let mut cx2 = 10.0 + tw(12.0, &band_lab) + 16.0;
+        let lab = format!("type > {}", TYPE_SHORT[typ.clamp(0, 7) as usize]);
+        let lw = 16.0 + tw(11.0, &lab);
+        let s = std::ffi::CString::new(lab).unwrap();
+        if (api.button)(c, cx2, y2, lw, s.as_ptr()) != 0 {
             sp(base as u32, ((typ + 1) % 8) as f32);
         }
-        cx += 106.0;
+        cx2 += lw + 12.0;
         let mut on = if typ == 0 { 0.0f32 } else { 1.0f32 };
         let s = std::ffi::CString::new("on").unwrap();
-        if (api.checkbox)(c, cx, by + 4.0, s.as_ptr(), &mut on) != 0 {
-            sp(base as u32, if on != 0.0 { 3.0 } else { 0.0 }); // "on" defaults to peaking
+        if (api.checkbox)(c, cx2, y2 + 4.0, s.as_ptr(), &mut on) != 0 {
+            sp(base as u32, if on != 0.0 { 3.0 } else { 0.0 }); // "on" = peaking
         }
-        cx += 60.0;
-        // Knobs: freq / gain / Q + global mix / out.
+        cx2 += 16.0 + tw(13.0, "on") + 18.0;
+        // Knobs on one shared row; mix/out right-aligned on the SAME row.
+        let ky = y2 + 16.0;
         let mut v = p[base + 1];
         let s = std::ffi::CString::new(format!("freq {}", fmt_hz(v))).unwrap();
-        if (api.knob)(c, cx, by + 16.0, 46.0, s.as_ptr(), &mut v, 20.0, 20000.0, 0.0) != 0 {
+        if (api.knob)(c, cx2, ky, 44.0, s.as_ptr(), &mut v, 20.0, 20000.0, 0.0) != 0 {
             sp(base as u32 + 1, v);
         }
-        cx += 62.0;
+        cx2 += 60.0;
         if uses_gain {
             let mut v = p[base + 2];
             let s = std::ffi::CString::new(format!("gain {:+.1}", v)).unwrap();
-            if (api.knob)(c, cx, by + 16.0, 46.0, s.as_ptr(), &mut v, -24.0, 24.0, 1.0) != 0 {
+            if (api.knob)(c, cx2, ky, 44.0, s.as_ptr(), &mut v, -24.0, 24.0, 1.0) != 0 {
                 sp(base as u32 + 2, v);
             }
-            cx += 62.0;
+            cx2 += 60.0;
         }
-        if uses_q {
-            let mut v = p[base + 3];
-            let s = std::ffi::CString::new(format!("Q {:.2}", v)).unwrap();
-            if (api.knob)(c, cx, by + 16.0, 46.0, s.as_ptr(), &mut v, 0.1, 16.0, 0.0) != 0 {
-                sp(base as u32 + 3, v);
-            }
-            cx += 62.0;
+        let mut v = p[base + 3];
+        let s = std::ffi::CString::new(format!("Q {:.2}", v)).unwrap();
+        if (api.knob)(c, cx2, ky, 44.0, s.as_ptr(), &mut v, 0.1, 16.0, 0.0) != 0 {
+            sp(base as u32 + 3, v);
         }
-        let _ = cx;
-    }
-    // Global knobs right-aligned on the strip.
-    unsafe {
         let mut v = p[P_MIX];
         let s = std::ffi::CString::new(format!("mix {:.0}%", v * 100.0)).unwrap();
-        if (api.knob)(c, w - 150.0, gy + gph + 52.0, 46.0, s.as_ptr(), &mut v, 0.0, 1.0, 1.0) != 0 {
+        if (api.knob)(c, w - 152.0, ky, 44.0, s.as_ptr(), &mut v, 0.0, 1.0, 1.0) != 0 {
             sp(P_MIX as u32, v);
         }
         let mut v = p[P_OUT];
         let s = std::ffi::CString::new(format!("out {:+.1}dB", 20.0f32 * (v.max(1e-4)).log10())).unwrap();
-        if (api.knob)(c, w - 88.0, gy + gph + 52.0, 46.0, s.as_ptr(), &mut v, 0.0, 2.0, 1.0) != 0 {
+        if (api.knob)(c, w - 88.0, ky, 44.0, s.as_ptr(), &mut v, 0.0, 2.0, 1.0) != 0 {
             sp(P_OUT as u32, v);
         }
     }

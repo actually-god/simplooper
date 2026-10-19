@@ -3217,7 +3217,7 @@ mod tests {
             if let egui::Shape::Circle(cc) = &cs.shape {
                 if cc.center.y > 400.0 && cc.center.x < 500.0 {
                     let c = cc.center;
-                    if knob.map_or(true, |k| c.x < k.x) {
+                    if knob.is_none_or(|k| c.x < k.x) {
                         knob = Some(c);
                     }
                 }
@@ -3251,6 +3251,52 @@ mod tests {
             Some("5") => { frame(vec![]); frame(vec![]); frame(vec![]); frame(vec![]); }
             _ => {}
         }
+        // (4) bell shape: B3 peaking +4.5 dB @ 800 Hz must be ONE smooth
+        // bump centred on its frequency, not spikes at random places (the
+        // curve once evaluated |H| at TAU*f instead of TAU*f/sample_rate
+        // and aliased every bell across the whole axis).
+        {
+            let mut grab = || -> Vec<(f32, f32)> {
+                frame(vec![]);
+                let shapes = frame(vec![]);
+                shapes
+                    .iter()
+                    .filter_map(|cs| match &cs.shape {
+                        egui::Shape::Path(pth) if pth.points.len() > 400 => {
+                            Some(pth.points.iter().map(|p| (p.x, p.y)).collect::<Vec<(f32, f32)>>())
+                        }
+                        _ => None,
+                    })
+                    .max_by_key(|pts| pts.len())
+                    .expect("response curve for bell check")
+            };
+            inst.set_param(0, 0.0); // B1 off: everything else sits at 0 dB gain
+            inst.set_param(10, 0.0); // B3 gain 0 -> the flat reference
+            let flat = grab();
+            inst.set_param(9, 800.0);
+            inst.set_param(10, 4.5);
+            let bell = grab();
+            let n = bell.len().min(flat.len());
+            let dev: Vec<f32> = (0..n).map(|i| flat[i].1 - bell[i].1).collect(); // px above flat
+            let peak = dev.iter().cloned().fold(f32::MIN, f32::max);
+            let pi = dev.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            let fpk = 20.0f32 * 1000.0f32.powf(pi as f32 / (n as f32 - 1.0));
+            assert!(peak > 10.0, "4.5 dB bump must be visible ({} px)", peak);
+            assert!((fpk - 800.0).abs() < 96.0, "bump peak at {} Hz, not 800", fpk);
+            let far = dev
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let f = 20.0f32 * 1000.0f32.powf(i as f32 / (n as f32 - 1.0));
+                    if f < 350.0 || f > 1800.0 {
+                        v.abs()
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(0.0f32, f32::max);
+            assert!(far < peak * 0.35, "spikes outside the band: {} vs peak {}", far, peak);
+        }
         let mut curve_at = |freq: f32| -> Vec<(f32, f32)> {
             inst.set_param(1, freq);
             frame(vec![]);
@@ -3267,7 +3313,9 @@ mod tests {
                 .expect("high-resolution response curve (single path)")
         };
         // A shelf/peak at 0 dB is mathematically FLAT — moving its corner
-        // frequency changes nothing visible. Give B1 real gain first.
+        // frequency changes nothing visible. Give B1 a real, enabled band.
+        inst.set_param(0, 1.0); // low shelf (the bell check above turned it off)
+        inst.set_param(10, 0.0); // and silence B3 again
         inst.set_param(2, 6.0);
         let skip_curve = std::env::var("EQC").is_ok();
         let c1 = if skip_knob || skip_curve { Vec::new() } else { curve_at(80.0) };

@@ -163,7 +163,7 @@ struct SpaceEcho {
     tone_lp: f64,
     tone_c: f64,
     phase: f64, // LFO phase (radians)
-    combs: [Comb; 4],
+    combs: [Comb; 8],
     ap: [Allpass; 4],
     /// comb lengths at sr=44.1 kHz; scaled by sr and by a 0.9..1.1 "room"
     /// spread so the two banks don't share modes.
@@ -174,7 +174,14 @@ struct SpaceEcho {
 }
 
 /// Comb tunings (samples @ 44100) and their spread factors.
-const COMB_TUNE: [(f64, f64); 4] = [(1557.0, 1.0), (1617.0, 0.89), (1491.0, 0.77), (1422.0, 0.65)];
+// Four combs bunched between 1422..1617 samples leave the mode spacing
+// sparse enough for individual modes to ring out after a transient: that is
+// the high-pitched metallic "ping" on snaps/claps, and no damping setting
+// fixes it (low damp passes the ring, high damp only kills the tail). The
+// classic Freeverb eight-comb bank from 1116..1617 samples multiplies the
+// mode density and smears the resonance into a wash; the 0.5 sum below
+// keeps the bank at the old level.
+const COMB_TUNE: [f64; 8] = [1116.0, 1188.0, 1277.0, 1356.0, 1422.0, 1491.0, 1557.0, 1617.0];
 /// All-pass tunings (samples @ 44100).
 const AP_TUNE: [f64; 4] = [225.0, 341.0, 441.0, 556.0];
 
@@ -183,7 +190,7 @@ impl SpaceEcho {
         let sr = if sample_rate.is_finite() && sample_rate > 1.0 { sample_rate } else { 48000.0 };
         let dl_n = (sr * 2.5) as usize + 16; // up to 2.5 s delay
         let scale = sr / 44100.0;
-        let combs = COMB_TUNE.map(|(t, sp)| Comb::new(((t * sp * scale) as usize) + 1));
+        let combs = COMB_TUNE.map(|t| Comb::new(((t * scale) as usize) + 1));
         let ap = AP_TUNE.map(|t| Allpass::new((t * scale) as usize + 1));
         Self {
             sr,
@@ -274,7 +281,7 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     for c in st.combs.iter_mut() {
         sum += c.process(verb_in, decay, damp_c);
     }
-    let mut v = sum;
+    let mut v = sum * 0.5;
     for a in st.ap.iter_mut() {
         v = allpass(a, v, 0.5);
     }
