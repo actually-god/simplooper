@@ -295,17 +295,29 @@ fn cfg_lr(v: &[u8], i: usize) -> u8 {
     *v.get(i).unwrap_or(&3)
 }
 
-/// In-flight two-step calibration for one continuous (knob) MIDI binding.
-/// The first message received defines the axis (control type + channel +
-/// CC number); the user then sweeps to the physical minimum, presses
-/// "Lock min", sweeps to the maximum, and presses Finish. `lo`/`hi` track
+/// In-flight three-step calibration for one continuous (knob) MIDI binding.
+///
+/// Step 1 captures the AXIS — message TYPE + CHANNEL, never the data byte.
+/// While the axis is unlocked every message re-picks it, so moving a
+/// different control changes the knob being bound; **Lock axis** freezes it.
+/// Step 2 then listens on that axis for ANY 0..=127 data value until
+/// **Lock min**, and step 3 listens again until **Finish**. `lo`/`hi` track
 /// the latest value seen on each end so a noisy first touch is not fatal.
+/// `lo > hi` (a control wired backwards) is stored as captured —
+/// `scale_axis` flips it so the translation stays continuous and monotonic.
 struct KnobLearn {
     slot: usize,
+    /// Axis (type + channel); `d1` is the last full id seen, shown for
+    /// orientation ("which physical knob am I looking at?") only.
     bind: MidiBind,
     has_axis: bool,
+    axis_locked: bool,
+    /// Data byte of the most recent message (value/velocity/program), used
+    /// to seed `lo` the moment the axis locks.
+    last_val: Option<u8>,
     lo: u8,
     hi: u8,
+    /// min locked (step 2 done) — collecting the maximum.
     locked: bool,
 }
 
@@ -354,9 +366,6 @@ pub struct App {
     dependent: bool,
     /// Track targeted by the keyboard shortcuts (keys 1–4 select it).
     selected: usize,
-    /// True while a quantize text field has focus; keyboard shortcuts are
-    /// suppressed then. Recomputed each frame in `ui()`.
-    in_text_edit: bool,
     track_state: [u8; MAX_LOOPS],
     track_len: [u32; MAX_LOOPS],
     wave: [Option<WaveCache>; MAX_LOOPS],
@@ -582,7 +591,6 @@ impl App {
             show_settings: false,
             dependent: false,
             selected: 0,
-            in_text_edit: false,
             track_state: [0u8; MAX_LOOPS],
             track_len: [0u32; MAX_LOOPS],
             wave: core::array::from_fn(|_| None),
@@ -662,9 +670,10 @@ impl App {
         self.learning_slot = None;
     }
 
-    /// Start the two-step knob learn for continuous slot `idx`: opens a
-    /// sub-window that walks the user through capturing the axis minimum
-    /// and maximum (see [`knob_learn_window`]).
+    /// Start the three-step knob learn for continuous slot `idx`: opens a
+    /// sub-window that walks the user through locking the axis (type +
+    /// channel), then capturing the raw minimum and maximum (see
+    /// [`knob_learn_window`]).
     pub fn arm_knob_learn(&mut self, idx: usize) {
         self.midi_learning_slot = None;
         self.learning_slot = None;
@@ -672,13 +681,81 @@ impl App {
             slot: idx,
             bind: MidiBind { ty: 0xff, ch: 0, d1: 0 },
             has_axis: false,
+            axis_locked: false,
+            last_val: None,
             lo: 0,
             hi: 127,
             locked: false,
         });
         self.status = format!(
-            "knob learn: {}",
+            "knob learn: {} — move the knob to define its axis",
             MidiAction::ALL[idx].label()
+        );
+    }
+
+    /// Step 1 done: freeze the axis (type + channel) found so far and start
+    /// collecting the minimum. While the axis is unlocked, every message
+    /// re-picks it (moving a different knob changes the binding); after
+    /// Lock axis, messages on other axes are rejected. Restart unlocks it
+    /// again.
+    pub fn knob_lock_axis(&mut self) {
+        if let Some(kl) = self.knob_learn.as_mut() {
+            if !kl.has_axis {
+                return;
+            }
+            kl.axis_locked = true;
+            // Seed the min readout with the value seen at lock time, then
+            // let step 2 follow every message from here on.
+            kl.lo = kl.last_val.unwrap_or(kl.lo);
+            self.status = format!(
+                "axis {} locked — sweep the control to its MINIMUM, then Lock min",
+                kl.bind.axis_label()
+            );
+        }
+    }
+
+    /// Step 2 done: freeze the minimum and start collecting the maximum.
+    pub fn knob_lock_min(&mut self) {
+        if let Some(kl) = self.knob_learn.as_mut() {
+            kl.locked = true;
+            kl.hi = kl.lo;
+            self.status = "sweep the control to its MAXIMUM, then Finish".into();
+        }
+    }
+
+    /// Step 3 done: commit the axis and the raw lo/hi range. lo > hi (an
+    /// inverted control) is stored exactly as captured — `scale_axis` flips
+    /// it so the knob still reads low→high continuously.
+    pub fn knob_finish(&mut self) {
+        let Some(kl) = self.knob_learn.take() else { return };
+        if kl.hi == kl.lo {
+            // Same raw value at both ends: there is nothing to scale against.
+            self.knob_learn = Some(kl);
+            self.status = "finish needs a maximum different from the minimum — sweep the control and Finish again".into();
+            return;
+        }
+        let (slot, lo, hi, bind) = (kl.slot, kl.lo, kl.hi, kl.bind);
+        self.midi_binds[slot] = Some(bind);
+        // 0..=127 is the program's native scale: no factor needed.
+        self.knob_cal[slot] = if lo == 0 && hi == 127 {
+            None
+        } else {
+            Some(MidiAxisCal { slot: slot as u16, lo, hi })
+        };
+        self.save_config();
+        self.status = format!(
+            "bound {} → axis {} (raw {}–{}{})",
+            MidiAction::ALL[slot].label(),
+            bind.axis_label(),
+            lo,
+            hi,
+            if lo > hi {
+                " — INVERTED control: flipped so the knob still reads low→high"
+            } else if lo == 0 && hi == 127 {
+                ""
+            } else {
+                ", rescaled to full range"
+            }
         );
     }
 
@@ -708,13 +785,50 @@ impl App {
     /// midi input and keyboard support"). Every action in MidiAction::ALL has
     /// a rebindable key slot (Settings → MIDI + Keyboard Bindings); keys are
     /// persisted. Press edges are read from the per-frame event list so key
-    /// auto-repeat doesn't re-fire an action, and the keys are ignored while a
-    /// text field has focus.
+    /// auto-repeat doesn't re-fire an action, and the keys are ignored while
+    /// ANY text box has focus.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // Ignore keys while a text field has focus (tracked in `ui()`), so
-        // typing "1" into the quantize fields doesn't switch loops.
-        if self.in_text_edit {
+        // Ignore keys while a text box anywhere in the program has focus —
+        // the egui focus registry, so it covers every TextEdit (quantize
+        // fields, FX preset name, export path, level nudge, …) including
+        // ones added later, instead of a hand-maintained per-widget flag.
+        if ctx.text_edit_focused() {
             return;
+        }
+
+        // The knob wizard is its own learn mode: it does NOT set
+        // `midi_learning_slot` (arm_knob_learn clears it), so it needs its
+        // own key branch. Escape cancels; Delete clears the slot's binding
+        // and calibration — same vocabulary as the key/MIDI cells. All keys
+        // are swallowed so nothing fires behind the wizard.
+        if self.knob_learn.is_some() {
+            let key = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(k) = key {
+                let kl = match k {
+                    egui::Key::Escape => Some(("cancelled knob learn", false)),
+                    egui::Key::Delete => Some(("cleared knob binding", true)),
+                    _ => None,
+                };
+                if let Some((verb, clear)) = kl {
+                    if let Some(kl) = self.knob_learn.take() {
+                        if clear {
+                            self.midi_binds[kl.slot] = None;
+                            if let Some(c) = self.knob_cal.get_mut(kl.slot) {
+                                *c = None;
+                            }
+                            self.save_config();
+                        }
+                        self.status =
+                            format!("{verb}: {}", MidiAction::ALL[kl.slot].label());
+                    }
+                }
+            }
+            return; // swallow all keys while the knob wizard is open
         }
 
         // Learn mode: the next key press becomes the slot's new binding.
@@ -769,18 +883,13 @@ impl App {
                 if k == egui::Key::Escape {
                     self.midi_learning_slot = None;
                 } else if k == egui::Key::Delete {
-                    // A knob-learn in flight takes Delete as "cancel", not
-                    // "clear the old binding".
-                    if let Some(kl) = self.knob_learn.take() {
-                        self.status =
-                            format!("cancelled knob learn: {}", MidiAction::ALL[kl.slot].label());
-                    } else {
-                        self.midi_binds[slot] = None;
-                        self.midi_learning_slot = None;
-                        self.save_config();
-                        self.status =
-                            format!("cleared MIDI binding: {}", MidiAction::ALL[slot].label());
-                    }
+                    // Delete clears this MIDI cell's binding (the knob
+                    // wizard is handled in its own branch above).
+                    self.midi_binds[slot] = None;
+                    self.midi_learning_slot = None;
+                    self.save_config();
+                    self.status =
+                        format!("cleared MIDI binding: {}", MidiAction::ALL[slot].label());
                 }
             }
             return; // swallow all keys while a MIDI cell is listening
@@ -926,6 +1035,9 @@ impl App {
             inst,
             gui,
             self.sample_rate as f64,
+            // The ACTIVE effects folder (not the possibly-unapplied edit
+            // box): that's where `user presets/` lives for these scripts.
+            self.fx_registry.dir().to_path_buf(),
         )));
     }
 
@@ -1122,35 +1234,36 @@ impl App {
                             }
                             self.midi_learning_slot = None;
                         } else if let Some(kl) = self.knob_learn.as_mut() {
-                            // Two-step knob learn in flight. The AXIS is the
-                            // message TYPE + CHANNEL only — the data byte
-                            // (CC value / note velocity) is what steps 2 and
-                            // 3 read, so it must never be part of the axis
-                            // identity. (Matching on the CC number too broke
-                            // controllers that re-use numbers mid-sweep:
-                            // every message after the first was rejected as
-                            // "not the same control", so min and max could
-                            // never move.)
-                            //
-                            // The raw VALUE shown/learned is the message's
-                            // data byte (CC value / note velocity) — NOT
-                            // MidiBind.d1, which is the CC/NOTE NUMBER
-                            // (using it froze both numbers at the first
-                            // message).
+                            // Three-step knob learn in flight (axis → min → max).
+                            // The AXIS is the message TYPE + CHANNEL only — the
+                            // data byte (CC value / note velocity / program
+                            // number) is the VALUE steps 2 and 3 read, and must
+                            // NEVER be part of the axis identity. Binding the
+                            // data byte in step 1 is what locked min and max to
+                            // the same value; matching d1 later rejected every
+                            // sweep message from controllers that re-use
+                            // numbers mid-sweep.
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => Some(*velocity),
+                                MidiMsg::ProgramChange { program, .. } => Some(*program),
                                 _ => None,
                             };
-                            if !kl.has_axis {
+                            if !kl.axis_locked {
+                                // Step 1 — pick the axis. Until it is locked,
+                                // the most recent message wins, so moving a
+                                // different knob (or landing on another
+                                // channel) simply re-selects the axis.
                                 kl.bind = bind;
                                 kl.has_axis = true;
-                                kl.lo = cval.unwrap_or(kl.lo);
+                                if let Some(v) = cval {
+                                    kl.last_val = Some(v);
+                                }
                                 self.status = format!(
-                                    "axis {} — sweep it to MINIMUM (the number follows every message), then Lock min",
+                                    "axis {} — press Lock axis, or move a different control to change it",
                                     kl.bind.axis_label()
                                 );
-                            } else if bind.ty != kl.bind.ty || bind.ch != kl.bind.ch {
+                            } else if !kl.bind.same_axis(&bind) {
                                 self.status = format!(
                                     "knob learn: got {} — min and max must use the \
                                      axis {} (same message type and channel)",
@@ -1169,21 +1282,32 @@ impl App {
                             }
                         } else {
                             // Value for continuous (knob) bindings: the CC
-                            // byte, or note velocity when the note binds.
-                            // The knob wizard may have captured a raw
-                            // min/max other than 0..=127 — rescale through
-                            // the slot's calibration so the control's full
-                            // physical travel maps onto the full program
-                            // range (and inverted wiring is corrected).
+                            // byte, note velocity, or program number. The
+                            // knob wizard may have captured a raw min/max
+                            // other than 0..=127 — rescale through the slot's
+                            // calibration so the control's full physical
+                            // travel maps onto the full program range (and
+                            // inverted wiring is corrected).
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
                                     Some(*velocity)
                                 }
+                                MidiMsg::ProgramChange { program, .. } => Some(*program),
                                 _ => None,
                             };
                             for i in 0..N_ACTIONS {
-                                if self.midi_binds[i] == Some(bind) {
+                                let Some(b) = self.midi_binds[i] else { continue };
+                                // A continuous (knob) binding owns its whole
+                                // axis (type + channel) — the wizard never
+                                // binds the data byte, so CC-number drift
+                                // mid-sweep keeps driving the parameter.
+                                let hit = if MidiAction::ALL[i].is_continuous() {
+                                    b.same_axis(&bind)
+                                } else {
+                                    b == bind
+                                };
+                                if hit {
                                     let a = MidiAction::ALL[i];
                                     let v = cval.map(|r| match self.knob_cal[i] {
                                         Some(c) => scale_axis(r, c.lo, c.hi),
@@ -1360,9 +1484,6 @@ impl eframe::App for App {
             self.save_config();
         }
 
-        // Recomputed by the text-edit widgets below while they have focus.
-        self.in_text_edit = false;
-
         top_bar(ui, self);
         if self.show_settings {
             settings_panel(ui, self);
@@ -1476,8 +1597,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("latency (ms):");
-                    let r = ui.add(egui::TextEdit::singleline(&mut app.latency_ms).desired_width(60.0));
-                    app.in_text_edit = app.in_text_edit || r.has_focus();
+                    ui.add(egui::TextEdit::singleline(&mut app.latency_ms).desired_width(60.0));
                     if ui.button("Apply").clicked() {
                         let ms = app.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0);
                         app.latency_ms = format!("{ms}");
@@ -1634,13 +1754,22 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
         });
     }
 
-/// Two-step knob-learn sub-window (opened by the knob buttons in
-/// `bind_row`). The first MIDI message from the control defines the axis;
-/// the user then sweeps to the minimum and locks it, sweeps to the maximum,
-/// and finishes. The captured raw lo/hi is stored per slot and incoming
-/// values are rescaled with `scale_axis`, so a knob wired to a partial
-/// range (or inverted) still covers the full program travel — including
-/// lo > hi, which inverts the axis.
+/// Three-step knob-learn sub-window (opened by the knob buttons in
+/// `bind_row`).
+///
+/// 1. Move any control: the axis — message TYPE + CHANNEL — is detected.
+///    While it is not locked, moving a different control re-picks it;
+///    **Lock axis** freezes it and advances to step 2.
+/// 2. Listen on that axis for ANY 0..=127 data value; **Lock min** freezes
+///    the raw minimum and advances to step 3.
+/// 3. Listen again for ANY value; **Finish** commits. If the maximum read
+///    lower than the minimum the axis is inverted — `scale_axis` flips the
+///    translation so the knob still maps continuously low\u{2192}high, and
+///    the window says so in plain words.
+///
+/// The raw lo/hi is stored per slot and incoming values are rescaled with
+/// `scale_axis`, so a knob wired to a partial range (or inverted) still
+/// covers the full program travel.
 fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
     if app.knob_learn.is_none() {
         return;
@@ -1650,9 +1779,10 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ui, |ui| {
-            ui.set_width(360.0);
+            ui.set_width(380.0);
             enum Act {
                 None,
+                LockAxis,
                 LockMin,
                 Finish,
                 Cancel,
@@ -1663,79 +1793,107 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                 let kl = app.knob_learn.as_ref().unwrap();
                 let action = MidiAction::ALL[kl.slot].label();
                 ui.label(RichText::new(format!("Bind knob: {action}")).strong());
-                ui.label(
-                    RichText::new(
-                        "The axis is the message TYPE + CHANNEL: any message of that kind \
-                         counts, and its data byte is the value shown. Move one physical \
-                         knob all the way down — the number follows every message — Lock \
-                         min, sweep to the top, Finish.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                ui.add_space(6.0);
                 let axis = kl.bind.axis_label();
-                let ctrl = kl.bind.label();
                 if !kl.has_axis {
-                    ui.label("1. Move your knob / slider to pick the axis (type + channel).");
-                    ui.label(RichText::new("waiting for the control's first message…").weak().italics());
-                } else {
-                    ui.label(RichText::new(format!("axis: {axis}")).monospace());
-                    ui.label(RichText::new(format!("bound control: {ctrl}")).weak().small());
+                    ui.label("1. Move the knob or slider you want to bind.");
+                    ui.label(
+                        RichText::new(
+                            "The axis is the message TYPE + CHANNEL; its data byte (0-127) \
+                             is the value that gets learned. Waiting for the control's \
+                             first message\u{2026}",
+                        )
+                        .weak()
+                        .small()
+                        .italics(),
+                    );
+                } else if !kl.axis_locked {
+                    ui.label(RichText::new(format!("1. Axis found: {axis}")).strong());
+                    ui.label(
+                        RichText::new(format!("last message seen: {}", kl.bind.label()))
+                            .monospace()
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Wrong knob? Just move another one \u{2014} the axis follows the \
+                             most recent control until you lock it. Lock the axis when it \
+                             shows the type + channel you want.",
+                        )
+                        .weak()
+                        .small(),
+                    );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        if ui.button("Lock axis").clicked() {
+                            act = Act::LockAxis;
+                        }
+                        ui.label(
+                            RichText::new("\u{2192} then capture the minimum")
+                                .weak()
+                                .small(),
+                        );
+                    });
+                } else if !kl.locked {
+                    ui.label(RichText::new(format!("2. Axis locked: {axis}")).strong());
+                    ui.horizontal(|ui| {
                         ui.label(format!("minimum raw value: {}", kl.lo));
-                        if !kl.locked {
-                            if ui.button("Lock min").clicked() {
-                                act = Act::LockMin;
-                            } else {
-                                act = Act::None;
-                            }
-                        } else {
-                            ui.label(RichText::new("(locked)").weak().small());
-                            act = Act::None;
+                        if ui.button("Lock min").clicked() {
+                            act = Act::LockMin;
                         }
                     });
-                    if kl.locked {
-                        ui.label("3. Move the control to its MAXIMUM position, then Finish.");
-                        ui.horizontal(|ui| {
-                            ui.label(format!("maximum raw value: {}", kl.hi));
-                            let ok = kl.hi != kl.lo;
-                            let fin = ui.add_enabled(ok, egui::Button::new("Finish"));
-                            if fin.clicked() {
-                                act = Act::Finish;
-                            }
-                        });
-                    } else {
-                        ui.label(
-                            RichText::new(
-                                "2. The number above follows every message the control sends — \
-                                 keep sweeping it, then press Lock min at its lowest position.",
-                            )
+                    ui.label(
+                        RichText::new(
+                            "Move the control to its LOWEST position \u{2014} the number \
+                             follows every message on this axis (any 0-127 value) \u{2014} \
+                             then Lock min.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    ui.label(RichText::new(format!("3. Axis locked: {axis}")).strong());
+                    ui.label(
+                        RichText::new(format!("minimum raw value: {} (locked)", kl.lo))
                             .weak()
                             .small(),
-                        );
-                    }
-                }
-                if matches!(act, Act::None) {
-                    ui.add_space(6.0);
+                    );
                     ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            act = Act::Cancel;
-                        }
-                        if kl.has_axis && ui.button("Restart").clicked() {
-                            act = Act::Restart;
+                        ui.label(format!("maximum raw value: {}", kl.hi));
+                        let ok = kl.hi != kl.lo;
+                        let fin = ui
+                            .add_enabled(ok, egui::Button::new("Finish"))
+                            .on_hover_text("needs a maximum different from the minimum");
+                        if fin.clicked() {
+                            act = Act::Finish;
                         }
                     });
+                    let hint = if kl.lo > kl.hi {
+                        format!(
+                            "Min {} > max {}: this control is INVERTED. Finish flips the \
+                             translation so turning the knob still sweeps low\u{2192}high \
+                             across the full range.",
+                            kl.lo, kl.hi
+                        )
+                    } else {
+                        "Move the control to its HIGHEST position, then Finish.".to_string()
+                    };
+                    ui.label(RichText::new(hint).weak().small());
                 }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        act = Act::Cancel;
+                    }
+                    if kl.has_axis && ui.button("Restart").clicked() {
+                        act = Act::Restart;
+                    }
+                });
             }
             match act {
                 Act::None => {}
-                Act::LockMin => {
-                    let kl = app.knob_learn.as_mut().unwrap();
-                    kl.locked = true;
-                    kl.hi = kl.lo;
-                }
+                Act::LockAxis => app.knob_lock_axis(),
+                Act::LockMin => app.knob_lock_min(),
+                Act::Finish => app.knob_finish(),
                 Act::Cancel => {
                     let kl = app.knob_learn.take().unwrap();
                     app.status =
@@ -1747,33 +1905,15 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                         slot,
                         bind: MidiBind { ty: 0xff, ch: 0, d1: 0 },
                         has_axis: false,
+                        axis_locked: false,
+                        last_val: None,
                         lo: 0,
                         hi: 127,
                         locked: false,
                     });
-                }
-                Act::Finish => {
-                    let kl = app.knob_learn.take().unwrap();
-                    let (slot, lo, hi, bind) = (kl.slot, kl.lo, kl.hi, kl.bind);
-                    app.midi_binds[slot] = Some(bind);
-                    // 0..=127 is the program's native scale: no factor needed.
-                    app.knob_cal[slot] = if lo == 0 && hi == 127 {
-                        None
-                    } else {
-                        Some(MidiAxisCal { slot: slot as u16, lo, hi })
-                    };
-                    app.save_config();
                     app.status = format!(
-                        "bound {} → {} (raw {}–{}{})",
-                        MidiAction::ALL[slot].label(),
-                        bind.label(),
-                        lo,
-                        hi,
-                        if lo == 0 && hi == 127 {
-                            ""
-                        } else {
-                            ", rescaled to full range"
-                        }
+                        "knob learn restarted: {} \u{2014} move the knob",
+                        MidiAction::ALL[slot].label()
                     );
                 }
             }
@@ -1805,6 +1945,12 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
             "listening…".to_string()
         } else {
             match app.midi_binds[idx] {
+                // A knob binding owns its AXIS (type + channel) — the data
+                // byte is never part of it, so show the axis, not a CC id.
+                Some(b) if knob => match app.knob_cal.get(idx).copied().flatten() {
+                    Some(c) => format!("{}  [{}/{}]", b.axis_label(), c.lo, c.hi),
+                    None => b.axis_label(),
+                },
                 Some(b) => match app.knob_cal.get(idx).copied().flatten() {
                     // Show the captured raw range next to the axis id.
                     Some(c) => format!("{}  [{}/{}]", b.label(), c.lo, c.hi),
@@ -1820,7 +1966,8 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
         let hover = if knob {
             "Click to open the knob wizard: move the control to its minimum, \
              lock it, move to the maximum, finish. Captures the full travel of \
-             the knob (min and max must be on the same MIDI channel)."
+             the knob (min and max must be on the same MIDI channel). \
+             Esc cancels; Delete clears the binding and its calibration."
         } else {
             "Click to listen: the next NOTE ON / CC / PROGRAM CHANGE \
              from your controller becomes this binding. Click again (or Esc) \
@@ -1893,8 +2040,7 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
             ui.add_space(6.0);
             ui.label("Destination:");
             ui.horizontal(|ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut app.export_path).desired_width(290.0));
-                app.in_text_edit = app.in_text_edit || r.has_focus();
+                ui.add(egui::TextEdit::singleline(&mut app.export_path).desired_width(290.0));
                 if ui.button("Browse…").clicked() {
                     // No extension here — the Format dropdown adds it at
                     // export time (see `do_export`), so changing the format
@@ -1953,9 +2099,7 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
         .show(ui, |ui| {
             ui.label("Effects location:");
             ui.horizontal(|ui| {
-                let r = ui
-                    .add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
-                app.in_text_edit = app.in_text_edit || r.has_focus();
+                ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
                 if ui.button("Browse…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().set_title("Effects folder").pick_folder()
                     {
@@ -2141,20 +2285,26 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("loop mode:").strong());
-            let dep = ui.checkbox(&mut app.dependent, "dependent").on_hover_text(
-                "Dependent looping: the longest loop is the master — every other loop \
-                 wraps on top of it, and the whole ensemble restarts together when the \
-                 longest one ends.\n\nUse only with properly quantized loops (Easy \
-                 Quantize, above), or you will hear skips at the loop points.",
+            // The selector is the INDEPENDENT switch: ticked = every loop
+            // runs on its own clock (unchecked = dependent). Only the
+            // polarity flipped — the dependent logic behind it is unchanged.
+            let mut indep = !app.dependent;
+            let dep = ui.checkbox(&mut indep, "independent").on_hover_text(
+                "Independent looping (tick = on): every loop plays on its own clock, \
+                 like sixteen standalone loopers.\n\nUntick for DEPENDENT looping: the \
+                 longest loop is the master — every other loop wraps on top of it, and \
+                 the whole ensemble restarts together when the longest one ends.\n\n\
+                 Use dependent mode only with properly quantized loops (Easy Quantize, \
+                 above), or you will hear skips at the loop points.",
             );
             if dep.changed() {
+                app.dependent = !indep;
                 app.backend.cmd(Cmd::SetDependent(app.dependent));
             }
             // Ensemble length: how many times the longest loop repeats before
             // everything restarts together.
             ui.label(RichText::new("root loops:").weak());
             let r_root = ui.add(egui::TextEdit::singleline(&mut app.q_root).desired_width(40.0));
-            app.in_text_edit = app.in_text_edit || r_root.has_focus();
             if r_root.changed() {
                 if let Ok(n) = app.q_root.trim().parse::<u32>() {
                     let n = n.clamp(1, 64);
@@ -2212,10 +2362,9 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                     );
                     ui.separator();
                     ui.label("time sig.");
-                    let r_num = ui.add(egui::TextEdit::singleline(&mut app.q_num).desired_width(40.0));
+                    ui.add(egui::TextEdit::singleline(&mut app.q_num).desired_width(40.0));
                     ui.label("/");
-                    let r_den = ui.add(egui::TextEdit::singleline(&mut app.q_den).desired_width(40.0));
-                    app.in_text_edit = app.in_text_edit || (r_num.has_focus() || r_den.has_focus());
+                    ui.add(egui::TextEdit::singleline(&mut app.q_den).desired_width(40.0));
                     ui.label("bars in loop");
                     egui::ComboBox::from_id_salt("q_root_loop")
                         .selected_text(format!("{}", app.q_root_loop + 1))
@@ -2225,8 +2374,7 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                             }
                         });
                     ui.label(":");
-                    let r_bars = ui.add(egui::TextEdit::singleline(&mut app.q_bars).desired_width(60.0));
-                    app.in_text_edit = app.in_text_edit || r_bars.has_focus();
+                    ui.add(egui::TextEdit::singleline(&mut app.q_bars).desired_width(60.0));
                     ui.label("quantize to:");
                     ui.radio_value(&mut app.q_unit_is_bar, false, "beat");
                     ui.radio_value(&mut app.q_unit_is_bar, true, "bar");
@@ -2296,13 +2444,11 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                     ui.separator();
                     ui.label("tempo");
                     let r_bpm = ui.add(egui::TextEdit::singleline(&mut app.metro_bpm).desired_width(50.0));
-                    app.in_text_edit = app.in_text_edit || r_bpm.has_focus();
                     if r_bpm.changed() && app.metro_bpm.trim().parse::<u32>().is_ok() {
                         app.send_metro();
                     }
                     ui.label("BPM · beats/measure");
                     let r_num = ui.add(egui::TextEdit::singleline(&mut app.metro_num).desired_width(30.0));
-                    app.in_text_edit = app.in_text_edit || r_num.has_focus();
                     if r_num.changed() && app.metro_num.trim().parse::<u32>().is_ok() {
                         app.send_metro();
                     }
@@ -2576,7 +2722,6 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                     .selectable(false),
             );
         }
-        app.in_text_edit = app.in_text_edit || rt.has_focus();
         if rt.has_focus() {
             app.lv_edit.insert(key, txt.clone());
         } else {
@@ -3469,6 +3614,137 @@ mod tests {
     }
 
     #[test]
+    fn eq_strip_checkboxes_sit_on_their_button_rows() {
+        // Headless regression for the "checkboxes overlap and are
+        // misaligned" report: `Ui::put` with a ZERO-sized rect CENTRES the
+        // checkbox on its anchor, so the box straddled the neighbour
+        // button and floated above the row centre. The strip contract is a
+        // TOP-LEFT anchor in a 20 px row band (see `fxgui::tr_checkbox`):
+        // every painted checkbox box must be vertically centred on the
+        // button row it belongs to, intersect NO button rect, and the
+        // drawn box must be clickable.
+        if !fx::rustc_available() {
+            return;
+        }
+        let mut app = test_app("eqchecks");
+        let dir = std::env::temp_dir().join(format!("simplooper-eqchecks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fx::API_FILE), fx::API_SRC).unwrap();
+        std::fs::write(dir.join(fx::TEMPLATE_FILE), fx::TEMPLATE_SRC).unwrap();
+        for (name, src) in fx::EXAMPLES {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        app.fx_dir_edit = dir.display().to_string();
+        app.apply_fx_dir();
+        app.fx_entries[0].iter_mut().for_each(|e| e.enabled = false);
+        let k = app.fx_entries[0].iter().position(|e| e.stem == "parametric_eq").unwrap();
+        app.fx_entries[0][k].enabled = true;
+        app.rebuild_fx(0);
+        app.open_fx_editor(0, 0);
+        let inst = app.fx_editor.as_ref().unwrap().inst.clone();
+        let ctx = egui::Context::default();
+        let mut t = 0.0f64;
+        let mut frame = |evs: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
+            let mut ri = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1920.0, 1080.0),
+                )),
+                time: Some({
+                    t += 0.1;
+                    t
+                }),
+                ..Default::default()
+            };
+            ri.events = evs;
+            let app: &mut App = unsafe { &mut *(&mut app as *mut App) };
+            let mut out = ctx.run_ui(ri, |c| {
+                app.fx_editor_window(c);
+            });
+            let shapes = out.shapes.clone();
+            ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            out.textures_delta.clear();
+            shapes
+        };
+        frame(vec![]);
+        let shapes = frame(vec![]);
+
+        // Checkbox boxes are the only ~14-16 px squares painted (band
+        // handles are 8 px, buttons 20 px tall).
+        let mut boxes: Vec<egui::Rect> = shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Rect(rr)
+                    if rr.rect.width() > 12.0
+                        && rr.rect.width() < 18.0
+                        && rr.rect.height() > 12.0
+                        && rr.rect.height() < 18.0 =>
+                {
+                    Some(rr.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        boxes.sort_by(|a, b| a.center().y.total_cmp(&b.center().y));
+        assert_eq!(boxes.len(), 2, "two strip checkboxes painted (spectrum + on)");
+
+        // The control strip buttons are 20 px tall.
+        let rows: Vec<egui::Rect> = shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Rect(rr) if (rr.rect.height() - 20.0).abs() < 0.6 => Some(rr.rect),
+                _ => None,
+            })
+            .collect();
+        assert!(rows.len() >= 8, "strip buttons painted as 20 px rows");
+        for b in &boxes {
+            let off = rows
+                .iter()
+                .map(|r| (r.center().y - b.center().y).abs())
+                .fold(f32::MAX, f32::min);
+            assert!(
+                off < 2.0,
+                "checkbox box {b:?} not centred on a button row (off {off:.1} px)"
+            );
+            for r in &rows {
+                assert!(
+                    (*b).intersect(*r).is_negative(),
+                    "checkbox {b:?} overlaps button {r:?} — anchor/width math regressed"
+                );
+            }
+        }
+
+        // The lower box is the "on" checkbox of the selected band (B1,
+        // default type = low shelf): a click AT THE PAINTED BOX must toggle
+        // the band type (shelf -> off -> peaking), proving hit and paint
+        // agree.
+        let on_box = boxes[1].center();
+        let mv = egui::Event::PointerMoved;
+        let down = |p: egui::Pos2| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let up = |p: egui::Pos2| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        assert_eq!(inst.param(0), 1.0, "B1 starts as a shelf (checked)");
+        frame(vec![mv(on_box)]);
+        frame(vec![down(on_box)]);
+        frame(vec![up(on_box)]);
+        assert_eq!(inst.param(0), 0.0, "clicking the painted box unchecks the band");
+        frame(vec![down(on_box)]);
+        frame(vec![up(on_box)]);
+        assert_eq!(inst.param(0), 3.0, "second click re-enables as peaking");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
 
     fn delete_clears_midi_binding_while_listening() {
         let mut app = test_app("midi-del");
@@ -3478,6 +3754,30 @@ mod tests {
         ctx.input_mut(|i| i.events.push(key_event(egui::Key::Delete)));
         app.handle_shortcuts(&ctx);
         assert_eq!(app.midi_binds[0], None, "Delete must clear the MIDI binding");
+        assert_eq!(app.midi_learning_slot, None, "and end the listening state");
+    }
+
+    #[test]
+    fn delete_clears_knob_binding_and_calibration() {
+        // The knob cell is "listening" while its wizard is open. Delete must
+        // clear the binding AND its min/max calibration there too — not just
+        // close the window (that was "cancel", which Escape still does).
+        let mut app = test_app("knob-del");
+        let slot = MidiAction::idx(MidiAction::VolLoop(0));
+        app.midi_binds[slot] = Some(crate::midi::MidiBind { ty: 1, ch: 1, d1: 7 });
+        app.knob_cal[slot] =
+            Some(crate::config::MidiAxisCal { slot: slot as u16, lo: 8, hi: 42 });
+        app.arm_knob_learn(slot);
+        assert!(app.knob_learn.is_some());
+        assert_eq!(app.midi_learning_slot, None, "the wizard owns no MIDI cell");
+        let ctx = egui::Context::default();
+        ctx.input_mut(|i| i.events.push(key_event(egui::Key::Delete)));
+        // Delete is only seen while the bindings window context runs the
+        // global handler, same as the MIDI test above.
+        app.handle_shortcuts(&ctx);
+        assert_eq!(app.midi_binds[slot], None, "Delete must clear the knob binding");
+        assert_eq!(app.knob_cal[slot], None, "and the min/max calibration");
+        assert!(app.knob_learn.is_none(), "and close the wizard");
         assert_eq!(app.midi_learning_slot, None, "and end the listening state");
     }
 
@@ -3526,61 +3826,95 @@ mod tests {
     }
 
     #[test]
-    fn knob_learn_numbers_follow_every_message_until_locked() {
-        // The learn window's min/max readouts must track the LATEST value
-        // the control sends, not freeze after the first message (the bug:
-        // MidiBind.d1 — the CC number, constant across a sweep — was stored
-        // as the raw min/max, so both numbers never moved and Finish could
-        // never fire). "Lock min" freezes the minimum; the maximum then
-        // listens until Finish.
+    fn knob_learn_locks_axis_then_follows_every_message() {
+        // Three-step wizard: step 1 captures the AXIS — message TYPE +
+        // CHANNEL, never the data byte — and Lock axis freezes it; steps 2
+        // and 3 then follow the LATEST value on that axis (any 0..=127 data
+        // byte) until Lock min / Finish. (The old bug: step 1 stored the
+        // first MidiBind.d1 — the CC number, constant across a sweep — as
+        // the binding AND read both ends off it, so min and max locked to
+        // the same value and Finish could never fire.)
         let mut app = test_app("knob-learn");
         let slot = MidiAction::idx(MidiAction::VolLoop(0));
         assert!(MidiAction::VolLoop(0).is_continuous());
         app.arm_knob_learn(slot);
-        fn cc(app: &mut App, ch: u8, v: u8) {
-            app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | ch, 7, v] }))
+        fn cc(app: &mut App, ch: u8, num: u8, v: u8) {
+            app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | ch, num, v] }))
         }
-        cc(&mut app, 1, 90);
+        // Step 1: the first message picks the axis — the axis only.
+        cc(&mut app, 1, 7, 90);
         {
-            let kl = app.knob_learn.as_ref().expect("axis armed");
-            assert!(kl.has_axis);
-            assert_eq!(kl.lo, 90, "first message seeds the readout");
-            assert_eq!(kl.bind.d1, 7, "axis identity is the CC number");
+            let kl = app.knob_learn.as_ref().expect("wizard open");
+            assert!(kl.has_axis && !kl.axis_locked, "axis detected, not yet locked");
+            assert_eq!(kl.bind, MidiBind { ty: 1, ch: 1, d1: 7 });
         }
+        // While unlocked, moving a different control re-picks the axis...
+        cc(&mut app, 2, 7, 10);
+        assert_eq!(app.knob_learn.as_ref().unwrap().bind.ch, 2, "axis follows the newest control");
+        // ...but another CC number on the same type + channel is the SAME axis.
+        cc(&mut app, 1, 71, 90);
+        let kl = app.knob_learn.as_ref().unwrap();
+        assert_eq!(kl.bind.ch, 1);
+        assert!(kl.bind.same_axis(&MidiBind { ty: 1, ch: 1, d1: 7 }));
+        // Lock axis: freezes the axis and seeds the min readout.
+        app.knob_lock_axis();
+        {
+            let kl = app.knob_learn.as_ref().unwrap();
+            assert!(kl.axis_locked);
+            assert_eq!(kl.lo, 90, "lock seeds the min readout from the last value");
+        }
+        // Step 2: the min follows every message until Lock min.
         for v in [40u8, 12, 30, 8] {
-            cc(&mut app, 1, v);
+            cc(&mut app, 1, 7, v);
             assert_eq!(app.knob_learn.as_ref().unwrap().lo, v, "min must follow every message");
         }
-        // "Lock min" at the lowest position: freezes lo, seeds hi.
-        {
-            let kl = app.knob_learn.as_mut().unwrap();
-            kl.locked = true;
-            kl.hi = kl.lo;
-        }
+        app.knob_lock_min();
+        // Step 3: the max follows every message; the min stays frozen.
         for v in [20u8, 70, 111, 127] {
-            cc(&mut app, 1, v);
+            cc(&mut app, 1, 7, v);
             let kl = app.knob_learn.as_ref().unwrap();
             assert_eq!(kl.hi, v, "max must follow every message after the lock");
             assert_eq!(kl.lo, 8, "locked min must not move");
         }
-        // A message from a DIFFERENT channel is off-axis: rejected, must
-        // not contaminate either end.
-        cc(&mut app, 2, 55);
+        // Off-axis (other channel) is rejected and contaminates neither end.
+        cc(&mut app, 2, 7, 55);
         {
             let kl = app.knob_learn.as_ref().unwrap();
             assert_eq!(kl.hi, 127, "off-axis message rejected");
             assert_eq!(kl.lo, 8, "off-axis message rejected");
         }
-        // The axis is TYPE + CHANNEL only: a message on the same channel
-        // with a DIFFERENT CC number still moves the readouts (controllers
-        // that re-use numbers mid-sweep must not be rejected — the old
-        // code compared d1 and froze both numbers at the first message).
-        app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | 1, 71, 42] }));
+        // Same axis, different CC number mid-sweep: still counts (controllers
+        // that re-use numbers must not be rejected).
+        cc(&mut app, 1, 71, 42);
         assert_eq!(app.knob_learn.as_ref().unwrap().hi, 42, "same channel, any CC number counts");
-        app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | 1, 7, 200] }));
-        assert_eq!(app.knob_learn.as_ref().unwrap().hi, 200);
-        // The finished binding targets the control seen first.
-        assert_eq!(app.knob_learn.as_ref().unwrap().bind.d1, 7);
+        // Finish commits the AXIS — the data byte is never part of it —
+        // plus the raw 8..=42 travel, rescaled at dispatch.
+        app.knob_finish();
+        assert!(app.knob_learn.is_none(), "finish closes the wizard");
+        assert_eq!(app.midi_bind_at(slot), Some(MidiBind { ty: 1, ch: 1, d1: 71 }));
+        let cal = app.knob_cal[slot].expect("partial travel gets a calibration");
+        assert_eq!((cal.lo, cal.hi), (8, 42));
+        // Dispatch drives the parameter through the calibration on ANY CC
+        // number of that axis: raw 8 -> silence, raw 42 -> full.
+        cc(&mut app, 1, 7, 8);
+        assert_eq!(app.trk_vol[0], 0, "raw minimum maps to program minimum");
+        cc(&mut app, 1, 9, 42);
+        assert_eq!(app.trk_vol[0], 127, "raw maximum maps to program maximum");
+        // An inverted capture (min read HIGHER than max) finishes too and
+        // flips: raw 120 -> 0, raw 10 -> 127.
+        let slot2 = MidiAction::idx(MidiAction::PanLoop(3));
+        app.arm_knob_learn(slot2);
+        cc(&mut app, 5, 3, 120);
+        app.knob_lock_axis();
+        app.knob_lock_min();
+        cc(&mut app, 5, 3, 10);
+        app.knob_finish();
+        assert!(app.knob_learn.is_none(), "inverted range is a valid finish");
+        assert_eq!(app.knob_cal[slot2].map(|c| (c.lo, c.hi)), Some((120, 10)));
+        cc(&mut app, 5, 3, 120);
+        assert_eq!(app.trk_pan[3], 0, "inverted raw min maps to 0");
+        cc(&mut app, 5, 3, 10);
+        assert_eq!(app.trk_pan[3], 127, "inverted raw max maps to 127");
     }
 
     #[test]

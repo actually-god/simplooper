@@ -39,7 +39,7 @@ import/export, and runtime-compiled per-loop effects.
   persisted between sessions and automatically re-applied when JACK comes up,
   so audio flows on launch without re-selecting.
 - **MIDI binding** — every action (loop select, record/overdub/clear/play-stop
-  on the selected loop, direct per-loop controls, dependent toggle) can be
+  on the selected loop, direct per-loop controls, loop-mode toggle) can be
   bound to a live-captured Note On/Off, CC, or Program Change (channel +
   note/controller/program). Bindings are recorded by clicking the cell and
   sending a message; velocity/CC value is ignored so pedals and knobs fire
@@ -52,12 +52,14 @@ import/export, and runtime-compiled per-loop effects.
   highlighted); `space` play/stop, `R` record, `O` overdub, `C` clear act on
   the selected loop; `D` toggles dependent mode; `M` toggles the metronome;
   `U`/`Y` undo/redo the last overdub. Every shortcut can be reassigned in
-  Settings. Keys are ignored while a text field has focus, and key auto-repeat
-  never re-fires an action.
-- **Loop modes** — a checkbox in the dashboard switches between:
-  - *independent*: each track plays on its own clock (sixteen independent
-    players);
-  - *dependent*: the longest track defines the master; shorter tracks wrap on
+  Settings. Keys are ignored while you type in **any** text box anywhere in
+  the program, and key auto-repeat never re-fires an action.
+- **Loop modes** — the **independent** checkbox in the dashboard switches
+  between:
+  - *independent* (ticked, default): each track plays on its own clock
+    (sixteen independent players);
+  - *dependent* (unticked): the longest track defines the master; shorter
+    tracks wrap on
     top of it (modulo tiling), and the ensemble clock wraps after a settable
     number of "root loops" (set in the main window, default 1) — the ensemble
     loops forever, never stopping in the middle. A tooltip warns to quantize
@@ -153,7 +155,7 @@ Full walkthrough in [docs/USAGE.md](docs/USAGE.md). The short version:
 3. On each track row: **REC** captures a fresh loop (auto-stops at ~60 s and
    starts playing), **OD** overdubs live input onto the existing loop,
    **PLAY** toggles playback, **CLEAR** zeros the buffer.
-4. Tick **dependent** to lock all tracks to one ensemble clock (see
+4. Untick **independent** to lock all tracks to one ensemble clock (see
    *Loop modes* above).
 
 ### Effects
@@ -194,10 +196,11 @@ are compiled with `rustc --edition 2021 --crate-type cdylib` — so **rustc
 must be installed** to use custom effects; a missing compiler just lists
 scripts with a hint. Working examples in the repo: `effects/parametric_eq.rs`
 (6-band EQ with response curve + 240-band live spectrum, draggable band
-handles and B1 lowpass / B6 highpass quick toggles in its own window) and
+handles on a logarithmic dB axis (−∞ at the bottom edge, +6 dB ceiling),
+B1 lowpass / B6 highpass quick toggles, and its own window) and
 `effects/space_echo.rs` (**Echo + Reverb**: animated echo window, independent
-echo/reverb levels, factory presets — plain echo, practice hall, auditorium,
-opera house, cathedral).
+echo/reverb levels, a **tone** knob voicing the whole wet path, factory
+presets — plain echo, practice hall, auditorium, opera house, cathedral).
 
 ### MIDI binding
 
@@ -235,8 +238,9 @@ selected one:
 
 Every key in the table can be reassigned in settings → **MIDI bindings**
 (click the key cell, press the new key; `Del` while a cell listens clears that
-binding, so `Del` itself is never bindable). The keys are ignored while a text
-field has focus, so you can type numbers without switching loops.
+binding, so `Del` itself is never bindable). The keys are ignored while you
+type in any text box anywhere in the program, so numbers never switch loops
+behind your back.
 
 ### Easy quantize
 

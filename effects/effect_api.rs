@@ -268,7 +268,10 @@ pub struct GuiApiV1 {
         ctx: *mut core::ffi::c_void,
         x: f32, y: f32, w: f32, label: *const core::ffi::c_char,
     ) -> u32,
-    /// Checkbox at (x, y); `on` != 0 draws checked, toggled writes 0/1.
+    /// Checkbox at (x, y) — TOP-LEFT anchor like `button`: the box starts
+    /// at x and the widget is centred inside a 20 px row band starting at
+    /// y, so it lines up with buttons placed at the same y. `on` != 0
+    /// draws checked, toggled writes 0/1.
     pub checkbox: extern "C" fn(
         ctx: *mut core::ffi::c_void,
         x: f32, y: f32, label: *const core::ffi::c_char, on: *mut f32,

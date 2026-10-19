@@ -1,6 +1,6 @@
 [package]
 name = "simplooper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Minimalist live audio looper for JACK/PipeWire (Rust, eframe)"
 license = "MIT"

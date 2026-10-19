@@ -245,6 +245,15 @@ impl MidiBind {
         }
     }
 
+    /// True when two bindings sit on the same AXIS: message TYPE + CHANNEL.
+    /// A continuous (knob) binding owns its whole axis — it deliberately
+    /// does NOT bind the data byte, so a controller whose CC number changes
+    /// mid-sweep still drives it, and the min/max wizard can learn "any
+    /// 0..=127 value" without freezing on the first message it saw.
+    pub fn same_axis(&self, o: &MidiBind) -> bool {
+        self.ty == o.ty && self.ch == o.ch
+    }
+
     /// Axis name for the knob learner: message TYPE + CHANNEL only. The
     /// data byte (CC number for normal knobs, velocity for notes) is the
     /// VALUE the learner reads — never part of the axis identity, so a

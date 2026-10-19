@@ -126,7 +126,201 @@ pub fn prepare_effects_dir(cfg_dir: Option<&str>) -> PathBuf {
         _ => default_effects_dir(),
     };
     seed_api(&dir);
+    // The user-preset folder lives beside the scripts and is (re)created at
+    // every launch — plugins find it ready-made the first time they save.
+    let _ = ensure_user_presets_dir(&dir);
     dir
+}
+
+// ---------------------------------------------------------------------------
+// User presets
+// ---------------------------------------------------------------------------
+//
+// Users save the current settings of any effect as a named preset. Files
+// live in `<effects>/user presets/` and are named
+// `{plugin stem}-{preset name}.json` — the stem prefix is the ownership
+// marker: a plugin lists and reads ONLY files starting with its own
+// `{stem}-`, so one folder serves every effect. Content is flat JSON:
+// `{"plugin": stem, "name": preset, "params": {"label": value, …}}`.
+
+/// Folder name (fixed by convention) inside the effects location.
+pub const USER_PRESET_DIR: &str = "user presets";
+
+pub fn user_presets_dir(fx_dir: &Path) -> PathBuf {
+    fx_dir.join(USER_PRESET_DIR)
+}
+
+/// Create the user-preset folder if missing and return its path.
+pub fn ensure_user_presets_dir(fx_dir: &Path) -> std::io::Result<PathBuf> {
+    let d = user_presets_dir(fx_dir);
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+
+/// Filesystem-safe preset name: keep letters/digits/space/dot/dash/underscore
+/// (UTF-8 aware so accented names survive), collapse runs of rejected chars
+/// to a single dash, trim. Empty result becomes "preset".
+pub fn sanitize_preset_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in raw.trim().chars() {
+        if ch.is_alphanumeric() || ch == ' ' || ch == '.' || ch == '_' {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    while out.ends_with(' ') || out.ends_with('-') || out.ends_with('.') {
+        out.pop();
+    }
+    // No hidden files, no confusion with relative paths: a preset name never
+    // starts with a dot or a separator.
+    while out.starts_with(' ') || out.starts_with('-') || out.starts_with('.') {
+        out.remove(0);
+    }
+    if out.is_empty() {
+        out.push_str("preset");
+    }
+    out
+}
+
+/// The preset file for (stem, name) — exact round-trip of `list_user_presets`.
+pub fn user_preset_path(fx_dir: &Path, stem: &str, name: &str) -> PathBuf {
+    user_presets_dir(fx_dir).join(format!("{stem}-{}.json", sanitize_preset_name(name)))
+}
+
+/// Preset names owned by `stem`, sorted. Only `{stem}-{name}.json` files.
+pub fn list_user_presets(fx_dir: &Path, stem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let prefix = format!("{stem}-");
+    if let Ok(rd) = std::fs::read_dir(user_presets_dir(fx_dir)) {
+        for e in rd.flatten() {
+            let Some(n) = e.file_name().to_str().map(str::to_string) else { continue };
+            if let Some(rest) = n.strip_prefix(&prefix) {
+                if let Some(name) = rest.strip_suffix(".json") {
+                    if !name.is_empty() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Delete a preset. Missing file counts as success (idempotent).
+pub fn delete_user_preset(fx_dir: &Path, stem: &str, name: &str) -> Result<(), String> {
+    let p = user_preset_path(fx_dir, stem, name);
+    match std::fs::remove_file(&p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not delete preset: {e}")),
+    }
+}
+
+/// Minimal flat JSON writer for a preset. Labels come from effect metadata;
+/// still escape the mandatory characters, and reject non-finite values —
+/// JSON has no NaN and a poisoned file would load garbage later.
+pub fn preset_to_json(stem: &str, name: &str, params: &[(String, f32)]) -> Result<String, String> {
+    let mut s = format!(
+        "{{\n  \"plugin\": \"{}\",\n  \"name\": \"{}\",\n  \"params\": {{\n",
+        json_escape(stem),
+        json_escape(name)
+    );
+    for (i, (label, v)) in params.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(format!("parameter '{label}' is not a number"));
+        }
+        s.push_str(&format!(
+            "    \"{}\": {}{}",
+            json_escape(label),
+            f64::from(*v),
+            if i + 1 < params.len() { "," } else { "" }
+        ));
+        s.push('\n');
+    }
+    s.push_str("  }\n}\n");
+    Ok(s)
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pull every `"label": number` pair out of a preset file. Deliberately
+/// lenient (string values like "plugin"/"name" simply don't parse as
+/// numbers and are skipped): a hand-tweaked preset should still load its
+/// numbers. Garbage that yields no pairs at all is still an error.
+pub fn preset_from_json(text: &str) -> Result<Vec<(String, f64)>, String> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        // Read one string literal starting at i (this position is a key
+        // candidate; string VALUES fall through the colon test below).
+        let mut j = i + 1;
+        let mut key = String::new();
+        let mut closed = false;
+        while j < b.len() {
+            if b[j] == b'\\' && j + 1 < b.len() {
+                key.push(text[j + 1..].chars().next().unwrap_or(' '));
+                j += 2;
+            } else if b[j] == b'"' {
+                closed = true;
+                break;
+            } else {
+                let ch = text[j..].chars().next().unwrap();
+                key.push(ch);
+                j += ch.len_utf8();
+            }
+        }
+        if !closed {
+            break;
+        }
+        i = j + 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b':' {
+            continue;
+        }
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && matches!(b[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+            i += 1;
+        }
+        if let Ok(v) = text[start..i].parse::<f64>() {
+            out.push((key, v));
+        }
+    }
+    if out.is_empty() {
+        return Err("no numeric parameters found in preset file".into());
+    }
+    Ok(out)
 }
 
 /// Write `effect_api.rs` next to the scripts when absent or stale.
@@ -1010,7 +1204,7 @@ mod tests {
             return;
         }
         let dir = temp_dir("echomodes");
-        let probe = |dir: &Path, stem: &str| -> (usize, f64) {
+        let probe = |dir: &Path, stem: &str| -> (usize, f64, f64, f64) {
             let mut reg = Registry::open(dir.to_path_buf());
             reg.rescan();
             // cathedral-ish: long decay, moderate damp, echo level 0 so the
@@ -1026,57 +1220,260 @@ mod tests {
             for _ in 0..24000 {
                 let _ = inst.process_private(0.0);
             }
-            // 2 s late window: fine (0.5 Hz) resolution so INDIVIDUAL comb
+            // Goertzel magnitudes of one window at 161 log-spaced freqs.
+            // 2 s windows give fine (0.5 Hz) resolution so INDIVIDUAL comb
             // modes resolve — that is exactly where sparse banks look
             // metallic and dense ones look like a wash.
-            const N: usize = 96000;
-            let mut x = Vec::with_capacity(N);
-            for _ in 0..N {
-                x.push(inst.process_private(0.0) as f64);
-            }
-            let mut mags = Vec::new();
-            for k in 0..161 {
-                let f = 150.0f64 * (14000.0f64 / 150.0).powf(k as f64 / 160.0);
-                let w = core::f64::consts::TAU * f / 48000.0;
-                let cw = w.cos();
-                let (mut s1, mut s2) = (0.0f64, 0.0f64);
-                for (n, &v) in x.iter().enumerate() {
-                    let h = 0.5 - 0.5 * (core::f64::consts::TAU * n as f64 / (N as f64 - 1.0)).cos();
-                    let s0 = v * h + 2.0 * cw * s1 - s2;
-                    s2 = s1;
-                    s1 = s0;
+            let window_mags = |x: &[f64]| -> Vec<f64> {
+                let n = x.len();
+                let mut mags = Vec::with_capacity(161);
+                for k in 0..161 {
+                    let f = 150.0f64 * (14000.0f64 / 150.0).powf(k as f64 / 160.0);
+                    let w = core::f64::consts::TAU * f / 48000.0;
+                    let cw = w.cos();
+                    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                    for (i, &v) in x.iter().enumerate() {
+                        let h = 0.5 - 0.5 * (core::f64::consts::TAU * i as f64 / (n as f64 - 1.0)).cos();
+                        let s0 = v * h + 2.0 * cw * s1 - s2;
+                        s2 = s1;
+                        s1 = s0;
+                    }
+                    mags.push((s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).max(0.0).sqrt());
                 }
-                mags.push((s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).max(0.0).sqrt());
+                mags
+            };
+            const N: usize = 96000;
+            let mut early = Vec::with_capacity(N);
+            for _ in 0..N {
+                early.push(inst.process_private(0.0) as f64);
             }
+            let mags = window_mags(&early);
+            // Late slice, ~1 s further in: where air absorption should have
+            // eaten the treble (the thing that made the old tail "tinny").
+            for _ in 0..48000 {
+                let _ = inst.process_private(0.0);
+            }
+            let mut late = Vec::with_capacity(N);
+            for _ in 0..N {
+                late.push(inst.process_private(0.0) as f64);
+            }
+            let lmags = window_mags(&late);
+            let band_mean = |m: &[f64], lo: usize, hi: usize| -> f64 {
+                let s: f64 = m[lo..hi].iter().sum();
+                s / (hi - lo) as f64
+            };
+            // hi (≈5.5–14 k) vs mid (≈1–4 k): natural tails darken.
+            let hm_e = band_mean(&mags, 127, 161) / band_mean(&mags, 67, 116).max(1e-30);
+            let hm_l = band_mean(&lmags, 127, 161) / band_mean(&lmags, 67, 116).max(1e-30);
             let mean = mags.iter().sum::<f64>() / mags.len() as f64;
             let mut peaks = 0usize;
-            let mut ratio = 0.0f64; // strongest peak / mean: concentration
+            // Tilt-removed concentration: each bin over a ±4-bin moving
+            // average of its neighbours. A dark high-frequency rolloff (what
+            // a *good* tail does) cancels in the ratio; a lone ringing mode
+            // does not. Raw neighbour ratios punish the shelf edge instead
+            // (1000x drops across 290 Hz at 9 kHz on a deep tilt).
+            let smooth: Vec<f64> = (0..mags.len())
+                .map(|i| {
+                    let lo = i.saturating_sub(4);
+                    let hi = (i + 5).min(mags.len());
+                    mags[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+                })
+                .collect();
+            let mut conc = 1.0f64;
             for i in 1..mags.len() - 1 {
                 if mags[i] > mags[i - 1] && mags[i] >= mags[i + 1] && mags[i] > mean * 2.0 {
                     peaks += 1;
                 }
-                ratio = ratio.max(mags[i] / mean.max(1e-30));
+                conc = conc.max(mags[i] / smooth[i].max(1e-30));
             }
             drop(reg);
-            (peaks, ratio)
+            (peaks, conc, hm_e, hm_l)
         };
-        let (peaks, ratio) = probe(&dir, "space_echo");
-        println!("MODEPROBE current: peaks={peaks} concentration={ratio:.1}");
-        if let Ok(old_path) = std::env::var("MODEPROBE_OLD") {
-            let odir = temp_dir("echomodes_old");
-            std::fs::write(odir.join(API_FILE), API_SRC).unwrap();
-            let src = std::fs::read_to_string(&old_path).unwrap();
-            std::fs::write(odir.join("old_echo.rs"), src).unwrap();
-            let (op, or_) = probe(&odir, "old_echo");
-            println!("MODEPROBE old: peaks={op} concentration={or_:.1}");
-            let _ = std::fs::remove_dir_all(&odir);
-        }
-        // Calibration (same probe): 4 bunched combs scored ~18x, the fixed
-        // 8-comb bank ~15x, the modulated bank lands ~7x. Assert well below
-        // the metallic baseline but above regressions; the peaks floor only
-        // guards against measuring a silent tail.
+        let (peaks, conc, hm_e, hm_l) = probe(&dir, "space_echo");
+        println!("MODEPROBE current: peaks={peaks} concentration={conc:.1} hi/mid {hm_e:.3}→{hm_l:.3}");
+        // Calibration (tilt-removed concentration): current bank ~7.5,
+        // deliberately bunched combs through the same damping stack ~8.7,
+        // the original unmodulated metallic bank (no damping, no diffusion)
+        // far higher; density (peaks) and the hi/mid darkening below are
+        // the primary guards — the tail must be a wash AND must lose
+        // treble as it decays ("tinny" was the complaint).
         assert!(peaks >= 5, "late tail empty? only {peaks} resonances visible");
-        assert!(ratio < 10.0, "late tail metallic: one resonance {ratio:.0}x the floor");
+        assert!(conc < 12.0, "late tail metallic: one mode {conc:.1}x over its local envelope");
+        assert!(hm_l < hm_e * 0.65, "tail stays tinny: hi/mid {hm_e:.3} → {hm_l:.3} barely darkens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diag_whine_probe() {
+        // TEMPORARY diagnostic — high-pitched whine report. Removed before ship.
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("diagwhine");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let mut rng = 0x2545F491u64;
+        let mut rnd = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng as f64) / (u64::MAX as f64)) * 2.0 - 1.0
+        };
+        let window_mags = |x: &[f64]| -> Vec<(f64, f64)> {
+            let n = x.len();
+            let mut out = Vec::new();
+            for k in 0..161 {
+                let f = 150.0f64 * (16000.0f64 / 150.0).powf(k as f64 / 160.0);
+                let w = core::f64::consts::TAU * f / 48000.0;
+                let cw = w.cos();
+                let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                for (i, &v) in x.iter().enumerate() {
+                    let h = 0.5 - 0.5 * (core::f64::consts::TAU * i as f64 / (n as f64 - 1.0)).cos();
+                    let s0 = v * h + 2.0 * cw * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                out.push((f, (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).max(0.0).sqrt()));
+            }
+            out
+        };
+        // (a) sustain test: noise burst, then silence; RMS every 100 ms.
+        // A self-oscillating tone shows as an RMS PLATEAU instead of decay.
+        let sets: [(&str, [f32; 11]); 4] = [
+            ("default-Echo", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 1.0]),
+            ("cathedral", [0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0]),
+            ("verb-only-hot", [0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 16000.0, 1.0, 1.0, 0.0, 1.5]),
+            ("bright-damp-max", [0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 16000.0, 1.0, 1.0, 1.0, 1.5]),
+        ];
+        for (name, params) in sets {
+            let inst = reg.create_instance("space_echo", 48000.0, &params).expect("inst");
+            for _ in 0..4800 {
+                let _ = inst.process_private(rnd() as f32 * 0.3);
+            }
+            let mut rms = Vec::new();
+            for _ in 0..40 {
+                let e: f64 = (0..4800).map(|_| {
+                    let y = inst.process_private(0.0) as f64;
+                    y * y
+                }).sum();
+                rms.push((e / 4800.0).sqrt());
+            }
+            let head = rms[0].max(1e-12);
+            let ratios: Vec<String> = rms.iter().step_by(4).map(|r| format!("{:.2}", r / head)).collect();
+            println!("SUSTAIN {name}: ratios(0.4s steps) {ratios:?}");
+            // late-window spectrum 1.6–2.6 s in: dominant peaks over local floor
+            for _ in 0..28800 {
+                let _ = inst.process_private(0.0);
+            }
+            let late: Vec<f64> = (0..48000).map(|_| inst.process_private(0.0) as f64).collect();
+            let mags = window_mags(&late);
+            let mm: Vec<f64> = mags.iter().map(|m| m.1).collect();
+            let smooth: Vec<f64> = (0..mm.len()).map(|i| {
+                let lo = i.saturating_sub(3);
+                let hi = (i + 4).min(mm.len());
+                mm[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+            }).collect();
+            let mut peaks: Vec<(f64, f64)> = (1..mm.len() - 1)
+                .filter(|&i| mm[i] > mm[i - 1] && mm[i] >= mm[i + 1])
+                .map(|i| (mags[i].0, mm[i] / smooth[i].max(1e-30)))
+                .collect();
+            peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top: Vec<String> = peaks.iter().take(6).map(|(f, c)| format!("{f:.0}Hz x{c:.1}")).collect();
+            let late_peak = late.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            println!("LATE {name}: peak={late_peak:.2e} top-peaks {top:?}");
+            drop(inst);
+        }
+        // (b) tone sensitivity: echo tail hi/lo energy vs tone param.
+        for tone in [200.0f32, 3600.0, 16000.0] {
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &[0.25, 0.9, tone, 0.0, 0.05, 0.5, 8000.0, 1.0, 1.0, 1.0, 0.0])
+                .expect("inst");
+            for _ in 0..2400 {
+                let _ = inst.process_private(rnd() as f32 * 0.5);
+            }
+            let tail: Vec<f64> = (0..48000).map(|_| inst.process_private(0.0) as f64).collect();
+            let mags = window_mags(&tail);
+            let mean = |lo: usize, hi: usize| -> f64 {
+                mags[lo..hi].iter().map(|m| m.1).sum::<f64>() / (hi - lo) as f64
+            };
+            let hilo = mean(120, 161) / mean(20, 70).max(1e-30);
+            let peak = tail.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            println!("TONE {tone:.0}: tail peak={peak:.3} hi/lo={hilo:.4}");
+            drop(inst);
+        }
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diag_sine_adds_nothing() {
+        // TEMPORARY diagnostic - sine in, anything else out? A whine is energy
+        // the plugin invents away from the input. Removed before ship.
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("diagsine");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let goertzel = |x: &[f64], f: f64| -> f64 {
+            let w = core::f64::consts::TAU * f / 48000.0;
+            let cw = w.cos();
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &v in x {
+                let s0 = v + 2.0 * cw * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).max(0.0).sqrt()
+        };
+        let sets: [(&str, [f32; 11]); 4] = [
+            ("user-opera", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0]),
+            ("opera-no-wob", [0.2, 0.42, 3800.0, 0.0, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0]),
+            ("opera-no-verb", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 0.0]),
+            ("opera-no-echo", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.0, 1.0]),
+        ];
+        for (name, params) in sets {
+            let inst = reg.create_instance("space_echo", 48000.0, &params).expect("inst");
+            for i in 0..144000u64 {
+                let x = (core::f64::consts::TAU * 1000.0 * i as f64 / 48000.0).sin() * 0.4;
+                let _ = inst.process_private(x as f32);
+            }
+            let win: Vec<f64> = (0..48000u64)
+                .map(|i| {
+                    let x = (core::f64::consts::TAU * 1000.0 * i as f64 / 48000.0).sin() * 0.4;
+                    inst.process_private(x as f32) as f64
+                })
+                .collect();
+            let norm = 2.0 / win.len() as f64; // single-bin amplitude from Goertzel
+            let fund = goertzel(&win, 1000.0) * norm;
+            let mut sum_out = 0.0f64;
+            let mut hi_out = 0.0f64;
+            let mut top = (0.0f64, 0.0f64);
+            for k in 0..120 {
+                let f = 60.0f64 * (16000.0f64 / 60.0).powf(k as f64 / 119.0);
+                if (f - 1000.0).abs() < 30.0 {
+                    continue; // skip the fundamental bin neighbourhood
+                }
+                let m = goertzel(&win, f) * norm;
+                sum_out += m * m;
+                if f > 4000.0 {
+                    hi_out += m * m;
+                }
+                if m > top.1 {
+                    top = (f, m);
+                }
+            }
+            println!(
+                "SINE {name}: fundAmp={fund:.4} out-of-band rms={:.4} hi-band rms={:.4} top={:.0}Hz amp={:.5} ratio-to-fund={:.4}",
+                sum_out.sqrt(),
+                hi_out.sqrt(),
+                top.0,
+                top.1,
+                top.1 / fund.max(1e-12)
+            );
+            drop(inst);
+        }
+        drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1393,5 +1790,56 @@ pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert!(errs["broken"].contains("compile failed"), "{}", errs["broken"]);
         assert!(errs["noinfo"].contains("simplooper_effect_info"), "{}", errs["noinfo"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_presets_folder_prefix_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sp-userpresets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = ensure_user_presets_dir(&dir).unwrap();
+        assert!(d.is_dir());
+        assert_eq!(d.file_name().unwrap(), std::ffi::OsStr::new(USER_PRESET_DIR));
+        // Ownership by prefix: only `{stem}-*.json` files belong to a plugin.
+        std::fs::write(d.join("space_echo-Warm Room.json"), "{}").unwrap();
+        std::fs::write(d.join("space_echo-Cathedral Big.json"), "{}").unwrap();
+        std::fs::write(d.join("parametric_eq-Warm Room.json"), "{}").unwrap();
+        std::fs::write(d.join("space_echo-notes.txt"), "").unwrap();
+        std::fs::write(d.join("unowned.json"), "").unwrap();
+        std::fs::write(d.join("space_echo-X.json"), "{}").unwrap();
+        assert_eq!(list_user_presets(&dir, "space_echo"), vec!["Cathedral Big", "Warm Room", "X"]);
+        assert_eq!(list_user_presets(&dir, "parametric_eq"), vec!["Warm Room"]);
+        assert_eq!(list_user_presets(&dir, "nope"), Vec::<String>::new());
+
+        // JSON round trip: numbers out and back, plugin/name never leak as params.
+        let params = vec![
+            ("time".to_string(), 0.32f32),
+            ("damp".to_string(), 1500.0),
+            ("tiny".to_string(), -2.5e-3),
+        ];
+        let j = preset_to_json("space_echo", "Warm Room", &params).unwrap();
+        let path = user_preset_path(&dir, "space_echo", "Warm Room");
+        std::fs::write(&path, &j).unwrap();
+        let back = preset_from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.len(), 3, "{j}");
+        assert!((back[0].1 - 0.32).abs() < 1e-6);
+        assert!((back[1].1 - 1500.0).abs() < 1e-3);
+        assert!((back[2].1 + 0.0025).abs() < 1e-9);
+        assert!(!back.iter().any(|(k, _)| k == "plugin" || k == "name"));
+
+        // Non-finite values must not be written at all.
+        assert!(preset_to_json("x", "y", &[("bad".to_string(), f32::NAN)]).is_err());
+
+        // Name sanitizing: no traversal, no hidden files, unicode-safe.
+        assert_eq!(sanitize_preset_name("../../evil"), "evil");
+        assert_eq!(sanitize_preset_name("  My/Room 2  "), "My-Room 2");
+        assert_eq!(sanitize_preset_name("///"), "preset");
+        assert_eq!(sanitize_preset_name("Warm Room ★"), "Warm Room");
+
+        // Delete, and idempotent delete of a gone file.
+        delete_user_preset(&dir, "space_echo", "Warm Room").unwrap();
+        assert_eq!(list_user_presets(&dir, "space_echo"), vec!["Cathedral Big", "X"]);
+        delete_user_preset(&dir, "space_echo", "Warm Room").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -18,12 +18,13 @@
 //! library) cannot die under a live GUI.
 
 use std::ffi::{c_char, c_void, CStr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use egui::{
-    Align2, Checkbox, Color32, FontId, Id, Painter, Pos2, Rect, RichText, Sense, Slider, Stroke,
-    StrokeKind, Ui, Vec2,
+    Align2, Checkbox, Color32, ComboBox, FontId, Id, Painter, Pos2, Rect, RichText, Sense, Slider,
+    Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
 
 use crate::fx::{self, EffectDesc, GuiApiV1, GuiFrameV1, ParamDesc};
@@ -59,11 +60,23 @@ pub struct FxEditor {
     /// Param rides requested by the GUI since the last flush (the UI layer
     /// mirrors them into the persisted chain rows).
     pub pending: Vec<(usize, f32)>,
+    // --- user presets (files in `<fx_dir>/user presets/`, see fx.rs) ---
+    fx_dir: PathBuf,
+    /// Preset names owned by this stem, refreshed on open/save/delete.
+    preset_list: Vec<String>,
+    preset_sel: Option<usize>,
+    /// Name buffer for the next save.
+    preset_name: String,
+    /// One-line feedback ("saved …", errors) under the strip.
+    preset_msg: String,
 }
 
 impl FxEditor {
     /// `gui` = the effect's custom GUI handle (None = auto slider window).
     /// A null `create` return falls back to the auto window as well.
+    // Eight distinct construction inputs — bundling them would only
+    // obscure the single call site in ui.rs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         loop_i: usize,
         slot: usize,
@@ -72,12 +85,14 @@ impl FxEditor {
         inst: Arc<fx::Instance>,
         gui: Option<fx::EffectGuiRef>,
         sample_rate: f64,
+        fx_dir: PathBuf,
     ) -> Self {
         let name = desc.name.clone();
         let custom = gui.and_then(|g| {
             let gs = g.create(sample_rate);
             (!gs.is_null()).then(|| Custom { gui: g, gs })
         });
+        let preset_list = fx::list_user_presets(&fx_dir, &stem);
         Self {
             loop_i,
             slot,
@@ -90,6 +105,11 @@ impl FxEditor {
             last: 0.0,
             frame_no: 0,
             pending: Vec::new(),
+            fx_dir,
+            preset_list,
+            preset_sel: None,
+            preset_name: String::new(),
+            preset_msg: String::new(),
         }
     }
 
@@ -416,8 +436,23 @@ extern "C" fn tr_checkbox(ctx: *mut c_void, x: f32, y: f32, label: *const c_char
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let mut b = unsafe { *on != 0.0 };
     let label = cstr(label);
-    let where_ = Rect::from_min_size(br.pos(x, y), Vec2::ZERO);
-    let r = with_no_wrap(br.ui, |ui| ui.put(where_, Checkbox::new(&mut b, label)));
+    // `Ui::put` CENTRES the widget in its rect (centered_and_justified
+    // layout), so putting the checkbox in a ZERO-sized rect made the whole
+    // widget straddle its anchor: half the label spilled onto the widget to
+    // the left and the box floated ~7 px above the row centre — the
+    // "checkboxes overlap and are misaligned" report. The strip contract is
+    // a TOP-LEFT anchor, like `button`: lay the checkbox out left-to-right,
+    // vertically centred, inside a 20 px band starting at (x, y).
+    let row = Rect::from_min_size(br.pos(x, y), Vec2::new(320.0, 20.0));
+    let r = with_no_wrap(br.ui, |ui| {
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| ui.add(Checkbox::new(&mut b, label)),
+        )
+        .inner
+    });
     if r.changed() {
         unsafe { *on = b as u32 as f32 };
         1
@@ -486,6 +521,8 @@ pub fn window(ui: &mut Ui, ed: &mut FxEditor) -> bool {
         .min_width(240.0)
         .auto_sized()
         .show(ui, |ui| {
+            preset_strip(ui, ed);
+            ui.separator();
             if ed.is_custom() {
                 custom_ui(ui, ed, hh);
             } else {
@@ -493,6 +530,170 @@ pub fn window(ui: &mut Ui, ed: &mut FxEditor) -> bool {
             }
         });
     open
+}
+
+// ---------------------------------------------------------------------------
+// User preset strip
+// ---------------------------------------------------------------------------
+//
+// One row on every effect editor (auto and custom alike): pick a saved
+// preset, load it, save the current settings, or delete. Files live in
+// `<fx_dir>/user presets/` as `{stem}-{name}.json` (format + folder in
+// fx.rs); the strip only ever lists files owned by this plugin's stem.
+
+fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("user preset").weak().small());
+        let status = if ed.preset_list.is_empty() {
+            "— none saved —".to_string()
+        } else {
+            ed.preset_sel
+                .and_then(|i| ed.preset_list.get(i).cloned())
+                .unwrap_or_else(|| String::from("select…"))
+        };
+        let mut cb = ComboBox::from_id_salt("fx_user_preset").selected_text(status).width(150.0);
+        // An empty list simply offers an empty popup; the Load button is
+        // the guarded path, so the combo itself stays enabled.
+        let _ = &mut cb;
+        cb.show_ui(ui, |ui| {
+            // Snapshot the names: the closure must not hold a borrow of
+            // `ed` while `load_user_preset` mutably borrows it.
+            let names: Vec<String> = ed.preset_list.to_vec();
+            for (i, name) in names.iter().enumerate() {
+                if ui.selectable_value(&mut ed.preset_sel, Some(i), name).clicked() {
+                    // Picking from the list loads it — one fewer click.
+                    ed.load_user_preset(name);
+                    ui.close();
+                }
+            }
+        });
+        if ui
+            .button(RichText::new("Load").small())
+            .on_hover_text("apply the selected preset")
+            .clicked()
+        {
+            match ed.preset_sel {
+                Some(i) => {
+                    let n = ed.preset_list[i].clone();
+                    ed.load_user_preset(&n);
+                }
+                None => ed.preset_msg = "pick a preset first".into(),
+            }
+        }
+        ui.add_sized(
+            [110.0, 0.0],
+            TextEdit::singleline(&mut ed.preset_name).hint_text("new preset name").font(egui::TextStyle::Small),
+        );
+        if ui.button(RichText::new("Save").small()).on_hover_text("save current settings as a new preset").clicked() {
+            let name = std::mem::take(&mut ed.preset_name);
+            ed.save_user_preset(&name);
+        }
+        let have_sel = ed.preset_sel.is_some();
+        if ui.add_enabled(have_sel, egui::Button::new(RichText::new("Delete").small())).clicked() {
+            if let Some(i) = ed.preset_sel {
+                let n = ed.preset_list[i].clone();
+                ed.delete_user_preset(&n);
+            }
+        }
+    });
+    if !ed.preset_msg.is_empty() {
+        ui.label(RichText::new(&ed.preset_msg).weak().small());
+    }
+}
+
+impl FxEditor {
+    fn refresh_presets(&mut self) {
+        self.preset_list = fx::list_user_presets(&self.fx_dir, &self.stem);
+        if let Some(i) = self.preset_sel {
+            if i >= self.preset_list.len() {
+                self.preset_sel = None;
+            }
+        }
+    }
+
+    /// Snapshot every param (label → live value) and write the JSON file.
+    /// Overwriting an existing name is intentional (it's what "save" means
+    /// to everyone else's muscle memory too).
+    pub fn save_user_preset(&mut self, raw_name: &str) {
+        let name = fx::sanitize_preset_name(raw_name);
+        if raw_name.trim().is_empty() {
+            self.preset_msg = "type a preset name first".into();
+            return;
+        }
+        let params: Vec<(String, f32)> = self
+            .desc
+            .params
+            .iter()
+            .enumerate()
+            .map(|(k, p)| (p.label.clone(), self.inst.param(k)))
+            .collect();
+        match fx::preset_to_json(&self.stem, &name, &params)
+            .and_then(|j| {
+                std::fs::create_dir_all(fx::user_presets_dir(&self.fx_dir))
+                    .map_err(|e| format!("could not create preset folder: {e}"))?;
+                std::fs::write(fx::user_preset_path(&self.fx_dir, &self.stem, &name), j)
+                    .map_err(|e| format!("could not write preset: {e}"))
+            }) {
+            Ok(()) => {
+                self.refresh_presets();
+                self.preset_sel = self.preset_list.iter().position(|n| *n == name);
+                self.preset_msg = format!("saved '{name}' to user presets");
+            }
+            Err(e) => self.preset_msg = e,
+        }
+    }
+
+    /// Apply a preset to the live instance. Params match by label first,
+    /// then by declaration order (hand-written files stay usable). Values
+    /// clamp to the declared ranges; every ride also lands in `pending` so
+    /// the main window persists the chain row.
+    pub fn load_user_preset(&mut self, name: &str) {
+        let path = fx::user_preset_path(&self.fx_dir, &self.stem, name);
+        let pairs = match std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read preset: {e}"))
+            .and_then(|t| fx::preset_from_json(&t))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                self.preset_msg = e;
+                return;
+            }
+        };
+        let mut applied = 0usize;
+        // Index order first…
+        for (i, (_, v)) in pairs.iter().enumerate() {
+            if let Some(p) = self.desc.params.get(i) {
+                let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
+                self.inst.set_param(i, v);
+                self.pending.push((i, v));
+                applied += 1;
+            }
+        }
+        // …then label matches win over positional guesses.
+        for (label, v) in &pairs {
+            if let Some((k, p)) = self.desc.params.iter().enumerate().find(|(_, p)| &p.label == label) {
+                let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
+                self.inst.set_param(k, v);
+                self.pending.push((k, v));
+            }
+        }
+        self.preset_msg = if applied == 0 {
+            format!("preset '{name}' has no matching parameters")
+        } else {
+            format!("loaded preset '{name}' ({applied} params)")
+        };
+    }
+
+    pub fn delete_user_preset(&mut self, name: &str) {
+        match fx::delete_user_preset(&self.fx_dir, &self.stem, name) {
+            Ok(()) => {
+                self.refresh_presets();
+                self.preset_sel = None;
+                self.preset_msg = format!("deleted preset '{name}'");
+            }
+            Err(e) => self.preset_msg = e,
+        }
+    }
 }
 
 /// The effect-drawn canvas: one fixed-height area, frame info built fresh,

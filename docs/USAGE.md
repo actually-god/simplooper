@@ -58,8 +58,9 @@ The window is a scrollable stack of **16 track rows**. Each row is one loop
 | **FX** | open the effects window for this loop (see [Per-loop effects](#per-loop-effects)) |
 | effect buttons | enabled effects appear right of FX, left-to-right in chain order, as name buttons — clicking one opens that effect's controls window (auto-generated sliders, or the effect's own scripted GUI) |
 
-Above the rows: **UNDO**/**REDO** (last overdub), the **dependent** checkbox
-(loop mode), the metronome bar, the quantizer, and **EXPORT**.
+Above the rows: **UNDO**/**REDO** (last overdub), the **independent** checkbox
+(loop mode: ticked = independent, unticked = dependent), the metronome bar,
+the quantizer, and **EXPORT**.
 
 *Volume/gain only trim playback (or overdub input) — recorded audio is never
 re-leveled, so you can fix levels after the fact.*
@@ -77,9 +78,11 @@ re-leveled, so you can fix levels after the fact.*
 
 ## Loop modes
 
-- **Independent** (default): every track runs on its own clock, like 16
+- **Independent** (checkbox ticked, default): every track runs on its own
+  clock, like 16
   separate loop pedals. Tracks started at different times stay offset.
-- **Dependent**: one ensemble clock. The longest track ("root") defines the
+- **Dependent** (checkbox unticked): one ensemble clock. The longest track
+  ("root") defines the
   cycle; shorter tracks tile/wrap on top of it (modulo), and the whole
   ensemble repeats after a settable number of **root loops** (default 1).
   It loops forever — nothing stops mid-cycle.
@@ -130,8 +133,9 @@ effects), not just the raw buffer.
 
 ## Keyboard shortcuts
 
-Defaults (every one is rebindable in settings; keys are ignored while a text
-field has focus, and key auto-repeat never re-fires an action):
+Defaults (every one is rebindable in settings; keys are ignored while you
+type in **any** text box anywhere in the program, and key auto-repeat never
+re-fires an action):
 
 | Key | Action |
 | --- | --- |
@@ -213,9 +217,11 @@ author, description, and up to **32 parameters** optional; an optional
 custom GUI entry point). simplooper compiles scripts with
 `rustc --edition 2021 --crate-type cdylib` — so **rustc must be installed**
 to use custom effects. Examples ship in the repo: `parametric_eq.rs` (response
-curve + 240-band spectrum GUI, draggable handles, B1 LP / B6 HP toggles) and
+curve + 240-band spectrum GUI, draggable handles on a logarithmic dB axis with
+−∞ at the bottom edge and a +6 dB ceiling, B1 LP / B6 HP toggles) and
 `space_echo.rs` (Echo + Reverb: animated echo window, independent echo/verb
-levels, factory presets — plain echo + room reverbs). Keep `process()`
+levels, tone knob for the whole wet path, factory presets — plain echo + room
+reverbs). Keep `process()`
 allocation-free and non-blocking — it runs in the realtime audio path.
 
 ## Latency compensation

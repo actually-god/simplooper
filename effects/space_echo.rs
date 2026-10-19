@@ -30,7 +30,7 @@ include!("effect_api.rs");
 // ---------------------------------------------------------------------------
 const P_TIME: usize = 0; // delay seconds (log range via slider range)
 const P_FEED: usize = 1; // delay feedback 0..0.95
-const P_TONE: usize = 2; // delay-loop damping, Hz (log)
+const P_TONE: usize = 2; // wet-path brightness, Hz (log): echo-loop AND reverb-feed damping
 const P_WOBBLE: usize = 3; // modulation depth 0..1 (= ±1 % of time)
 const P_RATE: usize = 4; // modulation rate Hz
 const P_DECAY: usize = 5; // reverb feedback 0.5..0.95
@@ -113,6 +113,9 @@ struct Comb {
     buf: Vec<f64>,
     idx: usize,
     lp: f64,
+    /// second stage of the TWO-POLE loop damping (12 dB/oct rolloff —
+    /// one-pole left an icy 4–8 kHz residue that read as "tinny")
+    lp2: f64,
     /// base delay in samples and modulation depth/phase offset
     base: f64,
     depth: f64,
@@ -121,13 +124,23 @@ struct Comb {
 
 impl Comb {
     fn new(base: f64, off: f64) -> Self {
-        let n = (base as usize + 4).max(4);
-        let depth = (base * 0.0018).clamp(0.5, 3.5); // ±0.5..3.5 samples
-        Self { buf: vec![0.0; n], idx: 0, lp: 0.0, base, depth, off }
+        // Headroom for the room stretch (decay drives delay up to ~2×)
+        // plus modulation depth.
+        let n = (base as usize * 9 / 4 + 8).max(8);
+        // EMT plates modulate ~±0.5 % of the delay length. The old
+        // ±0.18 %-max clamp left every comb mode pinned within ~±0.06 % —
+        // the eight tuned banks then stacked into a sustained, high-pitched
+        // WHINE (user report, 2026-10). At this depth the modes smear into
+        // bands and the row of resonators becomes a wash.
+        let depth = (base * 0.006).clamp(2.0, 12.0);
+        Self { buf: vec![0.0; n], idx: 0, lp: 0.0, lp2: 0.0, base, depth, off }
     }
     #[inline]
-    fn process(&mut self, x: f64, fb: f64, damp_c: f64, phase: f64) -> f64 {
-        let d = self.base + self.depth * (phase + self.off).sin();
+    fn process(&mut self, x: f64, fb: f64, damp_c: f64, phase: f64, room: f64) -> f64 {
+        // `room` stretches the delay with the decay knob: bigger room =
+        // longer combs = lower, denser modes; a fixed bank heard as a boxy
+        // midrange "cathedral-prison" ring no matter how long the decay.
+        let d = self.base * room + self.depth * (phase + self.off).sin();
         let n = self.buf.len();
         let di = d as usize;
         let fr = d - di as f64;
@@ -135,10 +148,12 @@ impl Comb {
         let i1 = (i0 + n - 1) % n;
         let out = self.buf[i0] + (self.buf[i1] - self.buf[i0]) * fr;
         self.lp = out * (1.0 - damp_c) + self.lp * damp_c;
-        if !self.lp.is_finite() {
+        self.lp2 = self.lp * (1.0 - damp_c) + self.lp2 * damp_c;
+        if !self.lp2.is_finite() {
             self.lp = 0.0;
+            self.lp2 = 0.0;
         }
-        self.buf[self.idx] = x + self.lp * fb;
+        self.buf[self.idx] = x + self.lp2 * fb;
         self.idx = (self.idx + 1) % n;
         if !out.is_finite() {
             return 0.0;
@@ -186,7 +201,11 @@ struct SpaceEcho {
     combs: [Comb; 8],
     /// comb-length modulation clock (radians)
     vphase: f64,
-    ap: [Allpass; 4],
+    ap: [Allpass; 6],
+    /// reverb-input pre-damp (one-pole at the TONE cutoff): real rooms are
+    /// fed AIR-ROLLED sound, and raw dry/echo fizz into the comb bank is
+    /// where the "tinny" starts — filter before ringing, not after.
+    verb_lp: f64,
     /// comb lengths at sr=44.1 kHz; scaled by sr and by a 0.9..1.1 "room"
     /// spread so the two banks don't share modes.
     mix: f64,
@@ -204,8 +223,11 @@ struct SpaceEcho {
 // mode density and smears the resonance into a wash; the 0.5 sum below
 // keeps the bank at the old level.
 const COMB_TUNE: [f64; 8] = [1116.0, 1188.0, 1277.0, 1356.0, 1422.0, 1491.0, 1557.0, 1617.0];
-/// All-pass tunings (samples @ 44100).
-const AP_TUNE: [f64; 4] = [225.0, 341.0, 441.0, 556.0];
+/// All-pass tunings (samples @ 44100). Six diffusers instead of the
+/// original four: more smear per unit of ring, and the two added lengths
+/// (672, 773) sit above the old top so the diffusion stays even up to
+/// ~2 kHz where the ear reads "metal".
+const AP_TUNE: [f64; 6] = [225.0, 341.0, 441.0, 556.0, 672.0, 773.0];
 
 impl SpaceEcho {
     fn new(sample_rate: f64) -> Self {
@@ -223,6 +245,7 @@ impl SpaceEcho {
             combs,
             vphase: 0.0,
             ap,
+            verb_lp: 0.0,
             mix: 0.4,
             out: 1.0,
             gui_open: AtomicU32::new(0),
@@ -298,8 +321,23 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     // ---- FDN reverb in parallel with the echo (fed from echo + dry) ----
     // 0.45 feed: rooms need the reverb to read as the ROOM, not as a faint
     // halo around the slap — the preset row drives echo down / verb up.
-    let verb_in = (echoed * 0.6 + x * 0.4) * 0.45;
+    // The feed is damped at the TONE cutoff (user report: "the tone knob
+    // does seemingly nothing" — at low feedback the echo loop alone made
+    // tone inaudible; reverb brightness responds at any setting, so tone
+    // now voices the entire wet path). Filtering before the comb bank is
+    // what separates "air" from "tin can" — filters after the ring can
+    // only dull everything together.
+    st.verb_lp = (echoed * 0.6 + x * 0.4) * 0.45 * (1.0 - st.tone_c)
+        + st.verb_lp * st.tone_c;
+    if !st.verb_lp.is_finite() {
+        st.verb_lp = 0.0;
+    }
+    let verb_in = st.verb_lp;
     let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
+    // Room stretch: decay 0.5 → 1.0× comb length, decay 0.95 → ~1.95×.
+    // Long tails through SHORT combs are the boxy, metallic "cathedral
+    // prison" ring — the modes have to actually descend for the room.
+    let room = 1.0 + ((decay - 0.5) / 0.45).clamp(0.0, 1.0) * 0.95;
     // comb-length LFO: ~0.85 Hz, one clock, per-comb offsets from the tunings.
     st.vphase += core::f64::consts::TAU * 0.85 / sr;
     if st.vphase > core::f64::consts::TAU {
@@ -307,7 +345,7 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     }
     let mut sum = 0.0f64;
     for c in st.combs.iter_mut() {
-        sum += c.process(verb_in, decay, damp_c, st.vphase);
+        sum += c.process(verb_in, decay, damp_c, st.vphase, room);
     }
     let mut v = sum * 0.5;
     for a in st.ap.iter_mut() {

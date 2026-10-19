@@ -88,8 +88,12 @@ concurrent e2e runs starve each other's JACK clients ("ensemble stalled").
 3. **Behavior specs live in tests and docs**: `README.md`, `IDEA.md`, and
    `tests/e2e.rs` pin intended behavior (e.g. additive overdub, latency =
    recording-start skip not input delay, dependent mode loops forever,
-   metronome never recorded, loop selection clamps at 1/16). Code aligns to
-   them; changing behavior means deliberately updating tests + docs.
+   metronome never recorded, loop selection clamps at 1/16, the loop-mode
+   checkbox is the INDEPENDENT switch — ticked = independent, the engine
+   `dependent` flag keeps its old meaning; keybinds are gated globally on
+   egui's `text_edit_focused()`, not per-widget flags; EQ graph vertical axis
+   is log-scaled, −∞ bottom / +6 dB top, gains clamp −24..+6). Code aligns
+   to them; changing behavior means deliberately updating tests + docs.
 4. **Audio server**: keep `NO_START`; never auto-spawn jackd or bypass JACK.
 5. **Packaging**: the AUR `PKGBUILD` (separate repo) fetches the GitHub
    **tag tarball**; `pkgver` must equal the `Cargo.toml` version, and

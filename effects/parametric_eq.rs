@@ -194,6 +194,20 @@ struct AnBand {
     env: f64,
 }
 
+/// Build the fixed constant-Q analyser bank (log-spaced 20 Hz … 20 kHz).
+fn make_analyser(sr: f64) -> [AnBand; NANALY] {
+    let mut an: [AnBand; NANALY] = core::array::from_fn(|_| AnBand { bq: Biquad::new(), env: 0.0 });
+    for (i, a) in an.iter_mut().enumerate() {
+        let f = 20.0f32 * (20000.0f32 / 20.0f32).powf(i as f32 / (NANALY - 1) as f32);
+        a.bq.cache_valid = false;
+        a.bq.set_params(T_BANDPASS, f, 0.0, 2.2, sr);
+        a.bq.b0 = a.bq.tb0; a.bq.b1 = a.bq.tb1; a.bq.b2 = a.bq.tb2;
+        a.bq.a1 = a.bq.ta1; a.bq.a2 = a.bq.ta2;
+        a.bq.gliding = false;
+    }
+    an
+}
+
 // ---------------------------------------------------------------------------
 // State — one per enabled (loop, slot) instance.
 // ---------------------------------------------------------------------------
@@ -202,7 +216,12 @@ use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 struct ParametricEq {
     sr: f64,
     bands: [Biquad; NBANDS],
+    /// Pre-EQ analyser (taps the raw input).
     an: [AnBand; NANALY],
+    /// Post-EQ analyser (taps the effect's own output — EQ curve, mix and
+    /// out trim all visible). Two independent banks because every analyser
+    /// band owns its filter state.
+    an_post: [AnBand; NANALY],
     an_release: f64,
     mix: f64,
     out: f64,
@@ -210,32 +229,24 @@ struct ParametricEq {
     gui_open: AtomicU32,
     /// Per-band linear peak levels (f32 bits) for the spectrum display.
     levels: [AtomicU32; NANALY],
+    levels_post: [AtomicU32; NANALY],
 }
 
 impl ParametricEq {
     fn new(sample_rate: f64) -> Self {
         let sr = if sample_rate.is_finite() && sample_rate > 1.0 { sample_rate } else { 48000.0 };
         let an_release = (-(1.0 / (sr * 0.08))).exp(); // ~80 ms peak decay
-        // Analyser: constant-Q band passes log-spaced 20 Hz … 20 kHz
-        // (the full human range, matching the graph's F_LO..F_HI axis).
-        let mut an: [AnBand; NANALY] = core::array::from_fn(|_| AnBand { bq: Biquad::new(), env: 0.0 });
-        for (i, a) in an.iter_mut().enumerate() {
-            let f = 20.0f32 * (20000.0f32 / 20.0f32).powf(i as f32 / (NANALY - 1) as f32);
-            a.bq.cache_valid = false;
-            a.bq.set_params(T_BANDPASS, f, 0.0, 2.2, sr);
-            a.bq.b0 = a.bq.tb0; a.bq.b1 = a.bq.tb1; a.bq.b2 = a.bq.tb2;
-            a.bq.a1 = a.bq.ta1; a.bq.a2 = a.bq.ta2;
-            a.bq.gliding = false;
-        }
         let mut s = Self {
             sr,
             bands: core::array::from_fn(|_| Biquad::new()),
-            an,
+            an: make_analyser(sr),
+            an_post: make_analyser(sr),
             an_release,
             mix: 1.0,
             out: 1.0,
             gui_open: AtomicU32::new(0),
             levels: core::array::from_fn(|_| AtomicU32::new(0)),
+            levels_post: core::array::from_fn(|_| AtomicU32::new(0)),
         };
         for b in s.bands.iter_mut() {
             // force coefficient build on the first sample
@@ -273,7 +284,8 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     st.mix += (mix - st.mix) * 0.01;
     st.out += (out - st.out) * 0.01;
 
-    // Spectrum (only while someone is watching).
+    // Spectrum: pre tap sees `input`; the post tap is fed the finished
+    // output sample below (EQ curve, mix and out trim all visible).
     let want_spec = st.gui_open.load(Relaxed) != 0;
     let mut s = input as f64;
 
@@ -295,6 +307,13 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
         s = b.step(s);
     }
 
+    let dry = input as f64;
+    let wet = s * st.out;
+    let mut o = dry * (1.0 - st.mix) + wet * st.mix;
+    if !o.is_finite() {
+        o = 0.0;
+    }
+
     if want_spec {
         let x = input as f64;
         let rel = st.an_release;
@@ -307,14 +326,17 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
             }
             lev.store((a.env as f32).to_bits(), Relaxed);
         }
+        for (a, lev) in st.an_post.iter_mut().zip(st.levels_post.iter()) {
+            let y = a.bq.step(o);
+            let m = if y < 0.0 { -y } else { y };
+            a.env = if m > a.env { m } else { a.env * rel };
+            if !a.env.is_finite() {
+                a.env = 0.0;
+            }
+            lev.store((a.env as f32).to_bits(), Relaxed);
+        }
     }
 
-    let dry = input as f64;
-    let wet = s * st.out;
-    let o = dry * (1.0 - st.mix) + wet * st.mix;
-    if !o.is_finite() {
-        return 0.0;
-    }
     o as f32
 }
 
@@ -350,7 +372,19 @@ extern "C" fn gui_destroy(gs: *mut core::ffi::c_void) {
 // ---- graph mapping helpers -------------------------------------------------
 const F_LO: f32 = 20.0f32;
 const F_HI: f32 = 20000.0f32;
-const DB_TOP: f32 = 18.0f32;
+/// Top edge of the graph AND the hard ceiling for band gains: +6 dB.
+const DB_TOP: f32 = 6.0f32;
+/// dB per decade on the LOG vertical axis: y = 1 − 10^((db−6)/48), so
+/// −∞ dB sits exactly at the bottom edge and 0 dB lands at y = 25 % —
+/// where the old +9 line sat, between the old +6 and +12 grid lines.
+/// A log axis gives −24 dB (the gain floor) 76 % of the height and every
+/// real-world gain lives INSIDE the graph, so a node can never be dragged
+/// to a value the view cannot draw (the old bug: drag past the axis edge,
+/// the handle pins to the border but its true position — and hit-test —
+/// live outside, so the mouse can no longer reach it).
+const DB_SPAN: f32 = 48.0f32;
+/// Gain floor, matching the "gain" param range — also the drag clamp.
+const DB_BOT: f32 = -24.0f32;
 
 fn f2x(f: f32, w: f32) -> f32 {
     ((f.max(F_LO) / F_LO).ln() / (F_HI / F_LO).ln()) * w
@@ -359,10 +393,11 @@ fn x2f(x: f32, w: f32) -> f32 {
     F_LO * (F_HI / F_LO).powf((x / w).clamp(0.0, 1.0))
 }
 fn db2y(db: f32, h: f32) -> f32 {
-    (0.5 - db / (2.0 * DB_TOP)).clamp(0.0, 1.0) * h
+    (1.0 - 10.0f32.powf((db - DB_TOP) / DB_SPAN)).clamp(0.0, 1.0) * h
 }
 fn y2db(y: f32, h: f32) -> f32 {
-    (0.5 - y / h) * 2.0 * DB_TOP
+    let u = (y / h.max(1.0)).clamp(0.0, 1.0);
+    DB_TOP + DB_SPAN * (1.0 - u).max(1e-9).log10()
 }
 fn uses_gain(typ: i32) -> bool {
     matches!(typ, 1 | 2 | 3)
@@ -380,7 +415,8 @@ fn handle_pt(bi: usize, p: &[f32; 32], gx: f32, gy: f32, gw: f32, gph: f32) -> (
     let hy = if uses_gain(p[base] as i32) {
         gy + db2y(p[base + 2], gph)
     } else {
-        gy + gph * 0.5
+        // filter-only bands sit ON the 0 dB line (the graph's neutral row)
+        gy + db2y(0.0, gph)
     };
     (hx, hy)
 }
@@ -439,9 +475,10 @@ extern "C" fn gui_draw(
     // ---- graph backdrop + grid -------------------------------------------
     unsafe {
         (api.rect_filled)(c, gx, gy, gw, gph, 0.09, 0.10, 0.13, 1.0);
-        // horizontal dB lines every 6 dB
-        let mut db = -12.0f32;
-        while db <= DB_TOP {
+        // horizontal dB lines every 6 dB on the LOG axis (+6 top edge,
+        // −∞ bottom edge — see DB_SPAN); 0 dB is drawn brighter.
+        let mut db = DB_BOT;
+        while db <= DB_TOP + 0.1 {
             let y = gy + db2y(db, gph);
             let zero = db.abs() < 0.5;
             let col = if zero { (0.5, 0.5, 0.55) } else { (0.22, 0.24, 0.28) };
@@ -481,31 +518,46 @@ extern "C" fn gui_draw(
     }
 
     // ---- live spectrum (vertical bars, bottom-up, loud = tall) -----------
-    // One bar per analyser band spanning its slice of the x axis. Bars grow
-    // UP from the bottom on a 0 dBFS .. −90 dB scale: silence = NO bar,
-    // 0 dBFS = full height (top of the graph). The old mapping inverted this
-    // (silence painted a full-height bar and signal "subtracted" from it).
+    // TWO translucent layers over the same geometry:
+    //   * PRE  (teal green)  — the incoming audio, the original behaviour.
+    //   * POST (amber)       — the effect's own output, so EQ cuts/boosts,
+    //                          mix and out trim show up live against the
+    //                          pre layer. Alpha < 1 so overlaps blend and
+    //                          both layers stay readable.
     if gs.show_spec && !state.is_null() {
         let st = unsafe { &*(state as *mut ParametricEq) };
         let freq = |i: usize| F_LO * (F_HI / F_LO).powf(i as f32 / (NANALY - 1) as f32);
-        for i in 0..NANALY {
-            let lin = f32::from_bits(st.levels[i].load(Relaxed)) as f64;
-            let db = 20.0 * lin.max(1e-7).log10(); // −∞..0 dBFS-ish
-            // −90 dB -> 0 (no bar), 0 dB -> 1 (full height).
-            let up = ((db + 90.0) / 90.0).clamp(0.0, 1.0) as f32;
-            if up <= 0.004 {
-                continue;
+        let layers: [(&[AtomicU32], f32, f32, f32); 2] = [
+            (st.levels.as_slice(), 0.30f32, 0.85f32, 0.55f32),
+            (st.levels_post.as_slice(), 1.00f32, 0.66f32, 0.25f32),
+        ];
+        for (levels, r, g, b) in layers {
+            for i in 0..NANALY {
+                let lin = f32::from_bits(levels[i].load(Relaxed)) as f64;
+                let db = 20.0 * lin.max(1e-7).log10(); // −∞..0 dBFS-ish
+                // −90 dB -> 0 (no bar), 0 dB -> 1 (full height).
+                let up = ((db + 90.0) / 90.0).clamp(0.0, 1.0) as f32;
+                if up <= 0.004 {
+                    continue;
+                }
+                // Bar spans from the midpoint to the previous band to the
+                // midpoint to the next band (edge bands clamp to the graph).
+                let f_lo = if i == 0 { F_LO } else { (freq(i - 1) * freq(i)).sqrt() };
+                let f_hi = if i + 1 == NANALY { F_HI } else { (freq(i) * freq(i + 1)).sqrt() };
+                let x0 = gx + f2x(f_lo, gw);
+                let x1 = gx + f2x(f_hi, gw);
+                let h = up * gph;
+                unsafe {
+                    (api.rect_filled)(c, x0 + 0.5, gy + gph - h, (x1 - x0 - 1.0).max(1.0), h, r, g, b, 0.45);
+                }
             }
-            // Bar spans from the midpoint to the previous band to the
-            // midpoint to the next band (edge bands clamp to the graph).
-            let f_lo = if i == 0 { F_LO } else { (freq(i - 1) * freq(i)).sqrt() };
-            let f_hi = if i + 1 == NANALY { F_HI } else { (freq(i) * freq(i + 1)).sqrt() };
-            let x0 = gx + f2x(f_lo, gw);
-            let x1 = gx + f2x(f_hi, gw);
-            let h = up * gph;
-            unsafe {
-                (api.rect_filled)(c, x0 + 0.5, gy + gph - h, (x1 - x0 - 1.0).max(1.0), h, 0.30, 0.85, 0.55, 0.55);
-            }
+        }
+        // Legend naming the two layers, top-left inside the graph.
+        unsafe {
+            let pre = std::ffi::CString::new("pre EQ").unwrap();
+            (api.text)(c, gx + 4.0, gy + 2.0, 9.0, 1, 0.30, 0.85, 0.55, 0.95, pre.as_ptr());
+            let post = std::ffi::CString::new("post EQ").unwrap();
+            (api.text)(c, gx + 48.0, gy + 2.0, 9.0, 1, 1.00, 0.66, 0.25, 0.95, post.as_ptr());
         }
         // Right-hand scale ticks for the analyser's own dB axis (0 dBFS at
         // the TOP — full-height bars reach it — down to −90 at the bottom).
@@ -609,7 +661,10 @@ extern "C" fn gui_draw(
             sp(base + 1, nf);
             let typ = p[bi * 4] as i32;
             if matches!(typ, 1 | 2 | 3) {
-                let g = y2db(my - gy, gph).clamp(-24.0, 24.0);
+                // Bounded to the drawn axis: a node parked outside the
+                // graph looked pinned to the border but its hit-test lived
+                // off-canvas, so the mouse could never grab it again.
+                let g = y2db((my - gy).clamp(0.0, gph), gph).clamp(DB_BOT, DB_TOP);
                 sp(base + 2, (g * 4.0).round() / 4.0);
             } else if typ >= 4 {
                 let q = (16.0f32).powf((1.0 - (my - gy) / gph).clamp(0.0, 1.0) * 2.0 - 0.5) * 0.5;
@@ -653,7 +708,7 @@ extern "C" fn gui_draw(
         let spec_w = 16.0 + tw(13.0, "spectrum");
         let mut spec = if gs.show_spec { 1.0f32 } else { 0.0f32 };
         let s = std::ffi::CString::new("spectrum").unwrap();
-        if (api.checkbox)(c, cx, sy + 4.0, s.as_ptr(), &mut spec) != 0 {
+        if (api.checkbox)(c, cx, sy, s.as_ptr(), &mut spec) != 0 {
             gs.show_spec = spec != 0.0;
         }
         cx += spec_w + 12.0;
@@ -706,7 +761,7 @@ extern "C" fn gui_draw(
         cx2 += lw + 12.0;
         let mut on = if typ == 0 { 0.0f32 } else { 1.0f32 };
         let s = std::ffi::CString::new("on").unwrap();
-        if (api.checkbox)(c, cx2, y2 + 4.0, s.as_ptr(), &mut on) != 0 {
+        if (api.checkbox)(c, cx2, y2, s.as_ptr(), &mut on) != 0 {
             sp(base as u32, if on != 0.0 { 3.0 } else { 0.0 }); // "on" = peaking
         }
         cx2 += 16.0 + tw(13.0, "on") + 18.0;
@@ -721,7 +776,7 @@ extern "C" fn gui_draw(
         if uses_gain {
             let mut v = p[base + 2];
             let s = std::ffi::CString::new(format!("gain {:+.1}", v)).unwrap();
-            if (api.knob)(c, cx2, ky, 44.0, s.as_ptr(), &mut v, -24.0, 24.0, 1.0) != 0 {
+            if (api.knob)(c, cx2, ky, 44.0, s.as_ptr(), &mut v, DB_BOT, DB_TOP, 1.0) != 0 {
                 sp(base as u32 + 2, v);
             }
             cx2 += 60.0;
@@ -749,27 +804,27 @@ extern "C" fn gui_draw(
 static PARAMS: [EffectParamV1; 26] = [
     EffectParamV1 { label: c"B1 type".as_ptr(), min: 0.0, max: 7.0, default: 1.0 },
     EffectParamV1 { label: c"B1 freq".as_ptr(), min: 20.0, max: 20000.0, default: 80.0 },
-    EffectParamV1 { label: c"B1 gain".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
+    EffectParamV1 { label: c"B1 gain".as_ptr(), min: -24.0, max: 6.0, default: 0.0 },
     EffectParamV1 { label: c"B1 Q".as_ptr(), min: 0.1, max: 16.0, default: 0.71 },
     EffectParamV1 { label: c"B2 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B2 freq".as_ptr(), min: 20.0, max: 20000.0, default: 250.0 },
-    EffectParamV1 { label: c"B2 gain".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
+    EffectParamV1 { label: c"B2 gain".as_ptr(), min: -24.0, max: 6.0, default: 0.0 },
     EffectParamV1 { label: c"B2 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B3 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B3 freq".as_ptr(), min: 20.0, max: 20000.0, default: 800.0 },
-    EffectParamV1 { label: c"B3 gain".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
+    EffectParamV1 { label: c"B3 gain".as_ptr(), min: -24.0, max: 6.0, default: 0.0 },
     EffectParamV1 { label: c"B3 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B4 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B4 freq".as_ptr(), min: 20.0, max: 20000.0, default: 2500.0 },
-    EffectParamV1 { label: c"B4 gain".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
+    EffectParamV1 { label: c"B4 gain".as_ptr(), min: -24.0, max: 6.0, default: 0.0 },
     EffectParamV1 { label: c"B4 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B5 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B5 freq".as_ptr(), min: 20.0, max: 20000.0, default: 6000.0 },
-    EffectParamV1 { label: c"B5 gain".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
+    EffectParamV1 { label: c"B5 gain".as_ptr(), min: -24.0, max: 6.0, default: 0.0 },
     EffectParamV1 { label: c"B5 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B6 type".as_ptr(), min: 0.0, max: 7.0, default: 2.0 },
     EffectParamV1 { label: c"B6 freq".as_ptr(), min: 20.0, max: 20000.0, default: 11000.0 },
-    EffectParamV1 { label: c"B6 gain".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
+    EffectParamV1 { label: c"B6 gain".as_ptr(), min: -24.0, max: 6.0, default: 0.0 },
     EffectParamV1 { label: c"B6 Q".as_ptr(), min: 0.1, max: 16.0, default: 0.71 },
     EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 1.0 },
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
