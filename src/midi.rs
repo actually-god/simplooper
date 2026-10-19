@@ -244,6 +244,18 @@ impl MidiBind {
             _ => format!("PC {} ch{:02}", self.d1, self.ch + 1),
         }
     }
+
+    /// Axis name for the knob learner: message TYPE + CHANNEL only. The
+    /// data byte (CC number for normal knobs, velocity for notes) is the
+    /// VALUE the learner reads — never part of the axis identity, so a
+    /// controller that changes numbers mid-sweep still tracks.
+    pub fn axis_label(&self) -> String {
+        match self.ty {
+            0 => format!("NOTE ch{:02}", self.ch + 1),
+            1 => format!("CC ch{:02}", self.ch + 1),
+            _ => format!("PC ch{:02}", self.ch + 1),
+        }
+    }
 }
 
 /// Rescale a raw controller value from a learned axis range onto 0..=127.

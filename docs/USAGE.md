@@ -163,8 +163,10 @@ the exception and act on the value (0–127: 0 = silence / hard left,
 **Knob calibration**: controllers with a limited or backwards travel can be
 learned — start a knob slot's calibration and sweep the physical control: the
 window shows its most recent raw value live, so you can hunt for the travel
-limits. Press **Lock min** at the lowest position (the minimum stops
-following), sweep to the maximum, press **Finish**.
+limits. The axis is the message *type + channel*: every message of that kind
+counts and its data byte is the number shown, so both min and max keep
+following until you lock them. Press **Lock min** at the lowest position (the
+minimum stops following), sweep to the maximum, press **Finish**.
 The control's range is then stretched onto the full 0–127 program range
 (a backwards-wired knob is inverted automatically), so the extremes of your
 hardware mean the extremes in simplooper.
@@ -211,8 +213,9 @@ author, description, and up to **32 parameters** optional; an optional
 custom GUI entry point). simplooper compiles scripts with
 `rustc --edition 2021 --crate-type cdylib` — so **rustc must be installed**
 to use custom effects. Examples ship in the repo: `parametric_eq.rs` (response
-curve + 240-band spectrum GUI) and `space_echo.rs` (animated echo window with
-factory space presets — practice hall, auditorium, opera house, cathedral). Keep `process()`
+curve + 240-band spectrum GUI, draggable handles, B1 LP / B6 HP toggles) and
+`space_echo.rs` (Echo + Reverb: animated echo window, independent echo/verb
+levels, factory presets — plain echo + room reverbs). Keep `process()`
 allocation-free and non-blocking — it runs in the realtime audio path.
 
 ## Latency compensation

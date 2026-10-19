@@ -849,6 +849,16 @@ fn run(
     midi_drops: Arc<AtomicU64>,
     engine: Arc<LoopEngine>,
 ) {
+    // Test-only kill switch: headless GUI tests must not open PipeWire-JACK
+    // clients at all. Spawning and closing dozens of clients per suite races
+    // libpipewire's own callback threads during teardown (UAF inside the
+    // client library, reported as glibc heap corruption), and none of that
+    // surface is what a headless UI test exercises. Behaves exactly like the
+    // "no JACK server" path below.
+    if std::env::var("SIMPLOOPER_NULL_AUDIO").is_ok() {
+        let _ = evt_tx.send(Evt::Unavailable("null audio (SIMPLOOPER_NULL_AUDIO)".into()));
+        return;
+    }
     let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
         Ok(c) => c,
         Err(e) => {
@@ -1233,6 +1243,14 @@ fn run(
     // The jack crate's deactivate only clears thread-init/process, so without
     // this a late notification would call into freed memory on PipeWire-JACK.
     unsafe { clear_all_callbacks(active.as_client().raw()) };
+    // Nulling the pointers does NOT cancel an invocation PipeWire-JACK has
+    // already dispatched: its thread may have loaded the callback + context
+    // pointer microseconds ago. Closing the client right now frees the jack
+    // crate's Arc'd context underneath that in-flight call — a use-after-free
+    // that glibc reports (in whichever thread frees first) as "corrupted size
+    // vs. prev_size" and aborts. Let a dozen audio cycles elapse so every
+    // dispatched callback runs against still-live state, then close.
+    std::thread::sleep(std::time::Duration::from_millis(250));
     drop(active); // deactivates + closes the client; no live callbacks remain.
 }
 

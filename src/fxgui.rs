@@ -381,11 +381,24 @@ extern "C" fn tr_knob(
     }
 }
 
+/// `Ui::put` justifies its widget and switches text to WRAP mode; inside a
+/// tight (or zero-sized) rect that stacks single-line widget labels one
+/// character per line — a "spectrum" checkbox rendered as an 8-row vertical
+/// column of letters. Widget labels are single-line: pin Extend while the
+/// put runs, then restore.
+fn with_no_wrap<T>(ui: &mut Ui, f: impl FnOnce(&mut Ui) -> T) -> T {
+    let prev = ui.style().wrap_mode;
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    let r = f(ui);
+    ui.style_mut().wrap_mode = prev;
+    r
+}
+
 extern "C" fn tr_button(ctx: *mut c_void, x: f32, y: f32, w: f32, label: *const c_char) -> u32 {
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let rect = Rect::from_min_size(br.pos(x, y), Vec2::new(w.max(24.0), 20.0));
     let label = cstr(label);
-    let r = br.ui.put(rect, egui::Button::new(RichText::new(label).small()));
+    let r = with_no_wrap(br.ui, |ui| ui.put(rect, egui::Button::new(RichText::new(label).small())));
     if r.clicked() {
         1
     } else {
@@ -401,7 +414,7 @@ extern "C" fn tr_checkbox(ctx: *mut c_void, x: f32, y: f32, label: *const c_char
     let mut b = unsafe { *on != 0.0 };
     let label = cstr(label);
     let where_ = Rect::from_min_size(br.pos(x, y), Vec2::ZERO);
-    let r = br.ui.put(where_, Checkbox::new(&mut b, label));
+    let r = with_no_wrap(br.ui, |ui| ui.put(where_, Checkbox::new(&mut b, label)));
     if r.changed() {
         unsafe { *on = b as u32 as f32 };
         1

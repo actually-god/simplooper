@@ -1122,17 +1122,21 @@ impl App {
                             }
                             self.midi_learning_slot = None;
                         } else if let Some(kl) = self.knob_learn.as_mut() {
-                            // Two-step knob learn in flight: the control seen
-                            // first defines the axis (type + channel + CC
-                            // number). Every later message must come from the
-                            // same control, else it is rejected with a hint —
-                            // min and max must be the same axis.
+                            // Two-step knob learn in flight. The AXIS is the
+                            // message TYPE + CHANNEL only — the data byte
+                            // (CC value / note velocity) is what steps 2 and
+                            // 3 read, so it must never be part of the axis
+                            // identity. (Matching on the CC number too broke
+                            // controllers that re-use numbers mid-sweep:
+                            // every message after the first was rejected as
+                            // "not the same control", so min and max could
+                            // never move.)
                             //
                             // The raw VALUE shown/learned is the message's
                             // data byte (CC value / note velocity) — NOT
-                            // MidiBind.d1, which is the CC/NOTE NUMBER (the
-                            // axis identity, constant across a sweep; using
-                            // it froze both numbers at the first message).
+                            // MidiBind.d1, which is the CC/NOTE NUMBER
+                            // (using it froze both numbers at the first
+                            // message).
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => Some(*velocity),
@@ -1143,22 +1147,19 @@ impl App {
                                 kl.has_axis = true;
                                 kl.lo = cval.unwrap_or(kl.lo);
                                 self.status = format!(
-                                    "knob {} bound — sweep it to MINIMUM (the number follows every message), then Lock min",
-                                    bind.label()
+                                    "axis {} — sweep it to MINIMUM (the number follows every message), then Lock min",
+                                    kl.bind.axis_label()
                                 );
-                            } else if bind.ty != kl.bind.ty
-                                || bind.ch != kl.bind.ch
-                                || bind.d1 != kl.bind.d1
-                            {
+                            } else if bind.ty != kl.bind.ty || bind.ch != kl.bind.ch {
                                 self.status = format!(
-                                    "knob learn: got {} — min and max must come from {} \
-                                     (same channel)",
+                                    "knob learn: got {} — min and max must use the \
+                                     axis {} (same message type and channel)",
                                     bind.label(),
-                                    kl.bind.label()
+                                    kl.bind.axis_label()
                                 );
                             } else if let Some(v) = cval {
                                 // Constant listeners: the number tracks the
-                                // MOST RECENT message from this control until
+                                // MOST RECENT message on this axis until
                                 // Lock min / Finish freezes it.
                                 if !kl.locked {
                                     kl.lo = v;
@@ -1664,20 +1665,23 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                 ui.label(RichText::new(format!("Bind knob: {action}")).strong());
                 ui.label(
                     RichText::new(
-                        "Min and max must come from the SAME control on the SAME MIDI \
-                         channel (move one physical knob all the way left, then all the \
-                         way right) — the number below follows every message it sends.",
+                        "The axis is the message TYPE + CHANNEL: any message of that kind \
+                         counts, and its data byte is the value shown. Move one physical \
+                         knob all the way down — the number follows every message — Lock \
+                         min, sweep to the top, Finish.",
                     )
                     .weak()
                     .small(),
                 );
                 ui.add_space(6.0);
-                let axis = kl.bind.label();
+                let axis = kl.bind.axis_label();
+                let ctrl = kl.bind.label();
                 if !kl.has_axis {
-                    ui.label("1. Move your knob / slider to its MINIMUM position.");
+                    ui.label("1. Move your knob / slider to pick the axis (type + channel).");
                     ui.label(RichText::new("waiting for the control's first message…").weak().italics());
                 } else {
                     ui.label(RichText::new(format!("axis: {axis}")).monospace());
+                    ui.label(RichText::new(format!("bound control: {ctrl}")).weak().small());
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(format!("minimum raw value: {}", kl.lo));
@@ -3059,6 +3063,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("simplooper-test-{}-{}", std::process::id(), tag));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        // No PipeWire-JACK clients in headless tests (see run()'s null mode).
+        std::env::set_var("SIMPLOOPER_NULL_AUDIO", "1");
         App::new(crate::audio::Backend::start())
     }
 
@@ -3118,6 +3124,141 @@ mod tests {
     }
 
     #[test]
+    fn eq_graph_handles_drag_at_their_drawn_positions() {
+        // Headless regression for the two EQ graph bugs:
+        // 1. every painted band handle must be grabbable AT ITS PAINTED
+        //    POSITION (draw and hit-test used to disagree: draw at the
+        //    cascade |H(fc)|, grab at the band's own gain — after moving
+        //    one band the other five handles were painted far from
+        //    anywhere clickable);
+        // 2. no widget label may wrap: a wrapped label renders as a
+        //    vertical column of one-character lines (the "spectrum"
+        //    checkbox bug via Ui::put's justified WRAP layout).
+        if !fx::rustc_available() {
+            return;
+        }
+        let mut app = test_app("eqgraph");
+        let dir = std::env::temp_dir().join(format!("simplooper-eqgraph-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fx::API_FILE), fx::API_SRC).unwrap();
+        std::fs::write(dir.join(fx::TEMPLATE_FILE), fx::TEMPLATE_SRC).unwrap();
+        for (name, src) in fx::EXAMPLES {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        app.fx_dir_edit = dir.display().to_string();
+        app.apply_fx_dir();
+        app.fx_entries[0].iter_mut().for_each(|e| e.enabled = false);
+        let k = app.fx_entries[0].iter().position(|e| e.stem == "parametric_eq").unwrap();
+        app.fx_entries[0][k].enabled = true;
+        app.rebuild_fx(0);
+        app.open_fx_editor(0, 0); // only parametric_eq is enabled
+        let inst = app.fx_editor.as_ref().unwrap().inst.clone();
+        let ctx = egui::Context::default();
+        let mut t = 0.0f64;
+        let mut frame = |evs: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
+            let mut ri = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1920.0, 1080.0),
+                )),
+                time: Some({
+                    t += 0.1;
+                    t
+                }),
+                ..Default::default()
+            };
+            ri.events = evs;
+            let app: &mut App = unsafe { &mut *(&mut app as *mut App) };
+            let mut out = ctx.run_ui(ri, |c| {
+                app.fx_editor_window(c);
+            });
+            let shapes = out.shapes.clone();
+            ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            out.textures_delta.clear();
+            shapes
+        };
+        // egui 0.36 frame-caches new windows: first pass paints Noop.
+        frame(vec![]);
+        frame(vec![]);
+        let shapes = frame(vec![]);
+        let canvas = shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Rect(rr) if rr.fill == egui::Color32::from_rgb(21, 23, 28) => {
+                    Some(rr.rect)
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.area().partial_cmp(&b.area()).unwrap())
+            .expect("canvas rect");
+
+        // (2) every text galley inside the editor is a single line.
+        for cs in &shapes {
+            if let egui::Shape::Text(t) = &cs.shape {
+                assert_eq!(
+                    t.galley.rows.len(),
+                    1,
+                    "label wrapped into {} lines at {:?}: {:?}",
+                    t.galley.rows.len(),
+                    t.pos,
+                    t.galley.text()
+                );
+            }
+        }
+
+        // (1) scan for the painted handles (8x8 squares, selected amber or
+        // unselected blue) and drag each one at its PAINTED centre.
+        let moved = |p: egui::Pos2| egui::Event::PointerMoved(p);
+        let down = |p: egui::Pos2| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let up = |p: egui::Pos2| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        for round in 0..2 {
+            let shapes = frame(vec![moved(canvas.min + egui::vec2(3.0, 3.0))]);
+            let mut handles: Vec<(f32, f32)> = shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(rr)
+                        if [(egui::Color32::from_rgb(255, 191, 76), 255), (egui::Color32::from_rgb(114, 158, 216), 255)]
+                            .iter()
+                            .any(|(c, _)| rr.fill == *c)
+                            && (rr.rect.width() - 8.0).abs() < 0.6
+                            && (rr.rect.height() - 8.0).abs() < 0.6 =>
+                    {
+                        Some((rr.rect.center().x, rr.rect.center().y))
+                    }
+                    _ => None,
+                })
+                .collect();
+            handles.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            assert_eq!(handles.len(), 6, "all six default band handles painted (round {round})");
+            for (bi, (hx, hy)) in handles.iter().enumerate() {
+                let before = inst.param(bi * 4 + 1);
+                let tgt = egui::pos2(*hx, *hy);
+                frame(vec![moved(tgt)]);
+                frame(vec![down(tgt)]);
+                let dst = egui::pos2(hx + 30.0, hy - 20.0);
+                frame(vec![moved(dst)]);
+                frame(vec![up(dst)]);
+                frame(vec![moved(canvas.min + egui::vec2(3.0, 3.0))]);
+                let after = inst.param(bi * 4 + 1);
+                assert_ne!(before, after, "dragging band {bi} handle at its drawn pos must move freq (round {round})");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+
     fn delete_clears_midi_binding_while_listening() {
         let mut app = test_app("midi-del");
         app.midi_binds[0] = Some(crate::midi::MidiBind { ty: 0, ch: 0, d1: 60 });
@@ -3211,14 +3352,24 @@ mod tests {
             assert_eq!(kl.hi, v, "max must follow every message after the lock");
             assert_eq!(kl.lo, 8, "locked min must not move");
         }
-        // A message from a DIFFERENT control (here: another channel) is
-        // rejected and must not contaminate either end.
+        // A message from a DIFFERENT channel is off-axis: rejected, must
+        // not contaminate either end.
         cc(&mut app, 2, 55);
         {
             let kl = app.knob_learn.as_ref().unwrap();
             assert_eq!(kl.hi, 127, "off-axis message rejected");
             assert_eq!(kl.lo, 8, "off-axis message rejected");
         }
+        // The axis is TYPE + CHANNEL only: a message on the same channel
+        // with a DIFFERENT CC number still moves the readouts (controllers
+        // that re-use numbers mid-sweep must not be rejected — the old
+        // code compared d1 and froze both numbers at the first message).
+        app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | 1, 71, 42] }));
+        assert_eq!(app.knob_learn.as_ref().unwrap().hi, 42, "same channel, any CC number counts");
+        app.handle_evt(Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0 | 1, 7, 200] }));
+        assert_eq!(app.knob_learn.as_ref().unwrap().hi, 200);
+        // The finished binding targets the control seen first.
+        assert_eq!(app.knob_learn.as_ref().unwrap().bind.d1, 7);
     }
 
     #[test]

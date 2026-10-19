@@ -1,19 +1,26 @@
 // ============================================================ simplooper ==
-// space_echo.rs — reverb + delay in one effect, with a custom child GUI.
+// space_echo.rs — echo AND reverb in one effect, with a custom child GUI.
 //
-// A mono effects chain in the classic dub/ambient order: a modulated
-// feedback delay (tone-controlled damping in the loop) feeding a Schroeder
-// FDN reverb (damped comb banks + all-pass diffusers), then a dry/wet mix.
+// A mono effects chain: a modulated feedback delay (tone-controlled damping
+// in the loop) running in parallel with a Schroeder FDN reverb (damped comb
+// banks + all-pass diffusers) fed from the echo path, mixed by independent
+// echo/reverb levels, then dry/wet mix and output trim. Turning "echo" down
+// and "verb" up turns the same circuit into a pure room simulator: the
+// factory presets ship that way (practice hall .. cathedral).
 //
-//   dry ─────────────┐
-//   in → delay ──→ reverb ──┤ mix → out
+//   dry ───────────────────────┐
+//   in → delay ──┬─ ×echo ─────┤
+//        └→ reverb ─ ×verb ────┤ mix → out
+//
+// (The file stem stays `space_echo` because saved chains and persisted
+// param rows reference it; only the display name says "Echo + Reverb".)
 //
 // Params are ordinary effect params, so the auto slider window works too;
 // the child GUI below is a scripted canvas showing the echo pattern
 // (tick spacing = time, fade = feedback, jitter = wobble) over a reverb
 // tail wedge, plus an input level history trace (bottom-up: silence at the
-// floor), a factory row of space presets (Default, Practice Hall,
-// Auditorium, Opera House, Cathedral) and the knob row.
+// floor), a factory row of presets (Echo, Practice Hall, Auditorium,
+// Opera House, Cathedral) and the knob row.
 // ---------------------------------------------------------------------------
 
 include!("effect_api.rs");
@@ -30,18 +37,21 @@ const P_DECAY: usize = 5; // reverb feedback 0.5..0.95
 const P_DAMP: usize = 6; // reverb damping, Hz (log)
 const P_MIX: usize = 7; // wet mix 0..1
 const P_OUT: usize = 8; // output trim 0..2
-const NPARAMS: u32 = 9;
+const P_ECHO: usize = 9; // echo-path level 0..1.5
+const P_VERB: usize = 10; // reverb-path level 0..1.5
+const NPARAMS: u32 = 11;
 
-/// Factory space presets — name + the 9 params (same order as PARAMS).
-/// The first entry is the plugin default; the rest mimic rooms of growing
-/// size: bright small hall → auditorium → opera house → vast cathedral.
-/// (Time/feedbk shape the slap echo, decay/damp the reverb tail.)
+/// Factory presets — name + all params (same order as PARAMS).
+/// "Echo" is the plain dub-style effect (the old default); the rooms run
+/// echo LOW and reverb FULL so the FDN tail, not the slap, dominates —
+/// bright tight hall → auditorium → opera house → vast dark cathedral.
+/// (Time/feedbk shape the early slap, decay/damp the tail length/colour.)
 const PRESETS: [(&str, [f32; NPARAMS as usize]); 5] = [
-    ("Default", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0]),
-    ("Practice Hall", [0.09, 0.45, 6500.0, 0.05, 0.5, 0.62, 7000.0, 0.22, 1.0]),
-    ("Auditorium", [0.22, 0.55, 4800.0, 0.1, 0.35, 0.78, 4200.0, 0.38, 0.98]),
-    ("Opera House", [0.36, 0.6, 3600.0, 0.15, 0.28, 0.86, 3000.0, 0.45, 0.95]),
-    ("Cathedral", [0.9, 0.78, 1800.0, 0.25, 0.14, 0.94, 1500.0, 0.55, 0.88]),
+    ("Echo", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5]),
+    ("Practice Hall", [0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0]),
+    ("Auditorium", [0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0]),
+    ("Opera House", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0]),
+    ("Cathedral", [0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -234,6 +244,8 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     let wobble = (g(P_WOBBLE) as f64).clamp(0.0, 1.0);
     let rate = (g(P_RATE) as f64).clamp(0.01, 20.0);
     let decay = (g(P_DECAY) as f64).clamp(0.5, 0.95);
+    let echo_lvl = (g(P_ECHO) as f64).clamp(0.0, 1.5);
+    let verb_lvl = (g(P_VERB) as f64).clamp(0.0, 1.5);
     st.mix += ((g(P_MIX) as f64).clamp(0.0, 1.0) - st.mix) * 0.01;
     st.out += ((g(P_OUT) as f64).clamp(0.0, 2.0) - st.out) * 0.01;
 
@@ -253,8 +265,10 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     }
     st.delay.write(x + st.tone_lp * fb);
 
-    // ---- FDN reverb on the delay output (with a little dry-to-verb tap) ----
-    let verb_in = (echoed * 0.7 + x * 0.3) * 0.25;
+    // ---- FDN reverb in parallel with the echo (fed from echo + dry) ----
+    // 0.45 feed: rooms need the reverb to read as the ROOM, not as a faint
+    // halo around the slap — the preset row drives echo down / verb up.
+    let verb_in = (echoed * 0.6 + x * 0.4) * 0.45;
     let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
     let mut sum = 0.0f64;
     for c in st.combs.iter_mut() {
@@ -265,7 +279,7 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
         v = allpass(a, v, 0.5);
     }
 
-    let wet = echoed + v;
+    let wet = echoed * echo_lvl + v * verb_lvl;
     let o = x * (1.0 - st.mix) + wet * st.mix * st.out;
     if !o.is_finite() {
         return 0.0;
@@ -406,6 +420,7 @@ extern "C" fn gui_draw(
 
         // ---- knob row ----------------------------------------------------
         // (ky starts high in the strip: the preset row lives at its bottom.)
+        // Pitch 66 fits eleven knobs across the 760 px window.
         let ky = canvas_h + 6.0;
         let row = |i: usize, label: &str, idx: usize, min: f32, max: f32, curve: f32, fmt: &str| {
             let mut v = gp(idx as u32);
@@ -418,7 +433,7 @@ extern "C" fn gui_draw(
                 _ => format!("{label} {v:.2}"),
             };
             let s = std::ffi::CString::new(shown).unwrap();
-            if (api.knob)(c, 12.0 + i as f32 * 84.0, ky + 16.0, 48.0, s.as_ptr(), &mut v, min, max, curve) != 0 {
+            if (api.knob)(c, 12.0 + i as f32 * 66.0, ky + 18.0, 44.0, s.as_ptr(), &mut v, min, max, curve) != 0 {
                 sp(idx as u32, v);
             }
         };
@@ -427,19 +442,22 @@ extern "C" fn gui_draw(
         row(2, "tone", P_TONE, 200.0, 16000.0, 0.0, "khz");
         row(3, "wobble", P_WOBBLE, 0.0, 1.0, 1.0, "pct");
         row(4, "rate", P_RATE, 0.05, 12.0, 0.0, "hz");
-        row(5, "decay", P_DECAY, 0.5, 0.95, 1.0, "pct");
-        row(6, "damp", P_DAMP, 200.0, 16000.0, 0.0, "khz");
-        row(7, "mix", P_MIX, 0.0, 1.0, 1.0, "pct");
-        row(8, "out", P_OUT, 0.0, 2.0, 1.0, "db");
+        row(5, "echo", P_ECHO, 0.0, 1.5, 1.0, "pct");
+        row(6, "verb", P_VERB, 0.0, 1.5, 1.0, "pct");
+        row(7, "decay", P_DECAY, 0.5, 0.95, 1.0, "pct");
+        row(8, "damp", P_DAMP, 200.0, 16000.0, 0.0, "khz");
+        row(9, "mix", P_MIX, 0.0, 1.0, 1.0, "pct");
+        row(10, "out", P_OUT, 0.0, 2.0, 1.0, "db");
 
-        // ---- factory space presets ------------------------------------
-        // One click applies all nine params (rooms of growing size).
-        let py = canvas_h + 94.0;
-        let s = std::ffi::CString::new("spaces:").unwrap();
+        // ---- factory presets ------------------------------------------
+        // One click applies all eleven params: plain echo, or a room with
+        // the reverb carrying the tail (echo low, verb full).
+        let py = canvas_h + 96.0;
+        let s = std::ffi::CString::new("presets:").unwrap();
         (api.text)(c, 8.0, py + 5.0, 10.0, 0, 0.7, 0.7, 0.75, 1.0, s.as_ptr());
         for (pi, (name, vals)) in PRESETS.iter().enumerate() {
             let s = std::ffi::CString::new(*name).unwrap();
-            if (api.button)(c, 58.0 + pi as f32 * 122.0, py, 118.0, s.as_ptr()) != 0 {
+            if (api.button)(c, 62.0 + pi as f32 * 122.0, py, 118.0, s.as_ptr()) != 0 {
                 for (k, v) in vals.iter().enumerate() {
                     sp(k as u32, *v);
                 }
@@ -451,7 +469,7 @@ extern "C" fn gui_draw(
 // ---------------------------------------------------------------------------
 // Descriptor + GUI tables + exports.
 // ---------------------------------------------------------------------------
-static PARAMS: [EffectParamV1; 9] = [
+static PARAMS: [EffectParamV1; 11] = [
     EffectParamV1 { label: c"time".as_ptr(), min: 0.02, max: 2.4, default: 0.38 },
     EffectParamV1 { label: c"feedback".as_ptr(), min: 0.0, max: 0.95, default: 0.62 },
     EffectParamV1 { label: c"tone".as_ptr(), min: 200.0, max: 16000.0, default: 3600.0 },
@@ -461,14 +479,16 @@ static PARAMS: [EffectParamV1; 9] = [
     EffectParamV1 { label: c"damp".as_ptr(), min: 200.0, max: 16000.0, default: 2800.0 },
     EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 0.4 },
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
+    EffectParamV1 { label: c"echo".as_ptr(), min: 0.0, max: 1.5, default: 1.0 },
+    EffectParamV1 { label: c"verb".as_ptr(), min: 0.0, max: 1.5, default: 1.0 },
 ];
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SIMPLOOPER_EFFECT_ABI,
-    name: c"Space Echo".as_ptr(),
+    name: c"Echo + Reverb".as_ptr(),
     author: c"simplooper".as_ptr(),
     description:
-        c"Modulated feedback delay feeding an FDN reverb; damped loops, wobble LFO, animated echo-pattern window, factory space presets (practice hall .. cathedral).".as_ptr(),
+        c"Modulated echo and FDN reverb with independent echo/reverb levels; damped loops, wobble LFO, animated echo-pattern window, factory presets (plain echo + practice hall .. cathedral).".as_ptr(),
     n_params: NPARAMS,
     params: PARAMS.as_ptr(),
     create,

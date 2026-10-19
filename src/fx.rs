@@ -890,7 +890,7 @@ mod tests {
             assert!(it.error.is_none(), "{name} failed to load: {}", it.error.clone().unwrap_or_default());
         }
         assert_eq!(reg.desc("parametric_eq").unwrap().params.len(), 26);
-        assert_eq!(reg.desc("space_echo").unwrap().params.len(), 9);
+        assert_eq!(reg.desc("space_echo").unwrap().params.len(), 11);
         assert!(reg.gui("parametric_eq").is_some(), "EQ must expose a child GUI");
         assert!(reg.gui("space_echo").is_some(), "space echo must expose a child GUI");
         assert!(reg.gui("template").is_none(), "template keeps the auto slider window");
@@ -951,6 +951,41 @@ mod tests {
         assert!(total > 1e-3, "wet echo produced no tail (sum {total})");
         let peak = win.iter().cloned().fold(0.0f32, f32::max);
         assert!(win[7] < peak, "tail must decay: {win:?}");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn space_echo_verb_and_echo_levels_are_independent() {
+        // The two level params pick between the two effect halves:
+        // with VERB at 0 nothing exists between the impulse and the first
+        // echo tap (delay 250 ms = 12000 samples); with ECHO at 0 the FDN
+        // still fills that window from the dry feed — a room with no slap.
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("echoverb");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let mk = |echo: f32, verb: f32| {
+            reg.create_instance(
+                "space_echo",
+                48000.0,
+                &[0.25, 0.5, 8000.0, 0.0, 0.05, 0.9, 8000.0, 1.0, 1.0, echo, verb],
+            )
+            .expect("echo instance")
+        };
+        let window_sum = |inst: &std::sync::Arc<Instance>| -> f32 {
+            let _ = inst.process_private(1.0);
+            // Samples 2800..11900: after the FDN fills (the diffuser chain's
+            // group delay puts the first verb sample around 2700) and before
+            // the first echo tap (0.25 s = 12000 samples).
+            (0..11900).skip(2800).map(|_| inst.process_private(0.0).abs()).sum()
+        };
+        let echo_only = window_sum(&mk(1.0, 0.0));
+        let verb_only = window_sum(&mk(0.0, 1.0));
+        assert!(echo_only < 1e-6, "echo-only must be silent before the first tap (sum {echo_only})");
+        assert!(verb_only > 1e-3, "verb-only must fill the pre-echo window (sum {verb_only})");
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }

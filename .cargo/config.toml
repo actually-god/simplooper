@@ -1,0 +1,7 @@
+# Tests share the process environment: `test_app` points XDG_CONFIG_HOME at a
+# per-test temp dir via `std::env::set_var` while other tests (and backend
+# threads they spawned) read env vars — a data race that glibc reports as
+# heap corruption ("corrupted size vs. prev_size", SIGABRT, intermittent).
+# The whole suite runs in ~2 s, so keep it single-threaded and race-free.
+[env]
+RUST_TEST_THREADS = "1"

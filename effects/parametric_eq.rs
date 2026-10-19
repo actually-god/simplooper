@@ -364,6 +364,26 @@ fn db2y(db: f32, h: f32) -> f32 {
 fn y2db(y: f32, h: f32) -> f32 {
     (0.5 - y / h) * 2.0 * DB_TOP
 }
+fn uses_gain(typ: i32) -> bool {
+    matches!(typ, 1 | 2 | 3)
+}
+
+/// Handle position for band `bi` — THE one geometry used for both drawing
+/// and hit-testing. It used to differ (draw at the cascade |H(fc)|, grab at
+/// the band's own gain), so after moving one band the other five handles
+/// were painted far away from anywhere they could be grabbed: dragging
+/// B1 visibly shoved every handle around ("random frequencies affected")
+/// and B2..B6 looked dead.
+fn handle_pt(bi: usize, p: &[f32; 32], gx: f32, gy: f32, gw: f32, gph: f32) -> (f32, f32) {
+    let base = bi * 4;
+    let hx = gx + f2x(p[base + 1], gw);
+    let hy = if uses_gain(p[base] as i32) {
+        gy + db2y(p[base + 2], gph)
+    } else {
+        gy + gph * 0.5
+    };
+    (hx, hy)
+}
 
 fn fmt_hz(f: f32) -> String {
     if f >= 10000.0 {
@@ -529,21 +549,13 @@ extern "C" fn gui_draw(
         unsafe { (api.polyline)(c, pts.as_ptr(), pts.len() as u32 / 2, 0, 2.0, 0.42, 0.72, 1.0, 1.0) };
 
         // ---- band handles + interaction ---------------------------------
+        // Drawn at the SAME geometry the grab test below uses (handle_pt).
         for bi in 0..NBANDS {
             let base = bi * 4;
-            let typ = p[base] as i32;
-            if typ == 0 {
+            if p[base] as i32 == 0 {
                 continue;
             }
-            let f = p[base + 1];
-            let wf = core::f64::consts::TAU * f as f64;
-            let mut mag = 1.0f64;
-            for b in disp.iter() {
-                mag *= b.mag(wf);
-            }
-            let db = mag.max(1e-6).log10() as f32 * 20.0;
-            let hx = gx + f2x(f, gw);
-            let hy = gy + db2y(db, gph);
+            let (hx, hy) = handle_pt(bi, &p, gx, gy, gw, gph);
             let sel = gs.sel == bi;
             let (r, g, bcol) = if sel { (1.0, 0.75, 0.30) } else { (0.45, 0.62, 0.85) };
             unsafe {
@@ -566,19 +578,15 @@ extern "C" fn gui_draw(
             let s = std::ffi::CString::new(fmt_hz(hf)).unwrap();
             (api.text)(c, mx, gy + 7.0, 10.0, 1, 0.9, 0.9, 0.95, 1.0, s.as_ptr());
         }
-        // Press near a handle grabs it; near empty graph with shift? keep simple.
+        // Press near a handle grabs it (same geometry that drew it).
         if fr.mouse_pressed != 0 {
             let mut best = None;
-            let mut bestd = 14.0f32;
+            let mut bestd = 16.0f32;
             for bi in 0..NBANDS {
-                let base = bi * 4;
-                if p[base] as i32 == 0 {
+                if p[bi * 4] as i32 == 0 {
                     continue;
                 }
-                let hx = gx + f2x(p[base + 1], gw);
-                // approximate handle y from gain for peaking/shelf, else center
-                let uses_gain = matches!(p[base] as i32, 1 | 2 | 3);
-                let hy = if uses_gain { gy + db2y(p[base + 2], gph) } else { gy + gph * 0.5 };
+                let (hx, hy) = handle_pt(bi, &p, gx, gy, gw, gph);
                 let d = ((hx - mx).abs()).max((hy - my).abs());
                 if d < bestd {
                     bestd = d;
@@ -643,13 +651,27 @@ extern "C" fn gui_draw(
             sp(P_MIX as u32, 1.0);
             sp(P_OUT as u32, 1.0);
         }
+        // Edge-filter quick toggles: one click drops a lowpass on B1 /
+        // highpass on B6 (the usual LP/HP positions); clicking again puts
+        // the band's default shelf back.
+        let b6 = (NBANDS - 1) as u32 * 4;
+        let lp_on = gp(0) as i32 == 4;
+        let s = std::ffi::CString::new(format!("B1 lp {}", if lp_on { "on" } else { "off" })).unwrap();
+        if (api.button)(c, bx + 152.0, sy, 78.0, s.as_ptr()) != 0 {
+            sp(0, if lp_on { BAND_DEFS[0][0] } else { 4.0 });
+        }
+        let hp_on = gp(b6) as i32 == 5;
+        let s = std::ffi::CString::new(format!("B6 hp {}", if hp_on { "on" } else { "off" })).unwrap();
+        if (api.button)(c, bx + 234.0, sy, 78.0, s.as_ptr()) != 0 {
+            sp(b6, if hp_on { BAND_DEFS[NBANDS - 1][0] } else { 5.0 });
+        }
 
         // Selected-band controls.
         let by = sy + 30.0;
         let sel = gs.sel.min(NBANDS - 1);
         let base = sel * 4;
         let typ = gp(base as u32) as i32;
-        let uses_gain = matches!(typ, 1 | 2 | 3);
+        let uses_gain = uses_gain(typ);
         let uses_q = true;
         let s = std::ffi::CString::new(format!("B{}: {}", sel + 1, TYPE_NAMES[typ.clamp(0, 7) as usize])).unwrap();
         (api.text)(c, 12.0, by + 10.0, 12.0, 0, 0.85, 0.85, 0.9, 1.0, s.as_ptr());

@@ -193,9 +193,11 @@ non-blocking, `depth 0`-style pass-through not required but polite). Effects
 are compiled with `rustc --edition 2021 --crate-type cdylib` — so **rustc
 must be installed** to use custom effects; a missing compiler just lists
 scripts with a hint. Working examples in the repo: `effects/parametric_eq.rs`
-(6-band EQ with response curve + 240-band live spectrum in its own window) and
-`effects/space_echo.rs` (animated echo window with factory space presets:
-practice hall, auditorium, opera house, cathedral).
+(6-band EQ with response curve + 240-band live spectrum, draggable band
+handles and B1 lowpass / B6 highpass quick toggles in its own window) and
+`effects/space_echo.rs` (**Echo + Reverb**: animated echo window, independent
+echo/reverb levels, factory presets — plain echo, practice hall, auditorium,
+opera house, cathedral).
 
 ### MIDI binding
 
