@@ -101,25 +101,45 @@ impl Delay {
 // ---------------------------------------------------------------------------
 // Schroeder comb with damping (Freeverb topology) and all-pass diffusers.
 // ---------------------------------------------------------------------------
+/// Feedback comb with damped loop and a SLOWLY MODULATED delay time.
+/// A fixed-length comb is a row of infinitely thin resonances; after a
+/// transient they ring as individual high-pitched partials — the metallic
+/// "ping" (worse with few, closely-spaced combs, and untreatable by the
+/// damping knob). Sweeping the length a fraction of a sample at <1 Hz
+/// (the EMT-250 / Bricasti trick) Doppler-spreads each mode into a dense
+/// band, so late tails wash instead of ring. Read is linearly
+/// interpolated at the fractional delay.
 struct Comb {
     buf: Vec<f64>,
     idx: usize,
     lp: f64,
+    /// base delay in samples and modulation depth/phase offset
+    base: f64,
+    depth: f64,
+    off: f64,
 }
 
 impl Comb {
-    fn new(n: usize) -> Self {
-        Self { buf: vec![0.0; n.max(4)], idx: 0, lp: 0.0 }
+    fn new(base: f64, off: f64) -> Self {
+        let n = (base as usize + 4).max(4);
+        let depth = (base * 0.0018).clamp(0.5, 3.5); // ±0.5..3.5 samples
+        Self { buf: vec![0.0; n], idx: 0, lp: 0.0, base, depth, off }
     }
     #[inline]
-    fn process(&mut self, x: f64, fb: f64, damp_c: f64) -> f64 {
-        let out = self.buf[self.idx];
+    fn process(&mut self, x: f64, fb: f64, damp_c: f64, phase: f64) -> f64 {
+        let d = self.base + self.depth * (phase + self.off).sin();
+        let n = self.buf.len();
+        let di = d as usize;
+        let fr = d - di as f64;
+        let i0 = (self.idx + n - 1 - (di % n)) % n;
+        let i1 = (i0 + n - 1) % n;
+        let out = self.buf[i0] + (self.buf[i1] - self.buf[i0]) * fr;
         self.lp = out * (1.0 - damp_c) + self.lp * damp_c;
         if !self.lp.is_finite() {
             self.lp = 0.0;
         }
         self.buf[self.idx] = x + self.lp * fb;
-        self.idx = (self.idx + 1) % self.buf.len();
+        self.idx = (self.idx + 1) % n;
         if !out.is_finite() {
             return 0.0;
         }
@@ -164,6 +184,8 @@ struct SpaceEcho {
     tone_c: f64,
     phase: f64, // LFO phase (radians)
     combs: [Comb; 8],
+    /// comb-length modulation clock (radians)
+    vphase: f64,
     ap: [Allpass; 4],
     /// comb lengths at sr=44.1 kHz; scaled by sr and by a 0.9..1.1 "room"
     /// spread so the two banks don't share modes.
@@ -190,7 +212,7 @@ impl SpaceEcho {
         let sr = if sample_rate.is_finite() && sample_rate > 1.0 { sample_rate } else { 48000.0 };
         let dl_n = (sr * 2.5) as usize + 16; // up to 2.5 s delay
         let scale = sr / 44100.0;
-        let combs = COMB_TUNE.map(|t| Comb::new(((t * scale) as usize) + 1));
+        let combs = COMB_TUNE.map(|t| Comb::new(t * scale, t)); // phase offset = tuning
         let ap = AP_TUNE.map(|t| Allpass::new((t * scale) as usize + 1));
         Self {
             sr,
@@ -199,6 +221,7 @@ impl SpaceEcho {
             tone_c: 0.5,
             phase: 0.0,
             combs,
+            vphase: 0.0,
             ap,
             mix: 0.4,
             out: 1.0,
@@ -277,9 +300,14 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     // halo around the slap — the preset row drives echo down / verb up.
     let verb_in = (echoed * 0.6 + x * 0.4) * 0.45;
     let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
+    // comb-length LFO: ~0.85 Hz, one clock, per-comb offsets from the tunings.
+    st.vphase += core::f64::consts::TAU * 0.85 / sr;
+    if st.vphase > core::f64::consts::TAU {
+        st.vphase -= core::f64::consts::TAU;
+    }
     let mut sum = 0.0f64;
     for c in st.combs.iter_mut() {
-        sum += c.process(verb_in, decay, damp_c);
+        sum += c.process(verb_in, decay, damp_c, st.vphase);
     }
     let mut v = sum * 0.5;
     for a in st.ap.iter_mut() {

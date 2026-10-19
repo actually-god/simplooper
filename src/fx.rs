@@ -144,15 +144,20 @@ fn seed_api(dir: &Path) {
     if fresh && !t.exists() {
         let _ = std::fs::write(&t, TEMPLATE_SRC);
     }
-    // Bundled examples are UPDATED with every app release, not just seeded
-    // once: the previous write-only-if-absent rule meant plugin fixes shipped
-    // in later releases never reached an existing install — users ran the
-    // day-one scripts forever ("EQ still has all bugs" while the repo copy
-    // was fixed). A file about to change is copied to `<name>.rs.bak`
-    // (single generation) first, so nothing is lost; a user customization
-    // that must survive updates belongs under its own file name.
+    // Bundled examples that are ALREADY PRESENT are updated with every app
+    // release, not just seeded once: the previous write-only-if-absent rule
+    // meant plugin fixes shipped in later releases never reached an existing
+    // install — users ran the day-one scripts forever ("EQ still has all
+    // bugs" while the repo copy was fixed). A file about to change is copied
+    // to `<name>.rs.bak` (single generation) first, so nothing is lost; a
+    // user customization that must survive updates belongs under its own
+    // file name. Files that are NOT present are never added to an existing
+    // folder — only a fresh folder gets the full starter set.
     for (name, src) in EXAMPLES {
         let p = dir.join(name);
+        if !p.exists() && !fresh {
+            continue;
+        }
         match std::fs::read_to_string(&p) {
             Ok(cur) if cur == *src => {}
             Ok(cur) => {
@@ -988,6 +993,90 @@ mod tests {
         let peak = win.iter().cloned().fold(0.0f32, f32::max);
         assert!(win[7] < peak, "tail must decay: {win:?}");
         drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn space_echo_tail_modes_are_dense_not_metallic() {
+        // Objective guard against the metallic "ping" on transients: after
+        // an impulse, the LATE reverb tail must be a dense wash, not a
+        // handful of knife-edge resonances. Method: impulse -> settle 0.4 s
+        // -> Hann-windowed Goertzel of the next 0.4 s at 97 log-spaced
+        // frequencies, count resonances standing out of the average floor.
+        // Four bunched combs produced a handful of huge isolated peaks; the
+        // eight-comb Freeverb bank must produce many more, much flatter
+        // ones.
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("echomodes");
+        let probe = |dir: &Path, stem: &str| -> (usize, f64) {
+            let mut reg = Registry::open(dir.to_path_buf());
+            reg.rescan();
+            // cathedral-ish: long decay, moderate damp, echo level 0 so the
+            // FDN alone is measured.
+            let inst = reg
+                .create_instance(
+                    stem,
+                    48000.0,
+                    &[0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 2800.0, 1.0, 1.0, 0.0, 1.0],
+                )
+                .expect("echo instance");
+            let _ = inst.process_private(1.0);
+            for _ in 0..24000 {
+                let _ = inst.process_private(0.0);
+            }
+            // 2 s late window: fine (0.5 Hz) resolution so INDIVIDUAL comb
+            // modes resolve — that is exactly where sparse banks look
+            // metallic and dense ones look like a wash.
+            const N: usize = 96000;
+            let mut x = Vec::with_capacity(N);
+            for _ in 0..N {
+                x.push(inst.process_private(0.0) as f64);
+            }
+            let mut mags = Vec::new();
+            for k in 0..161 {
+                let f = 150.0f64 * (14000.0f64 / 150.0).powf(k as f64 / 160.0);
+                let w = core::f64::consts::TAU * f / 48000.0;
+                let cw = w.cos();
+                let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                for (n, &v) in x.iter().enumerate() {
+                    let h = 0.5 - 0.5 * (core::f64::consts::TAU * n as f64 / (N as f64 - 1.0)).cos();
+                    let s0 = v * h + 2.0 * cw * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                mags.push((s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).max(0.0).sqrt());
+            }
+            let mean = mags.iter().sum::<f64>() / mags.len() as f64;
+            let mut peaks = 0usize;
+            let mut ratio = 0.0f64; // strongest peak / mean: concentration
+            for i in 1..mags.len() - 1 {
+                if mags[i] > mags[i - 1] && mags[i] >= mags[i + 1] && mags[i] > mean * 2.0 {
+                    peaks += 1;
+                }
+                ratio = ratio.max(mags[i] / mean.max(1e-30));
+            }
+            drop(reg);
+            (peaks, ratio)
+        };
+        let (peaks, ratio) = probe(&dir, "space_echo");
+        println!("MODEPROBE current: peaks={peaks} concentration={ratio:.1}");
+        if let Ok(old_path) = std::env::var("MODEPROBE_OLD") {
+            let odir = temp_dir("echomodes_old");
+            std::fs::write(odir.join(API_FILE), API_SRC).unwrap();
+            let src = std::fs::read_to_string(&old_path).unwrap();
+            std::fs::write(odir.join("old_echo.rs"), src).unwrap();
+            let (op, or_) = probe(&odir, "old_echo");
+            println!("MODEPROBE old: peaks={op} concentration={or_:.1}");
+            let _ = std::fs::remove_dir_all(&odir);
+        }
+        // Calibration (same probe): 4 bunched combs scored ~18x, the fixed
+        // 8-comb bank ~15x, the modulated bank lands ~7x. Assert well below
+        // the metallic baseline but above regressions; the peaks floor only
+        // guards against measuring a silent tail.
+        assert!(peaks >= 5, "late tail empty? only {peaks} resonances visible");
+        assert!(ratio < 10.0, "late tail metallic: one resonance {ratio:.0}x the floor");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
