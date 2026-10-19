@@ -3,8 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A minimalist live audio looper built in Rust for Linux (JACK / PipeWire-JACK).
-Sixteen simultaneous loops with record/overdub, waveform dashboard, MIDI
-binding, independent/dependent loop modes, an easy quantize tool, a metronome,
+Sixteen simultaneous stereo-aware loops with record/overdub, waveform
+dashboard, MIDI binding, per-loop pan and L/R output routing,
+independent/dependent loop modes, an easy quantize tool, a metronome,
 import/export, and runtime-compiled per-loop effects.
 
 **Docs:** [install guide](docs/INSTALL.md) · [user guide](docs/USAGE.md) ·
@@ -24,24 +25,29 @@ import/export, and runtime-compiled per-loop effects.
   resurrected.
 - **Dashboard** — the main window is a scrollable stack of sixteen track rows,
   each showing the recorded waveform plus REC / OD / PLAY / CLEAR / IMPORT
-  buttons. Every row also carries per-loop **volume** and **gain** sliders:
-  the slider shows the live **dB** readout centred on it (volume: 0 = −∞ …
-  127 = 0 dB; gain: 80 = 0 dB, 127 = +10 dB), the raw MIDI value sits in the
-  text beside it. They trim that loop's playback — recorded audio itself is
-  never re-leveled.
+  buttons. Every row also carries per-loop **vol**, **gain** and **pan**
+  controls: the text boxes are editable (type a dB value or pan 0–100 and
+  press Enter), the number beside each slider is the raw MIDI value. Volume
+  trims playback (0 = −∞ … 127 = 0 dB), gain trims in/out (80 = 0 dB,
+  127 = +10 dB), and pan positions the loop across the stereo L/R buses
+  (0 = hard left, 50 = centre, 100 = hard right, equal power). They only
+  shape playback/monitoring — recorded audio itself is never re-leveled.
 - **Settings menu** — the three-bar (hamburger) button in the top-left opens
-  the settings panel: input/output port selection, master gain, latency
+  the settings panel: input/output port selection (each output gets **L**,
+  **R** or both — both plays the mono downmix), master gain, latency
   compensation, and per-action MIDI + keyboard bindings. Port selections are
   persisted between sessions and automatically re-applied when JACK comes up,
   so audio flows on launch without re-selecting.
 - **MIDI binding** — every action (loop select, record/overdub/clear/play-stop
-  on the selected loop, direct per-loop controls, per-loop volume/gain knobs,
-  dependent toggle) can be bound to a live-captured Note On/Off, CC, or
-  Program Change (channel + note/controller/program). Bindings are recorded
-  by clicking the cell and sending a message; velocity/CC value is ignored so
-  pedals and knobs fire anywhere — except the per-loop *volume (knob)* /
-  *gain (knob)* bindings, which read the message value (0–127: 0 =
-  off/−∞, 127 = max). All bindings persist between sessions.
+  on the selected loop, direct per-loop controls, dependent toggle) can be
+  bound to a live-captured Note On/Off, CC, or Program Change (channel +
+  note/controller/program). Bindings are recorded by clicking the cell and
+  sending a message; velocity/CC value is ignored so pedals and knobs fire
+  anywhere — except the per-loop *volume* / *gain* / *pan* **(knob)**
+  bindings, which read the message value (0–127: 0 = off/−∞, 127 = max) and
+  support **two-point axis calibration** (sweep the knob to its physical
+  min/max so odd controllers use their whole travel, inverted axes
+  included). All bindings persist between sessions.
 - **Keyboard shortcuts** — keys `1`–`4` select a loop (the selected row is
   highlighted); `space` play/stop, `R` record, `O` overdub, `C` clear act on
   the selected loop; `D` toggles dependent mode; `M` toggles the metronome;
@@ -72,11 +78,15 @@ import/export, and runtime-compiled per-loop effects.
   WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
 - **MIDI monitor** — a permanent `simplooper:midi_in` JACK MIDI port; every
   incoming event is parsed and shown in the bottom panel and on stdout.
-- **Live mix passthrough** — selected inputs are summed × master gain into
-  selected outputs, independent of the loop engine.
+- **Live mix passthrough & monitoring** — selected inputs are summed × master
+  gain into selected outputs (per-port L/R routing). Input monitoring rides
+  the **selected** loop's chain: its gain × volume × effects × pan shape the
+  live pass-through, so what you hear is what that loop will do to your
+  signal. Recording and overdubs always capture the raw input.
 - **Per-loop effects** — a runtime-compiled effects framework. Each loop row's
-  bottom strip stacks **volume** over **gain** (bottom-left), puts an **FX**
-  button next to them, and shows every enabled effect *after* the button —
+  bottom strip stacks **vol**, **gain** and **pan** (bottom-left), puts an
+  **FX** button next to them, and shows every enabled effect *after* the
+  button as name buttons —
   each with live sliders for the parameters its script declares, plus a
   click-through editor window (automatic sliders, or a **scripted custom
   GUI** when the effect provides one). The Effects window (the FX button)
@@ -137,8 +147,9 @@ Full walkthrough in [docs/USAGE.md](docs/USAGE.md). The short version:
 1. Wait for `JACK ready` in the top bar (client name + sample rate).
 2. Click the **hamburger** (top-left) to open settings; under **INPUTS** tick
    the remote output ports you want to loop (they are summed), under
-   **OUTPUTS** tick your speakers/monitor mix, then **Apply Selection**. Your
-   selection is saved and re-applied automatically on the next launch.
+   **OUTPUTS** tick each speaker/monitor port's **L**, **R** or both (both =
+   mono downmix), then **Apply Selection**. Your selection is saved and
+   re-applied automatically on the next launch.
 3. On each track row: **REC** captures a fresh loop (auto-stops at ~60 s and
    starts playing), **OD** overdubs live input onto the existing loop,
    **PLAY** toggles playback, **CLEAR** zeros the buffer.
@@ -191,8 +202,12 @@ Send events into `simplooper:midi_in` (hardware via PipeWire, or
 cell next to any action — it turns blue and shows *listening…* — then send a
 Note On/Off, CC, or Program Change; the first matching message becomes the
 binding (the second data byte — velocity / CC value — is ignored, so pedals and
-knobs fire anywhere; the per-loop *volume (knob)* / *gain (knob)* bindings are
-the exception — they act on the value, 0 = silence/−∞ up to 127 = max).
+knobs fire anywhere; the per-loop *volume* / *gain* / *pan* **(knob)** bindings
+are the exception — they act on the value, 0 = silence/−∞ up to 127 = max).
+Knob bindings additionally support **calibration**: after binding, start the
+calibration flow, sweep the physical control to its minimum and press **Lock
+min**, sweep to the maximum, **Finish** — the control's travel is then scaled
+onto the full 0–127 range (backwards-wired knobs are inverted automatically).
 Click the cell again or press `Esc` to cancel without
 changing anything; while a cell is listening, `Del` clears that binding.
 **Reset to defaults** restores the factory key bindings.
