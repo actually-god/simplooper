@@ -128,7 +128,10 @@ if [ "${1:-}" = "--full" ]; then
     err "sandbox makepkg build failed (see $tmp/proj/build.log)"
     tail -20 "$tmp/proj/build.log" >&2
   fi
-  pkg=$(ls "$tmp"/proj/*.pkg.tar.zst "$tmp"/proj/pkg/*.pkg.tar.zst 2>/dev/null | head -1)
+  # Glob with the package-name prefix on purpose: a stale *.pkg.tar.zst left
+  # in the project root (gitignored build leftovers) would otherwise be
+  # copied into the sandbox and inspected instead of the fresh build.
+  pkg=$(ls "$tmp"/proj/slooper-*.pkg.tar.zst "$tmp"/proj/pkg/slooper/*.pkg.tar.zst 2>/dev/null | head -1)
   if [ -z "$pkg" ]; then
     err "no .pkg.tar.zst produced"
   else
