@@ -291,208 +291,91 @@ pub fn scale_axis(raw: u8, lo: u8, hi: u8) -> u8 {
 }
 
 /// A bindable *action* a MIDI trigger can fire. Mirrors the keyboard
-/// shortcuts (selected-track actions) plus direct per-loop actions.
+/// shortcuts (selected-track actions) plus direct per-track actions and the
+/// global transport controls.
+///
+/// The removed v0.1 actions (overdub, import, dependent mode, undo/redo) are
+/// gone from the table; a persisted config that still names one deserializes
+/// to [`MidiAction::Reserved`] and the binding is dropped on load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MidiAction {
-    /// Record / overdub / clear / play-stop the *selected* track.
+    /// Record the *selected* track (capture starts now; the take becomes an
+    /// asset placed at the playhead when recording stops).
     RecSelected,
-    OdSelected,
     ClearSelected,
+    /// Toggle the selected track's play/stop (its lane in the transport).
     PlaySelected,
-    /// Import a recording file into the selected loop (opens file dialog).
-    ImportSelected,
-    /// Open the export prompt (one loop or whole project).
+    /// Open the export prompt (one track or the whole project).
     Export,
     /// Select track `i` (0-based).
     Select(usize),
     /// Direct per-track actions (independent of selection).
     RecLoop(usize),
-    OdLoop(usize),
     ClearLoop(usize),
     PlayLoop(usize),
-    /// Toggle dependent (ensemble) mode.
-    Dependent,
     /// Toggle the metronome (click goes to the outputs only, never recorded).
     Metronome,
-    /// Select the next loop (wraps around).
+    /// Select the next track (wraps around).
     SelectNext,
-    /// Select the previous loop (wraps around).
+    /// Select the previous track (wraps around).
     SelectPrev,
-    /// Undo the most recent overdub (global — reverts the loop it was dubbed
-    /// over to its pre-overdub content).
-    UndoOverdub,
-    /// Redo the most recently undone overdub.
-    RedoOverdub,
-    /// Set loop `i`'s playback volume from a continuous controller: the
+    /// Start the global transport (all *sounding* tracks play together).
+    PlayAll,
+    /// Stop the global transport (playhead holds its position).
+    StopAll,
+    /// Set track `i`'s playback volume from a continuous controller: the
     /// binding fires on the message VALUE (CC / note velocity, 0..=127;
     /// 0 = -inf dB, 127 = 0 dB). Keyboard bindings cannot carry a value and
     /// are never fired for these actions.
     VolLoop(usize),
-    /// Set loop `i`'s gain trim from a continuous controller (0 = -inf dB,
+    /// Set track `i`'s gain trim from a continuous controller (0 = -inf dB,
     /// 80 = 0 dB, 127 = +10 dB). Value semantics as [`MidiAction::VolLoop`].
     GainLoop(usize),
-    /// Set loop `i`'s stereo pan from a continuous controller (0 = hard
+    /// Set track `i`'s stereo pan from a continuous controller (0 = hard
     /// left, 64 = centre, 127 = hard right; equal-power law). Value
     /// semantics as [`MidiAction::VolLoop`].
     PanLoop(usize),
+    /// Catch-all for action names this build no longer knows (see the enum
+    /// doc); never bindable, never fired.
+    #[serde(other)]
+    Reserved,
 }
 
 impl MidiAction {
     /// Every bindable action, in UI order. `ALL[i]` is the action stored at
-    /// index `i` of the binding table: global actions first, then one
-    /// `Select` per loop, then record/overdub/clear/play for each of the 16
-    /// loops (the settings panel shows these through a loop dropdown), then
-    /// dependent mode, metronome, and next/previous selection. New actions
-    /// must be APPENDED (the persisted `shortcuts` vector is positional).
-    pub const ALL: [MidiAction; 140] = [
-        MidiAction::RecSelected,
-        MidiAction::OdSelected,
-        MidiAction::ClearSelected,
-        MidiAction::PlaySelected,
-        MidiAction::ImportSelected,
-        MidiAction::Export,
-        // Select(0..15): pick a loop by MIDI.
-        MidiAction::Select(0),
-        MidiAction::Select(1),
-        MidiAction::Select(2),
-        MidiAction::Select(3),
-        MidiAction::Select(4),
-        MidiAction::Select(5),
-        MidiAction::Select(6),
-        MidiAction::Select(7),
-        MidiAction::Select(8),
-        MidiAction::Select(9),
-        MidiAction::Select(10),
-        MidiAction::Select(11),
-        MidiAction::Select(12),
-        MidiAction::Select(13),
-        MidiAction::Select(14),
-        MidiAction::Select(15),
-        // Per-loop direct actions: for each of the 16 loops, record /
-        // overdub / clear / play-stop — independent of selection.
-        MidiAction::RecLoop(0),
-        MidiAction::OdLoop(0),
-        MidiAction::ClearLoop(0),
-        MidiAction::PlayLoop(0),
-        MidiAction::RecLoop(1),
-        MidiAction::OdLoop(1),
-        MidiAction::ClearLoop(1),
-        MidiAction::PlayLoop(1),
-        MidiAction::RecLoop(2),
-        MidiAction::OdLoop(2),
-        MidiAction::ClearLoop(2),
-        MidiAction::PlayLoop(2),
-        MidiAction::RecLoop(3),
-        MidiAction::OdLoop(3),
-        MidiAction::ClearLoop(3),
-        MidiAction::PlayLoop(3),
-        MidiAction::RecLoop(4),
-        MidiAction::OdLoop(4),
-        MidiAction::ClearLoop(4),
-        MidiAction::PlayLoop(4),
-        MidiAction::RecLoop(5),
-        MidiAction::OdLoop(5),
-        MidiAction::ClearLoop(5),
-        MidiAction::PlayLoop(5),
-        MidiAction::RecLoop(6),
-        MidiAction::OdLoop(6),
-        MidiAction::ClearLoop(6),
-        MidiAction::PlayLoop(6),
-        MidiAction::RecLoop(7),
-        MidiAction::OdLoop(7),
-        MidiAction::ClearLoop(7),
-        MidiAction::PlayLoop(7),
-        MidiAction::RecLoop(8),
-        MidiAction::OdLoop(8),
-        MidiAction::ClearLoop(8),
-        MidiAction::PlayLoop(8),
-        MidiAction::RecLoop(9),
-        MidiAction::OdLoop(9),
-        MidiAction::ClearLoop(9),
-        MidiAction::PlayLoop(9),
-        MidiAction::RecLoop(10),
-        MidiAction::OdLoop(10),
-        MidiAction::ClearLoop(10),
-        MidiAction::PlayLoop(10),
-        MidiAction::RecLoop(11),
-        MidiAction::OdLoop(11),
-        MidiAction::ClearLoop(11),
-        MidiAction::PlayLoop(11),
-        MidiAction::RecLoop(12),
-        MidiAction::OdLoop(12),
-        MidiAction::ClearLoop(12),
-        MidiAction::PlayLoop(12),
-        MidiAction::RecLoop(13),
-        MidiAction::OdLoop(13),
-        MidiAction::ClearLoop(13),
-        MidiAction::PlayLoop(13),
-        MidiAction::RecLoop(14),
-        MidiAction::OdLoop(14),
-        MidiAction::ClearLoop(14),
-        MidiAction::PlayLoop(14),
-        MidiAction::RecLoop(15),
-        MidiAction::OdLoop(15),
-        MidiAction::ClearLoop(15),
-        MidiAction::PlayLoop(15),
-        MidiAction::Dependent,
-        MidiAction::Metronome,
-        MidiAction::SelectNext,
-        MidiAction::SelectPrev,
-        // APPENDED (never inserted): the persisted shortcut table is positional.
-        MidiAction::UndoOverdub,
-        MidiAction::RedoOverdub,
-        // Per-loop continuous (knob/slider) bindings, appended per loop.
-        MidiAction::VolLoop(0),
-        MidiAction::GainLoop(0),
-        MidiAction::VolLoop(1),
-        MidiAction::GainLoop(1),
-        MidiAction::VolLoop(2),
-        MidiAction::GainLoop(2),
-        MidiAction::VolLoop(3),
-        MidiAction::GainLoop(3),
-        MidiAction::VolLoop(4),
-        MidiAction::GainLoop(4),
-        MidiAction::VolLoop(5),
-        MidiAction::GainLoop(5),
-        MidiAction::VolLoop(6),
-        MidiAction::GainLoop(6),
-        MidiAction::VolLoop(7),
-        MidiAction::GainLoop(7),
-        MidiAction::VolLoop(8),
-        MidiAction::GainLoop(8),
-        MidiAction::VolLoop(9),
-        MidiAction::GainLoop(9),
-        MidiAction::VolLoop(10),
-        MidiAction::GainLoop(10),
-        MidiAction::VolLoop(11),
-        MidiAction::GainLoop(11),
-        MidiAction::VolLoop(12),
-        MidiAction::GainLoop(12),
-        MidiAction::VolLoop(13),
-        MidiAction::GainLoop(13),
-        MidiAction::VolLoop(14),
-        MidiAction::GainLoop(14),
-        MidiAction::VolLoop(15),
-        MidiAction::GainLoop(15),
-        // APPENDED 2026-10: per-loop pan, appended as a block so the
-        // existing vol/gain slot indices never move.
-        MidiAction::PanLoop(0),
-        MidiAction::PanLoop(1),
-        MidiAction::PanLoop(2),
-        MidiAction::PanLoop(3),
-        MidiAction::PanLoop(4),
-        MidiAction::PanLoop(5),
-        MidiAction::PanLoop(6),
-        MidiAction::PanLoop(7),
-        MidiAction::PanLoop(8),
-        MidiAction::PanLoop(9),
-        MidiAction::PanLoop(10),
-        MidiAction::PanLoop(11),
-        MidiAction::PanLoop(12),
-        MidiAction::PanLoop(13),
-        MidiAction::PanLoop(14),
-        MidiAction::PanLoop(15),
-    ];
+    /// index `i` of the binding table: selected-track globals, one `Select`
+    /// per track, record/clear/play for each of the 16 tracks, the metronome
+    /// and selection movers, the global transport (play all / stop all), then
+    /// the per-track continuous (knob/slider) bindings.
+    ///
+    /// v0.2 reshaped this table when overdub/import/dependent/undo/redo were
+    /// removed; the old positional tables (length 140 / 25 / 9) are remapped
+    /// on load (see `ui::migrate_shortcuts`). New actions must be APPENDED.
+    pub const ALL: [MidiAction; 121] = {
+        // const-friendly construction: the layout is fully arithmetic.
+        let mut a = [MidiAction::Reserved; 121];
+        a[0] = MidiAction::RecSelected;
+        a[1] = MidiAction::ClearSelected;
+        a[2] = MidiAction::PlaySelected;
+        a[3] = MidiAction::Export;
+        let mut i = 0usize;
+        while i < 16 {
+            a[4 + i] = MidiAction::Select(i);
+            a[20 + i * 3] = MidiAction::RecLoop(i);
+            a[21 + i * 3] = MidiAction::ClearLoop(i);
+            a[22 + i * 3] = MidiAction::PlayLoop(i);
+            a[73 + i * 2] = MidiAction::VolLoop(i);
+            a[74 + i * 2] = MidiAction::GainLoop(i);
+            a[105 + i] = MidiAction::PanLoop(i);
+            i += 1;
+        }
+        a[68] = MidiAction::Metronome;
+        a[69] = MidiAction::SelectNext;
+        a[70] = MidiAction::SelectPrev;
+        a[71] = MidiAction::PlayAll;
+        a[72] = MidiAction::StopAll;
+        a
+    };
 
     /// Position of `a` in [`MidiAction::ALL`] (binding-table index).
     pub fn idx(a: MidiAction) -> usize {
@@ -503,25 +386,22 @@ impl MidiAction {
     pub fn label(self) -> String {
         match self {
             MidiAction::RecSelected => "record (selected)".into(),
-            MidiAction::OdSelected => "overdub (selected)".into(),
             MidiAction::ClearSelected => "clear (selected)".into(),
             MidiAction::PlaySelected => "play / stop (selected)".into(),
-            MidiAction::ImportSelected => "import (selected)".into(),
             MidiAction::Export => "export".into(),
-            MidiAction::Select(i) => format!("select loop {}", i + 1),
-            MidiAction::RecLoop(i) => format!("loop {}: record", i + 1),
-            MidiAction::OdLoop(i) => format!("loop {}: overdub", i + 1),
-            MidiAction::ClearLoop(i) => format!("loop {}: clear", i + 1),
-            MidiAction::PlayLoop(i) => format!("loop {}: play / stop", i + 1),
-            MidiAction::Dependent => "dependent mode".into(),
+            MidiAction::Select(i) => format!("select track {}", i + 1),
+            MidiAction::RecLoop(i) => format!("track {}: record", i + 1),
+            MidiAction::ClearLoop(i) => format!("track {}: clear", i + 1),
+            MidiAction::PlayLoop(i) => format!("track {}: play / stop", i + 1),
             MidiAction::Metronome => "metronome on / off".into(),
-            MidiAction::SelectNext => "select next loop".into(),
-            MidiAction::SelectPrev => "select previous loop".into(),
-            MidiAction::UndoOverdub => "undo overdub".into(),
-            MidiAction::RedoOverdub => "redo overdub".into(),
-            MidiAction::VolLoop(i) => format!("loop {}: volume (knob)", i + 1),
-            MidiAction::GainLoop(i) => format!("loop {}: gain (knob)", i + 1),
-            MidiAction::PanLoop(i) => format!("loop {}: pan (knob)", i + 1),
+            MidiAction::SelectNext => "select next track".into(),
+            MidiAction::SelectPrev => "select previous track".into(),
+            MidiAction::PlayAll => "play all".into(),
+            MidiAction::StopAll => "stop all".into(),
+            MidiAction::VolLoop(i) => format!("track {}: volume (knob)", i + 1),
+            MidiAction::GainLoop(i) => format!("track {}: gain (knob)", i + 1),
+            MidiAction::PanLoop(i) => format!("track {}: pan (knob)", i + 1),
+            MidiAction::Reserved => String::new(),
         }
     }
 
@@ -535,6 +415,52 @@ impl MidiAction {
 
 /// Number of bindable actions — `MidiAction::ALL.len()`.
 pub const N_ACTIONS: usize = MidiAction::ALL.len();
+
+/// Remap a persisted keyboard-shortcut table onto the v0.2 action layout.
+///
+/// The table is positional, so a config from an older build arrives with the
+/// old layout:
+/// Width **140** (v0.1.x: selected-track globals, import, overdub, dependent,
+/// undo/redo, a 4-slot per-loop block, vol/gain, pan) maps forward by
+/// remembering each surviving action's old slot; actions that no longer exist
+/// (overdub, import, dependent, undo, redo) are dropped. Width **25** (early
+/// v0.0.x, the 1-4-loop era) maps the few globals it had. Any other width
+/// cannot be trusted — the caller starts from the new defaults instead.
+///
+/// Returns exactly `N_ACTIONS` entries.
+pub fn migrate_shortcuts(old: &[Option<egui::Key>]) -> Vec<Option<egui::Key>> {
+    let mut out = vec![None; N_ACTIONS];
+    match old.len() {
+        n if n == N_ACTIONS => return old.to_vec(),
+        140 => {
+            // (old, new) slot pairs; removed actions have no entry.
+            for (o, n) in [(0, 0), (2, 1), (3, 2), (5, 3), (87, 68), (88, 69), (89, 70)] {
+                out[n] = old[o];
+            }
+            for i in 0..16 {
+                out[4 + i] = old[6 + i]; // Select
+                out[20 + i * 3] = old[22 + i * 4]; // record
+                out[21 + i * 3] = old[24 + i * 4]; // clear
+                out[22 + i * 3] = old[25 + i * 4]; // play
+                out[73 + i * 2] = old[92 + i * 2]; // volume knob
+                out[74 + i * 2] = old[93 + i * 2]; // gain knob
+                out[105 + i] = old[124 + i]; // pan knob
+            }
+        }
+        25 => {
+            for (o, n) in [(0, 4), (1, 5), (2, 6), (3, 7), (4, 0), (6, 1), (7, 2)] {
+                out[n] = old[o];
+            }
+            for i in 0..4 {
+                out[20 + i * 3] = old[8 + i * 4]; // record
+                out[21 + i * 3] = old[10 + i * 4]; // clear
+                out[22 + i * 3] = old[11 + i * 4]; // play
+            }
+        }
+        _ => return vec![None; N_ACTIONS], // unknown layout: caller applies defaults
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {

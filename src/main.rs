@@ -1,8 +1,10 @@
-//! simplooper — a minimalist live audio looper for Linux (JACK / PipeWire).
+//! simplooper — a minimalist clip-based audio DAW for Linux (JACK / PipeWire).
 //!
-//! Sixteen simultaneous loops with record/overdub/playback/clear, waveform
-//! dashboard, MIDI action mapping plus keyboard shortcuts, easy quantize,
-//! independent/dependent loop modes, live mix passthrough and a MIDI monitor.
+//! Sixteen tracks on a global, draggable playhead: asset-rack drag & drop
+//! onto a metronome-defined bar grid, additive child lanes, takes that
+//! record into rack assets + auto-placed clips, metronome-anchored
+//! quantize/trim, `.simplooper` projects, per-track effects, MIDI action
+//! mapping plus keyboard shortcuts, live mix passthrough and a MIDI monitor.
 
 /// Bundled application icon (placeholder for now — see assets/icon.png).
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");

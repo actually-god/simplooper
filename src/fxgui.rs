@@ -1,4 +1,4 @@
-//! Child GUI windows for per-loop effects.
+//! Child GUI windows for per-track effects.
 //!
 //! Every enabled effect gets a button on its loop row; the button opens
 //! this editor window. Two flavours, decided by the effect itself:
@@ -12,7 +12,7 @@
 //!   ([`Bridge`]), and call the effect's `draw`. No egui type ever crosses
 //!   the C boundary — only floats, pointers and u32s.
 //!
-//! One editor window at a time (simplooper's per-loop effects window and
+//! One editor window at a time (simplooper.s per-track effects window and
 //! the loop rows both route through it). The editor holds an `Arc<Instance>`
 //! clone for its whole lifetime, so the audio instance (and the dlopen'd
 //! library) cannot die under a live GUI.

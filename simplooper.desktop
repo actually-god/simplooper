@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=Simplooper
-Comment=Lightweight JACK audio looper with MIDI and keyboard control
+Comment=Lightweight JACK clip-based DAW with MIDI and keyboard control
 Exec=simplooper
 Icon=simplooper
 Terminal=false
 Categories=AudioVideo;Audio;Midi;
-Keywords=audio;jack;looper;midi;recording;
+Keywords=audio;jack;daw;loop;midi;recording;
 StartupNotify=true

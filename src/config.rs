@@ -1,9 +1,12 @@
-//! Persistent configuration: rebindable keyboard shortcuts, MIDI bindings and
-//! the dependent-mode "root loops" count.
+//! Persistent configuration: rebindable keyboard shortcuts, MIDI bindings,
+//! per-track mixer levels, metronome/grid settings and folder locations.
 //!
 //! Stored as JSON at `$XDG_CONFIG_HOME/simplooper/config.json` (falling back to
 //! `~/.config/simplooper/config.json`). A missing or corrupt file yields
 //! defaults; saving is best-effort (UI keeps working if the write fails).
+//! Unknown fields are ignored and removed fields (root loops, the old
+//! metronome-quantize toggle) simply drop out, so configs from any older
+//! build load cleanly.
 
 use std::path::PathBuf;
 
@@ -28,7 +31,7 @@ pub struct MidiAxisCal {
     pub hi: u8,
 }
 
-/// One enabled effect in a loop's saved chain (script stem + slider values,
+/// One enabled effect in a track's saved chain (script stem + slider values,
 /// in chain order). The stem is the key: dropping scripts is always safe.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackFxSave {
@@ -40,7 +43,8 @@ pub struct TrackFxSave {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Keyboard shortcuts as key names (e.g. `"R"`, `"Space"`), one per entry
-    /// of `MidiAction::ALL` (same order); null = unbound.
+    /// of `MidiAction::ALL` (same order); null = unbound. Tables from older
+    /// layouts are remapped on load (`midi::migrate_shortcuts`).
     #[serde(default)]
     pub shortcuts: Vec<Option<String>>,
     /// MIDI bindings (only bound actions are stored).
@@ -50,9 +54,6 @@ pub struct Config {
     /// Slots without an entry use the controller's full 0..=127 travel.
     #[serde(default)]
     pub midi_axis: Vec<MidiAxisCal>,
-    /// Dependent-mode ensemble length in units of the longest loop (>= 1).
-    #[serde(default = "default_root_loops")]
-    pub root_loops: u32,
     /// Last applied audio port selections — restored on the next launch so the
     /// user doesn't have to re-check the same ports every time.
     #[serde(default)]
@@ -69,40 +70,58 @@ pub struct Config {
     pub gui_scale: f32,
     /// Latency compensation in milliseconds: each fresh recording discards
     /// this much input at its start, so the button click that started the
-    /// take lands exactly at the loop start. Monitoring, overdubs and the
+    /// take lands exactly at the take's first sample. Monitoring and the
     /// output mix are never delayed.
     #[serde(default)]
     pub latency_ms: f32,
-    /// Per-loop playback volume, MIDI-knob style (0..=127; 0 = -inf, 127 =
+    /// Per-track playback volume, MIDI-knob style (0..=127; 0 = -inf, 127 =
     /// 0 dB). Missing entries fall back to 127.
     #[serde(default)]
     pub trk_vol: Vec<u8>,
-    /// Per-loop gain trim, MIDI-knob style (0..=127; 0 = -inf, 80 = 0 dB,
+    /// Per-track gain trim, MIDI-knob style (0..=127; 0 = -inf, 80 = 0 dB,
     /// 127 = +10 dB). Missing entries fall back to 80 (unity).
     #[serde(default)]
     pub trk_gain: Vec<u8>,
-    /// Per-loop stereo pan, MIDI-knob style (0..=127; 0 = hard left,
+    /// Per-track stereo pan, MIDI-knob style (0..=127; 0 = hard left,
     /// 64 = centre, 127 = hard right). Missing entries fall back to 64.
     #[serde(default)]
     pub trk_pan: Vec<u8>,
-    /// Metronome tempo in BPM.
+    /// Metronome tempo in BPM — also the tempo of the project grid.
     #[serde(default = "default_metro_bpm")]
     pub metro_bpm: u32,
-    /// Metronome subdivision as clicks per beat (1 = quarter, 2 = eighth, ...).
+    /// Metronome click subdivision as clicks per beat (1 = quarter, 2 = eighth).
     #[serde(default = "default_metro_sub")]
     pub metro_sub: u32,
     /// Metronome beats per measure (time-signature numerator); the first
-    /// quarter note of every measure gets the downbeat tone.
+    /// quarter note of every measure gets the downbeat tone and defines the
+    /// measure the timeline grid (and the ruler) is drawn on.
     #[serde(default = "default_metro_num")]
     pub metro_num: u32,
-    /// Easy quantize: snap to the metronome grid instead of the root loop.
+    /// Quantize grid: evenly-spaced steps per beat (index into the UI's
+    /// SUBDIVISIONS table; see `quantize::unit_samples`).
+    #[serde(default = "default_grid_sub")]
+    pub q_sub: u32,
+    /// Drag/drop snap grid: evenly-spaced steps per beat.
+    #[serde(default = "default_grid_sub")]
+    pub snap_sub: u32,
+    /// Snap freshly recorded takes' placement to the quantize grid.
+    #[serde(default = "default_true")]
+    pub auto_quantize: bool,
+    /// Timeline loop toggle: wrap the playhead at the end of the project.
+    #[serde(default = "default_true")]
+    pub loop_tl: bool,
+    /// Where `.simplooper` project files live (empty = `~/simplooper-projects`).
     #[serde(default)]
-    pub q_metro: bool,
+    pub project_dir: String,
+    /// Asset rack folders, in order. The first entry is the *primary* folder:
+    /// recordings are written there.
+    #[serde(default)]
+    pub rack_folders: Vec<String>,
     /// Effects folder ("" = default: `effects/` next to the installed
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
     pub fx_dir: String,
-    /// Per-loop effect chains: index = track, entries = enabled scripts in
+    /// Per-track effect chains: index = track, entries = enabled scripts in
     /// chain order (each stem + its slider values).
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
@@ -114,9 +133,6 @@ impl Default for Config {
             shortcuts: Vec::new(),
             midi: Vec::new(),
             midi_axis: Vec::new(),
-            // Must match serde's field default — the derived `Default` would
-            // give 0, which the UI clamps but is not a valid ensemble length.
-            root_loops: default_root_loops(),
             ports_in: Vec::new(),
             ports_out: Vec::new(),
             ports_out_lr: Vec::new(),
@@ -128,15 +144,16 @@ impl Default for Config {
             metro_bpm: default_metro_bpm(),
             metro_sub: default_metro_sub(),
             metro_num: default_metro_num(),
-            q_metro: false,
+            q_sub: default_grid_sub(),
+            snap_sub: default_grid_sub(),
+            auto_quantize: default_true(),
+            loop_tl: default_true(),
+            project_dir: String::new(),
+            rack_folders: Vec::new(),
             fx_dir: String::new(),
             track_fx: Vec::new(),
         }
     }
-}
-
-fn default_root_loops() -> u32 {
-    1
 }
 
 fn default_gui_scale() -> f32 {
@@ -153,6 +170,14 @@ fn default_metro_sub() -> u32 {
 
 fn default_metro_num() -> u32 {
     4
+}
+
+fn default_grid_sub() -> u32 {
+    4
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -184,6 +209,16 @@ impl Config {
         std::fs::write(&p, s).map_err(|e| e.to_string())
     }
 
+    /// Where `.simplooper` files live: the configured folder, or the
+    /// `simplooper-projects` folder in the user's home when unset.
+    pub fn projects_dir(&self) -> PathBuf {
+        if self.project_dir.trim().is_empty() {
+            home_dir().join("simplooper-projects")
+        } else {
+            PathBuf::from(self.project_dir.trim())
+        }
+    }
+
     /// MIDI binding for `action`, if any.
     pub fn midi_bind(&self, a: MidiAction) -> Option<MidiBind> {
         self.midi.iter().find(|b| b.action == a).and_then(|b| b.bind)
@@ -209,7 +244,6 @@ mod tests {
                 bind: Some(MidiBind { ty: 0, ch: 1, d1: 60 }),
             }],
             midi_axis: Vec::new(),
-            root_loops: 3,
             ports_in: vec!["remote:out_1".into()],
             ports_out: vec!["remote:in_1".into(), "remote:in_2".into()],
             ports_out_lr: vec![1, 2],
@@ -218,24 +252,32 @@ mod tests {
             metro_bpm: 96,
             metro_sub: 3,
             metro_num: 7,
-            q_metro: true,
+            q_sub: 6,
+            snap_sub: 2,
+            auto_quantize: false,
+            loop_tl: false,
+            project_dir: "/tmp/projects".into(),
+            rack_folders: vec!["/tmp/samples".into(), "/tmp/takes".into()],
+            fx_dir: "/tmp/effects".into(),
+            track_fx: vec![vec![TrackFxSave { stem: "template".into(), params: vec![0.5, 4.0] }]],
             trk_vol: vec![127, 100],
             trk_gain: vec![80, 60],
             trk_pan: vec![64, 20],
-            fx_dir: "/tmp/effects".into(),
-            track_fx: vec![vec![TrackFxSave { stem: "template".into(), params: vec![0.5, 4.0] }]],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back.shortcuts, cfg.shortcuts);
         assert_eq!(back.midi, cfg.midi);
-        assert_eq!(back.root_loops, 3);
         assert!((back.gui_scale - 1.25).abs() < f32::EPSILON);
         assert!((back.latency_ms - 12.5).abs() < f32::EPSILON);
         assert_eq!(back.metro_bpm, 96);
         assert_eq!(back.metro_sub, 3);
         assert_eq!(back.metro_num, 7);
-        assert!(back.q_metro);
+        assert_eq!(back.q_sub, 6);
+        assert_eq!(back.snap_sub, 2);
+        assert!(!back.auto_quantize && !back.loop_tl);
+        assert_eq!(back.project_dir, "/tmp/projects");
+        assert_eq!(back.rack_folders, cfg.rack_folders);
         assert_eq!(back.ports_in, cfg.ports_in);
         assert_eq!(back.ports_out, cfg.ports_out);
         assert_eq!(back.ports_out_lr, cfg.ports_out_lr);
@@ -250,20 +292,48 @@ mod tests {
     #[test]
     fn defaults_on_corrupt() {
         let back: Config = serde_json::from_str("{not json").unwrap_or_default();
-        assert_eq!(back.root_loops, 1);
+        assert_eq!(back.q_sub, 4);
         assert!(back.shortcuts.is_empty());
     }
 
     #[test]
-    fn missing_fields_default() {
-        let back: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(back.root_loops, 1);
+    fn missing_fields_default_and_removed_fields_tolerated() {
+        // An old config: removed fields (root_loops, q_metro) must be
+        // ignored, new ones must land on their documented defaults.
+        let back: Config =
+            serde_json::from_str(r#"{"root_loops": 3, "q_metro": true, "unknown": 1}"#).unwrap();
+        assert_eq!(back.q_sub, 4);
+        assert_eq!(back.snap_sub, 4);
+        assert!(back.auto_quantize, "recordings snap to the grid unless unticked");
+        assert!(back.loop_tl, "the timeline loops by default");
         assert!(back.midi.is_empty());
-        // Per-loop levels are #[serde(default)] — old configs load as empty
-        // and App::new falls them back to 127 (vol) / 80 (gain).
+        // Per-track levels are #[serde(default)] — old configs load as empty
+        // and App::new falls them back to 127 (vol) / 80 (gain) / 64 (pan).
         assert!(back.trk_vol.is_empty());
         assert!(back.trk_gain.is_empty());
         assert!(back.trk_pan.is_empty());
         assert!(back.ports_out_lr.is_empty());
+        assert!(back.rack_folders.is_empty());
+    }
+
+    #[test]
+    fn removed_midi_actions_become_reserved() {
+        // A persisted binding naming an action this build removed must not
+        // poison the whole config load.
+        let back: Config = serde_json::from_str(
+            r#"{"midi":[{"action":"OdSelected","bind":{"ty":0,"ch":0,"d1":60}},
+                       {"action":{"RecLoop":3},"bind":null}]}"#,
+        )
+        .expect("old action names still deserialize");
+        assert_eq!(back.midi[0].action, MidiAction::Reserved);
+        assert_eq!(back.midi[1].action, MidiAction::RecLoop(3));
+    }
+
+    #[test]
+    fn projects_dir_fallback() {
+        let mut cfg = Config::default();
+        assert!(cfg.projects_dir().ends_with("simplooper-projects"));
+        cfg.project_dir = "/srv/music".into();
+        assert_eq!(cfg.projects_dir(), PathBuf::from("/srv/music"));
     }
 }

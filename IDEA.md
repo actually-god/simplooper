@@ -1,1 +1,1 @@
-A minimalist live audio looper built in Rust for Linux. Developing from scratch. Includes a simple action mapping system with midi input and keyboard support.
+A minimalist clip-based audio DAW built in Rust for Linux: sixteen tracks on a global draggable playhead, an asset rack you drop audio from, additive child lanes, takes that record themselves into clips, metronome-anchored quantize, and saved projects. Developing from scratch. Includes a simple action mapping system with midi input and keyboard support.

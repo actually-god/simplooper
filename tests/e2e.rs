@@ -1,13 +1,17 @@
-//! End-to-end tests for the simplooper JACK backend.
+//! End-to-end tests for the simplooper DAW backend.
 //!
-//! These drive the real `Backend` (manager thread + realtime handler) against a
-//! live JACK/PipeWire-JACK server, using a second JACK client as test source:
+//! These drive the real `Backend` (manager thread + realtime handler) against
+//! a live JACK/PipeWire-JACK server, using a second JACK client as test
+//! source:
 //! - audio: two constant sources are summed into one sink through the applied
 //!   port layout (`out = Σ in × gain`);
+//! - transport: the global play/stop/seek + loop wrap/park behaviour, track
+//!   mute flags, and the record-take pipeline (`Evt::Take`) are verified
+//!   acoustically at a sink;
 //! - metronome: click grid, three-tone pattern and immediate downbeat start
 //!   are captured at a sink;
-//! - overdub undo/redo: an additive overdub is undone back to the pre-overdub
-//!   content and redone, verified acoustically at the sink;
+//! - export: a placed project renders through `Cmd::Export{Track,Project}`
+//!   to a decodable WAV;
 //! - midi: messages are sent to `simplooper:midi_in` and must come back parsed.
 //!
 //! If no JACK/PipeWire server is running, the tests skip themselves.
@@ -21,9 +25,9 @@ use jack::{
     ProcessScope, RawMidi,
 };
 
-use simplooper::audio::{Backend, Cmd, Evt, LOOP_CAP, TR_IDLE, TR_OD, TR_PLAY, TR_REC};
+use simplooper::arrange::{Arrangement, Clip};
+use simplooper::audio::{Backend, Cmd, Evt};
 use simplooper::midi::MidiMsg;
-use simplooper::quantize::{compute_target, snap_length, Unit};
 
 /// Serialize the e2e tests. Each drives the live audio server in real time
 /// and asserts on sample-accurate timing; running them concurrently starves
@@ -293,11 +297,12 @@ fn e2e_midi_capture_and_fire_sinco() {
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("XDG_CONFIG_HOME", &dir);
 
-    // Arm the "select loop 2" slot (Select(1) = table index 7 in the 87-slot
-    // layout: 0-5 globals, 6..=19 are Select(0)..Select(15)). The next
-    // bindable MIDI message is captured.
+    // Arm the "select track 2" slot (Select(1) in the action table) so the
+    // fired action is observable via `App::selected_loop`. The next bindable
+    // MIDI message is captured.
     let mut app = simplooper::ui::App::new(b);
-    app.arm_midi_slot(7);
+    let slot = simplooper::midi::MidiAction::idx(simplooper::midi::MidiAction::Select(1));
+    app.arm_midi_slot(slot);
     app.drain_events();
 
     // Source client emulating SINCO MIDI 1, wired to simplooper:midi_in.
@@ -319,7 +324,7 @@ fn e2e_midi_capture_and_fire_sinco() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         app.drain_events();
-        if app.midi_bind_at(7).is_some() && app.selected_loop() == 1 {
+        if app.midi_bind_at(slot).is_some() && app.selected_loop() == 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -335,7 +340,7 @@ fn e2e_midi_capture_and_fire_sinco() {
         simplooper::midi::MidiBind { ty: 2, ch: 2, d1: 1 },
         simplooper::midi::MidiBind { ty: 2, ch: 3, d1: 2 },
     ];
-    let captured = app.midi_bind_at(7);
+    let captured = app.midi_bind_at(slot);
     assert!(
         expected.contains(&captured.unwrap_or(simplooper::midi::MidiBind { ty: 0, ch: 99, d1: 99 })),
         "armed slot must capture one of the SINCO PC patterns, got {captured:?}"
@@ -350,10 +355,7 @@ fn e2e_midi_capture_and_fire_sinco() {
     let _ = active;
 }
 
-// --------------------------------------------------- loop engine (record, --
-// playback, overdub, quantize, independent vs dependent looping) --
-
-const CAP_N: usize = 48_000; // sink capture window per phase (~1 s @ 48 kHz)
+// ----------------------------------------------- DAW transport & takes --
 
 /// Source client: a controllable sample generator (constant or PRNG ±0.2)
 /// plus a lock-free capture ring of the sink (what simplooper wrote back).
@@ -450,46 +452,21 @@ fn wait_until(pred: impl Fn() -> bool, timeout: Duration, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
-/// Variance of a capture (mean removed).
-fn var(x: &[f32]) -> f64 {
-    let n = x.len();
-    let mean = x.iter().sum::<f32>() / n as f32;
-    x.iter()
-        .map(|&v| (v - mean) as f64 * (v - mean) as f64)
-        .sum::<f64>()
-        / n as f64
-}
-
-/// Normalized autocorrelation at `lag` over the whole capture. A signal that
-/// repeats with period `lag` scores ~variance; uncorrelated content scores ~0.
-fn acf_norm(x: &[f32], lag: usize) -> f64 {
-    let n = x.len();
-    if lag == 0 || lag >= n {
-        return 0.0;
-    }
-    let mean = x.iter().sum::<f32>() / n as f32;
-    let m = n - lag;
-    (0..m)
-        .map(|i| ((x[i] - mean) as f64) * ((x[i + lag] - mean) as f64))
-        .sum::<f64>()
-        / m as f64
-}
-
 #[test]
-fn e2e_loop_engine() {
+fn e2e_transport_and_clips() {
     let _g = e2e_lock();
     let Some((b, _client_name, sr)) = start_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19; // big enough to hold a whole dependent-mode run
+    let ring_n = 1usize << 19;
     let ring: Arc<Vec<AtomicU32>> =
         Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
     let widx = Arc::new(AtomicU64::new(0));
     let mode = Arc::new(AtomicU8::new(0));
-    let const_val = Arc::new(AtomicU32::new(0.25f32.to_bits()));
+    let const_val = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
-    let (client, _status) = Client::new("loop_test", ClientOptions::NO_START_SERVER)
+    let (client, _status) = Client::new("daw_test", ClientOptions::NO_START_SERVER)
         .expect("no JACK server");
     let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
@@ -513,443 +490,141 @@ fn e2e_loop_engine() {
         ins: vec![format!("{src_name}:out_a")],
         outs: vec![(format!("{src_name}:sink"), 3)],
     });
-    let mut applied = None;
-    for _ in 0..200 {
-        match b.evt_rx.try_recv() {
-            Ok(Evt::Applied { ins, outs }) => {
-                applied = Some((ins, outs));
-                break;
-            }
-            Ok(Evt::Error(msg)) => eprintln!("apply error: {msg}"),
-            Ok(Evt::Xrun) => {}
-            Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
     assert!(
-        matches!(applied, Some((1, 1))),
-        "backend did not apply the 1-in/1-out layout ({applied:?})"
-    );
-
-    // --- Phase 1: record track 0 (constant +0.25 for ~400 ms) -------------
-    b.cmd(Cmd::ToggleRecord { i: 0 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_REC),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not enter REC"
-    );
-    std::thread::sleep(Duration::from_millis(400));
-    b.cmd(Cmd::ToggleRecord { i: 0 }); // stop -> PLAY (has content)
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, lens } if states[0] == TR_PLAY && lens[0] > 12_000),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not stop into PLAY"
-    );
-    let len0 = b.engine.len_of(0);
-    assert!(
-        ((sr as u64 * 350 / 1000)..(sr as u64 * 450 / 1000)).contains(&(len0 as u64)),
-        "recorded {len0} samples, expected ~{sr}×0.4"
-    );
-
-    // --- Phase 2: playback with a silent input -----------------------------
-    // The sink must still carry the recorded +0.25 — proving the loop plays
-    // back from its buffer rather than passing the (now silent) input through.
-    const_val.store(0.0f32.to_bits(), Ordering::Relaxed);
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.25).abs() < 0.05).unwrap_or(false),
-        Duration::from_secs(3),
-        "playback of the recorded constant with silent input",
-    );
-
-    // --- Phase 3: additive overdub -0.1 on top of the +0.25 take -----------
-    // Overdub must never replace or re-amp the original content: after a full
-    // pass the buffer holds 0.25 + (-0.1) = 0.15 everywhere.
-    const_val.store((-0.1f32).to_bits(), Ordering::Relaxed);
-    b.cmd(Cmd::ToggleOverdub { i: 0 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_OD),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not enter OD"
-    );
-    let od_time = Duration::from_millis(len0 as u64 * 1000 / sr as u64 + 800);
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.05).abs() < 0.03).unwrap_or(false),
-        od_time,
-        "additive overdub: sink -> dry(-0.1) + mixed take(0.15) = 0.05",
-    );
-    b.cmd(Cmd::ToggleOverdub { i: 0 }); // back to PLAY
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_PLAY),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not leave OD"
-    );
-    const_val.store(0.0f32.to_bits(), Ordering::Relaxed);
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.15).abs() < 0.03).unwrap_or(false),
-        Duration::from_secs(2),
-        "overdubbed content (0.25 + -0.1 = 0.15) playing back at original level",
-    );
-
-    // --- Phase 4: easy-quantize against track 0's own length ---------------
-    let len_before = b.engine.len_of(0);
-    let (target, beat, _bar) = compute_target(len_before, 1, 4, Unit::Beat).unwrap();
-    assert!(target > 0 && beat > 0.0);
-    b.cmd(Cmd::Quantize { num: 4, den: 4, bars: 1, unit: Unit::Beat, root: 0, metro: false, bpm: 120 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Quantized { .. }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "no Quantized event"
-    );
-    let ideal = snap_length(len_before, target, LOOP_CAP);
-    let w = (sr / 200).min(ideal / 4) as i64;
-    let new_len = b.engine.len_of(0) as i64;
-    assert!(
-        (new_len - ideal as i64).abs() <= w + 64,
-        "quantized len {new_len} vs grid point {ideal}"
-    );
-    assert!(b.engine.len_of(0) >= target);
-    wait_for(
-        &b,
-        |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_IDLE),
-        Duration::from_secs(2),
-    );
-
-    // --- Phase 5: independent mode — track 1 loops on its own clock --------
-    b.cmd(Cmd::TogglePlay { i: 0 }); // restart the (now quantized) take
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_PLAY),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not resume playback"
-    );
-    mode.store(1, Ordering::Relaxed); // aperiodic PRNG content
-    b.cmd(Cmd::ToggleRecord { i: 1 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[1] == TR_REC),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 1 did not enter REC"
-    );
-    std::thread::sleep(Duration::from_millis(156)); // ~7500 samples @ 48 kHz
-    b.cmd(Cmd::ToggleRecord { i: 1 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, lens } if states[1] == TR_PLAY && lens[1] > 4_000),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 1 did not stop into PLAY"
-    );
-    let len1 = b.engine.len_of(1);
-    assert!(
-        ((sr as u64 * 120 / 1000)..(sr as u64 * 200 / 1000)).contains(&(len1 as u64)),
-        "recorded {len1} samples, expected ~{sr}×0.156"
-    );
-    mode.store(0, Ordering::Relaxed); // silence the input before capturing
-    std::thread::sleep(Duration::from_millis(300));
-
-    let len0q = b.engine.len_of(0);
-    let lmax = len0q.max(len1) as u64;
-    let rem = lmax % len1 as u64;
-    assert!(
-        rem > 800 && len1 as u64 - rem > 800,
-        "unlucky lengths for mode discrimination: lmax {lmax}, len1 {len1}"
-    );
-
-    let x = read_ring(&ring, &widx, CAP_N, Duration::from_secs(3)).expect("capture");
-    let x = &x[2048..]; // drop the input-switching tail
-    let v = var(x);
-    assert!(v > 0.01, "no signal in capture (var {v})");
-    let a = acf_norm(x, len1 as usize);
-    let c = acf_norm(x, lmax as usize);
-    assert!(a > 0.5 * v, "independent: no period at len1 (acf {a} vs var {v})");
-    assert!(
-        c.abs() < 0.2 * a,
-        "independent: unexpected correlation at lmax (acf {c} vs {a})"
-    );
-
-    // --- Phase 6: dependent mode — endless ensemble of N root loops --------
-    // Stop both tracks first so the run starts from silence at the sink
-    // (the input is silent too), letting us measure the run cleanly.
-    b.cmd(Cmd::TogglePlay { i: 0 });
-    b.cmd(Cmd::TogglePlay { i: 1 });
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
-        Duration::from_secs(2),
-        "silence before the dependent run",
-    );
-
-    b.cmd(Cmd::SetRootLoops(8)); // ensemble period = 8 root loops
-    b.cmd(Cmd::SetDependent(true));
-    b.cmd(Cmd::TogglePlay { i: 0 });
-    b.cmd(Cmd::TogglePlay { i: 1 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_PLAY && states[1] == TR_PLAY),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "tracks did not start in dependent mode"
-    );
-
-    // Continuous wrap: the ensemble must NOT stop at the end of the N root
-    // loops — it loops forever. Sleep well past two full ensemble periods and
-    // assert both tracks are still playing.
-    let period = lmax * 8;
-    std::thread::sleep(Duration::from_millis(period * 2 * 1000 / sr as u64 + 2000));
-    assert_eq!(
-        b.engine.state_of(0),
-        TR_PLAY,
-        "ensemble stopped at the end of the root loops (must loop forever)"
-    );
-    assert_eq!(b.engine.state_of(1), TR_PLAY, "ensemble stopped mid-run");
-
-    // Capture ~2 ensemble periods already sitting in the ring (the sleep above
-    // guaranteed they exist) and prove the wrap is seamless: no silent chunk
-    // anywhere, the mix repeats exactly with the ensemble period (continuous
-    // wrap), and the shorter loop keeps tiling.
-    let need = (period as usize * 2 + 20_000).min(ring_n - 1);
-    let end = widx.load(Ordering::Relaxed);
-    let x: Vec<f32> = (0..need)
-        .map(|i| {
-            f32::from_bits(
-                ring[((end - need as u64 + i as u64) % ring_n as u64) as usize]
-                    .load(Ordering::Relaxed),
-            )
-        })
-        .collect();
-    let chunk = 480usize;
-    let rms = |c: &[f32]| {
-        (c.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / c.len() as f64).sqrt()
-    };
-    for k in 0..x.len() / chunk {
-        assert!(
-            rms(&x[k * chunk..(k + 1) * chunk]) > 0.05,
-            "silent gap inside the dependent run at chunk {k} — ensemble stalled?"
-        );
-    }
-    let v = var(&x);
-    assert!(v > 0.01, "no signal in run (var {v})");
-    let ap = acf_norm(&x, period as usize);
-    assert!(
-        ap > 0.5 * v,
-        "dependent: mix does not repeat with the ensemble period (acf {ap} vs var {v})"
-    );
-
-    // Shorter loops must repeat (tile) across the ensemble — not play once
-    // and go silent until the root ends. Track 1's contribution is strictly
-    // periodic with its own length under modulo-wrap playback.
-    let d1 = acf_norm(&x, len1 as usize);
-    assert!(
-        d1 > 0.5 * v,
-        "dependent: shorter loop not repeating (acf at len1 {d1} vs var {v})"
-    );
-
-    // Stop the ensemble before clearing.
-    b.cmd(Cmd::TogglePlay { i: 0 });
-    b.cmd(Cmd::TogglePlay { i: 1 });
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
-        Duration::from_secs(2),
-        "silence after the dependent run",
-    );
-
-    // --- Phase 7: clear ------------------------------------------------------
-    b.cmd(Cmd::ClearTrack { i: 0 });
-    b.cmd(Cmd::ClearTrack { i: 1 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, lens } if states[0] == TR_IDLE && states[1] == TR_IDLE && lens[0] == 0 && lens[1] == 0),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "tracks did not clear"
-    );
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
-        Duration::from_secs(2),
-        "silence after clear",
-    );
-
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
-    let _ = active;
-}
-
-// ------------------------------------------------------ overdub undo/redo --
-
-#[test]
-fn e2e_overdub_undo() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
-        return; // no audio server: skip
-    };
-
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let mode = Arc::new(AtomicU8::new(0));
-    let const_val = Arc::new(AtomicU32::new(0.25f32.to_bits()));
-
-    let (client, _status) = Client::new("undo_test", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
-    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            LoopSrcProc {
-                out: out_a,
-                sink,
-                mode: mode.clone(),
-                const_val: const_val.clone(),
-                seed: 0x9e37_79b9,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-
-    b.cmd(Cmd::Apply {
-        ins: vec![format!("{src_name}:out_a")],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
+        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }), Duration::from_secs(5))
+            .is_some(),
         "backend did not apply the 1-in/1-out layout"
     );
 
-    // --- record +0.25 for ~400 ms, keep it playing -------------------------
-    b.cmd(Cmd::ToggleRecord { i: 0 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_REC),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not enter REC"
-    );
-    std::thread::sleep(Duration::from_millis(400));
-    b.cmd(Cmd::ToggleRecord { i: 0 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, lens } if states[0] == TR_PLAY && lens[0] > 12_000),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not stop into PLAY"
-    );
-    let len0 = b.engine.len_of(0);
+    // ---- a project: one 0.5 asset on track 0 at t = 0 ----------------------
+    let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 16_000]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+    let clip_len = 16_000u64;
+    let total = 32_000u64; // two clip lengths: a real "project end"
+    let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0.clone()]);
+    b.cmd(Cmd::SetProject { assets: table, arr: Arc::new(arr), len: total });
+    b.cmd(Cmd::SetLoop(true));
 
-    // --- additive overdub of -0.1 (buffer becomes 0.15 everywhere) ---------
-    const_val.store((-0.1f32).to_bits(), Ordering::Relaxed);
-    b.cmd(Cmd::ToggleOverdub { i: 0 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_OD),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not enter OD"
-    );
-    let od_time = Duration::from_millis(len0 as u64 * 1000 / sr as u64 + 800);
+    // The transport is the only thing that makes clip sound: silent before.
+    std::thread::sleep(Duration::from_millis(150));
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.05).abs() < 0.03).unwrap_or(false),
-        od_time,
-        "overdub pass: sink -> dry(-0.1) + mixed take(0.15) = 0.05",
+        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        Duration::from_secs(2),
+        "silence before the transport starts",
     );
-    b.cmd(Cmd::ToggleOverdub { i: 0 }); // back to PLAY
+
+    // ---- play: the clip plays from position 0 -------------------------------
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        Duration::from_secs(3),
+        "transport playing the 0.5 clip",
+    );
+    assert!(b.engine.transport_on(), "PlayAll did not set the transport flag");
+
+    // ---- a stopped track contributes nothing (clips stay placed) ------------
+    b.cmd(Cmd::ToggleTrackOn { i: 0 });
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        Duration::from_secs(3),
+        "muting track 0 silences the mix",
+    );
+    b.cmd(Cmd::ToggleTrackOn { i: 0 });
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        Duration::from_secs(3),
+        "un-muting track 0 restores the clip",
+    );
+
+    // ---- stop holds the position; play resumes from it ----------------------
+    b.cmd(Cmd::StopAll);
+    assert!(
+        wait_for(&b, |e| matches!(e, Evt::Transport { on: false }), Duration::from_secs(2))
+            .is_some(),
+        "no Transport(off) event from StopAll"
+    );
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        Duration::from_secs(2),
+        "silence after StopAll",
+    );
+    let held = b.engine.pos();
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(b.engine.pos(), held, "position moved while stopped");
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        Duration::from_secs(3),
+        "play again resumes from the held position (still inside the clip)",
+    );
+
+    // ---- seek past the clip end: silence, playhead still running ------------
+    b.cmd(Cmd::Seek { pos: clip_len + 4_000 });
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        Duration::from_secs(2),
+        "silence after seeking past the clip end",
+    );
+    // Seek back inside: sound returns immediately (scrub-scan works).
+    b.cmd(Cmd::Seek { pos: 2_000 });
+    wait_until(
+        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        Duration::from_secs(2),
+        "sound after scrubbing back into the clip",
+    );
+
+    // ---- loop wrap: the playhead rolls over instead of stopping -------------
+    // Leave ~125 ms of runway, give the Seek command time to land, then
+    // sample: 250 ms later the playhead MUST have passed the end and
+    // reappeared at the top.
+    b.cmd(Cmd::Seek { pos: total - sr as u64 / 8 });
+    std::thread::sleep(Duration::from_millis(50));
+    let p0 = b.engine.pos();
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(b.engine.transport_on(), "looping transport must not stop at the end");
+    let p1 = b.engine.pos();
+    assert!(p1 < p0, "no wrap: pos went {p0} -> {p1} with loop on");
+
+    // ---- loop off: park at the end and stop ---------------------------------
+    b.cmd(Cmd::SetLoop(false));
+    b.cmd(Cmd::Seek { pos: total - sr as u64 / 4 });
+    assert!(
+        wait_for(&b, |e| matches!(e, Evt::Transport { on: false }), Duration::from_secs(3))
+            .is_some(),
+        "non-looping transport did not stop at the project end"
+    );
+    let parked = b.engine.pos();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(b.engine.pos(), parked, "parked playhead must hold");
+    assert!(parked >= total - sr as u64 / 2, "parked far before the end: {parked}");
+    b.cmd(Cmd::SetLoop(true));
+
+    // ---- recording produces a take (Evt::Take), not loop state --------------
+    let at0 = b.engine.pos();
+    const_val.store(0.25f32.to_bits(), Ordering::Relaxed);
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    std::thread::sleep(Duration::from_millis(300));
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    let take = wait_for(
+        &b,
+        |e| matches!(e, Evt::Take { track: 0, .. }),
+        Duration::from_secs(3),
+    );
     const_val.store(0.0f32.to_bits(), Ordering::Relaxed);
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.15).abs() < 0.03).unwrap_or(false),
-        Duration::from_secs(2),
-        "overdubbed content (0.15) playing back",
-    );
-
-    // --- undo: the loop reverts to its pre-overdub content (0.25) ----------
-    b.cmd(Cmd::UndoOverdub);
+    let Evt::Take { at, data, .. } = take.expect("no Evt::Take from record toggle") else {
+        unreachable!()
+    };
     assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Notice(m) if m.contains("undid overdub")),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "no undo notice"
+        data.len() >= (sr as f32 * 0.2) as usize && data.len() <= (sr as f32 * 0.6) as usize,
+        "take length {} samples, expected ~0.3 s",
+        data.len()
     );
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, lens } if states[0] == TR_PLAY && lens[0] == len0),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "track 0 did not resume playing at its original length after undo"
-    );
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.25).abs() < 0.03).unwrap_or(false),
-        Duration::from_secs(2),
-        "undone content (0.25) playing back",
-    );
+    let mean = data.iter().sum::<f32>() / data.len() as f32;
+    assert!((mean - 0.25).abs() < 0.03, "take captured mean {mean}, expected 0.25");
+    assert!(at.saturating_sub(at0) < sr as u64, "take start {at} far from playhead {at0}");
 
-    // --- redo: the overdubbed state comes back (0.15) ----------------------
-    b.cmd(Cmd::RedoOverdub);
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Notice(m) if m.contains("redid overdub")),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "no redo notice"
-    );
-    wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.15).abs() < 0.03).unwrap_or(false),
-        Duration::from_secs(2),
-        "redone overdub (0.15) playing back",
-    );
-
-    // --- cleanup ------------------------------------------------------------
-    b.cmd(Cmd::TogglePlay { i: 0 });
-    b.cmd(Cmd::ClearTrack { i: 0 });
+    b.cmd(Cmd::StopAll);
     b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
     let _ = active;
 }
@@ -1140,20 +815,10 @@ fn e2e_metronome() {
 
 // ------------------------------------------------------------------ export --
 
-/// The Export button's whole path: engine content -> Cmd::ExportTrack ->
-/// file on disk, extension appended from the format (the picker path never
-/// carries one), plus the "no recording" error for empty loops.
-struct ConstSrcProc {
-    out: Port<AudioOut>,
-}
-
-impl ProcessHandler for ConstSrcProc {
-    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
-        self.out.as_mut_slice(ps).fill(0.25);
-        Control::Continue
-    }
-}
-
+/// The Export button's whole path: placed project -> Cmd::ExportTrack /
+/// Cmd::ExportProject -> decodable WAV on disk, extension appended from the
+/// format (the picker path never carries one), plus explicit "no clips"
+/// errors for empty tracks and empty projects.
 #[test]
 fn e2e_export_writes_file() {
     use simplooper::audio_io::ExportFormat;
@@ -1161,83 +826,79 @@ fn e2e_export_writes_file() {
     let Some((b, _cn, sr)) = start_backend() else {
         return; // no audio server: skip
     };
-
-    let (client, _status) = Client::new("export_src", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
-    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async((), ConstSrcProc { out: out_a })
-        .unwrap();
-
-    b.cmd(Cmd::Apply { ins: vec![format!("{src_name}:out_a")], outs: vec![] });
-    let mut applied = None;
-    for _ in 0..200 {
-        match b.evt_rx.try_recv() {
-            Ok(Evt::Applied { ins, outs }) => {
-                applied = Some((ins, outs));
-                break;
-            }
-            Ok(Evt::Error(msg)) => eprintln!("apply error: {msg}"),
-            Ok(_) => {}
-            Err(_) => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
-    assert!(matches!(applied, Some((1, 0))), "input not applied: {applied:?}");
-
-    // Record ~300 ms into loop 0.
-    b.cmd(Cmd::ToggleRecord { i: 0 });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::LoopState { states, .. } if states[0] == TR_REC),
-            Duration::from_secs(2)
-        )
-        .is_some(),
-        "loop 0 never entered REC"
-    );
-    std::thread::sleep(Duration::from_millis(300));
-    b.cmd(Cmd::ToggleRecord { i: 0 });
-    std::thread::sleep(Duration::from_millis(150));
+    // A project the engine can render without any live ports: a 0.5 asset on
+    // track 0, plus a child-lane clip at half level on the same track.
+    let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 8_000]);
+    let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 4_000]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+    arr.insert(0, 1, Clip { asset: 1, pos: 4_000 });
+    let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0, a1]);
+    b.cmd(Cmd::SetProject { assets: table, arr: Arc::new(arr), len: 12_000 });
 
     let dir = std::env::temp_dir().join(format!("simplooper-e2e-export-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let stem = dir.join("take");
+    let stem = dir.join("mix");
 
+    // Track export: both lanes of track 0, engine-rate mixdown.
     b.cmd(Cmd::ExportTrack { i: 0, path: stem.clone(), fmt: ExportFormat::Wav });
     let got = wait_for(
         &b,
         |e| matches!(e, Evt::Notice(m) if m.contains("exported")),
         Duration::from_secs(5),
     );
-    assert!(got.is_some(), "no export Notice: empty loop recorded?");
+    assert!(got.is_some(), "no export Notice for a track with clips");
     let file = stem.with_extension("wav"); // extension from the format
-    let bytes = std::fs::read(&file).expect("exported wav must exist on disk");
-    assert!(bytes.starts_with(b"RIFF"), "exported file is not a WAV");
-    // Some real audio must be in there (≥ ~50 ms), plus the 44-byte header.
-    let min = 44 + (sr as f32 * 0.05) as usize * 4;
-    assert!(bytes.len() > min, "wav too small: {} bytes", bytes.len());
+    let samples = simplooper::audio_io::decode_to_mono(&file, sr).expect("exported wav decodes");
+    assert!(samples.len() >= 12_000, "export shorter than the project: {}", samples.len());
+    // [0,4000): only the 0.5 clip; [4000,8000): both lanes summed; then silence.
+    let seg = |a: usize, c: usize| samples[a..c].iter().sum::<f32>() / (c - a) as f32;
+    assert!((seg(0, 4_000) - 0.5).abs() < 0.02, "lane 0 only");
+    assert!((seg(4_000, 8_000) - 0.75).abs() < 0.02, "lanes stack additively");
+    assert!(seg(8_000, 12_000).abs() < 1e-6, "silence past the last clip");
 
-    // Empty loop must produce an explicit error, not silence.
+    // Whole-project export: nothing is playing, but placement is the truth.
+    b.cmd(Cmd::ExportProject { path: dir.join("whole"), fmt: ExportFormat::Wav });
+    let got = wait_for(
+        &b,
+        |e| matches!(e, Evt::Notice(m) if m.contains("exported project")),
+        Duration::from_secs(5),
+    );
+    assert!(got.is_some(), "no Notice for the whole-project export");
+    assert!(dir.join("whole.wav").exists(), "project wav missing");
+
+    // Empty track / empty project must fail loudly, not write silence.
     b.cmd(Cmd::ExportTrack { i: 7, path: dir.join("none"), fmt: ExportFormat::Wav });
     let err = wait_for(
         &b,
-        |e| matches!(e, Evt::Error(m) if m.contains("no recording")),
+        |e| matches!(e, Evt::Error(m) if m.contains("no placed clips")),
         Duration::from_secs(2),
     );
-    assert!(err.is_some(), "empty-loop export must report 'no recording'");
-    assert!(!dir.join("none.wav").exists(), "no file may be written for an empty loop");
+    assert!(err.is_some(), "empty-track export must report 'no placed clips'");
+    assert!(!dir.join("none.wav").exists(), "no file may be written for an empty track");
 
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(Arrangement::new()),
+        len: 4_800,
+    });
+    b.cmd(Cmd::ExportProject { path: dir.join("empty"), fmt: ExportFormat::Wav });
+    let err = wait_for(
+        &b,
+        |e| matches!(e, Evt::Error(m) if m.contains("no clips placed")),
+        Duration::from_secs(2),
+    );
+    assert!(err.is_some(), "empty-project export must report an error");
+    assert!(!dir.join("empty.wav").exists(), "no file for an empty project");
+
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = active;
 }
 
 // -------------------------------------------------------------- monitoring --
 
-/// Live input pass-through follows the SELECTED loop: input x (vol x gain)
-/// of the selected loop, equal-power panned across the routed outputs.
+/// Live input pass-through follows the SELECTED track: input x (vol x gain)
+/// of the selected track, equal-power panned across the routed outputs.
 /// Nothing needs to be recording for this to hold — that is the whole point
 /// of "monitoring rides the selection".
 #[test]
@@ -1329,7 +990,7 @@ fn e2e_selected_loop_monitoring() {
         panic!("{what}: want mean {want}, last saw {seen:?}");
     };
     expect(&ring_l, 0.0, "left bus (pan hard right)");
-    expect(&ring_r, 0.25, "right bus (input x selected-loop vol)");
+    expect(&ring_r, 0.25, "right bus (input x selected-track vol)");
 
     // Switching the selection to loop 1 (untouched: vol 1, gain 1, centre)
     // re-shapes monitoring immediately: both buses at 0.5 x 0.7071 ≈ 0.354.

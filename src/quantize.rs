@@ -1,116 +1,122 @@
-//! "Easy quantization" — snap loop lengths onto a beat/bar grid.
+//! Grid math and audio-editing helpers for the DAW workflow.
 //!
-//! The tempo is derived from Loop 1's actual recorded length: the user says
-//! "Loop 1 is N bars of M/D time", so one bar = len1 / N samples and one beat
-//! = bar / M samples. Every loop's length is then snapped to the nearest
-//! multiple of the chosen unit (beat or bar). Following the standard
-//! loop-editing practice (DAW snap-to-grid + seamless-loop tools), a raw
-//! grid snap alone would cut mid-waveform and click, so each new boundary is
-//! refined to the quietest sample (nearest zero crossing) within ±5 ms and a
-//! short wrap-around crossfade blends the tail into the head across the seam.
+//! The metronome (tempo, beats per measure, subdivision) defines the *one*
+//! timeline grid every track shares: a beat is `60/bpm` seconds, a measure is
+//! `metro_num` beats, and a grid line is `sub` evenly-spaced steps per beat
+//! (1 = quarter note, 2 = eighth, 3 = triplet, 4 = sixteenth, ...). Two
+//! independent grid levels use these helpers:
+//!
+//! - **Quantize** snaps a clip's *start position* to the nearest grid line at
+//!   the chosen quantize subdivision (and records can snap automatically).
+//! - **Snap** constrains where dragging or dropping a clip may place it, using
+//!   the same subdivision list at its own level.
+//!
+//! Positions here are always *timeline samples* at the engine rate; nothing in
+//! this module knows about JACK — it is pure math, unit-tested offline.
 
-/// The grid unit lengths are snapped to.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Unit {
-    Beat,
-    Bar,
+/// Samples per beat at `bpm` for an engine running at `sr`.
+pub fn beat_samples(sr: u32, bpm: u32) -> f64 {
+    60.0 * sr as f64 / bpm.max(1) as f64
 }
 
-/// Compute the grid from Loop 1's length and the user's time signature.
-///
-/// Returns `(target_samples, beat_samples, bar_samples)` where `target` is
-/// the (rounded) unit the loops will be snapped to.
-pub fn compute_target(
-    len1: u32,
-    bars: u32,
-    num: u32,
-    unit: Unit,
-) -> Result<(u32, f64, f64), String> {
-    if len1 == 0 {
-        return Err("Loop 1 has no recording yet — record it first".into());
-    }
-    if bars == 0 || num == 0 {
-        return Err("bars and numerator must be at least 1".into());
-    }
-    let bar = len1 as f64 / bars as f64;
-    let beat = bar / num as f64;
-    let target_f = match unit {
-        Unit::Beat => beat,
-        Unit::Bar => bar,
-    };
-    if target_f < 0.5 {
-        return Err(
-            "grid too fine: fewer than half a sample per unit — use more bars or a smaller numerator"
-                .into(),
-        );
-    }
-    let target = (target_f + 0.5) as u32; // round to nearest whole sample
-    Ok((target, beat, bar))
+/// Grid-unit length in samples for `sub` evenly-spaced steps per beat.
+/// A subdivision of `n` divides the beat into `n` equal grid steps.
+pub fn unit_samples(sr: u32, bpm: u32, sub: u32) -> f64 {
+    beat_samples(sr, bpm) / sub.max(1) as f64
 }
 
-/// Snap `len` to the nearest multiple of `target`, clamped to `[target, cap]`.
-pub fn snap_length(len: u32, target: u32, cap: u32) -> u32 {
-    let mult = (len as f64 / target as f64).round().max(1.0);
-    let snapped = (mult * target as f64) as u32;
-    snapped.clamp(target.min(cap), cap)
+/// Snap a timeline position to the nearest multiple of `unit`.
+/// Non-finite or non-positive units pass the position through unchanged.
+pub fn snap_start(pos: u64, unit: f64) -> u64 {
+    if !unit.is_finite() || unit <= 0.0 {
+        return pos;
+    }
+    ((pos as f64 / unit).round() * unit).max(0.0) as u64
 }
 
-/// Pick the quietest sample within `±window` of `ideal` (nearest zero
-/// crossing) as the actual cut point.
-pub fn refine_zero_crossing(buf: &[f32], ideal: u32, window: u32, cap: u32) -> u32 {
-    if buf.is_empty() {
-        return ideal;
+/// Floor a timeline position down to the grid (used by snap-dragging, where
+/// the grab offset should keep the clip under the cursor's left edge).
+pub fn floor_start(pos: u64, unit: f64) -> u64 {
+    if !unit.is_finite() || unit <= 0.0 {
+        return pos;
     }
-    let lo = ideal.saturating_sub(window).max(1);
-    let hi = (ideal + window).min(cap).min(buf.len() as u32 - 1);
-    if lo > hi {
-        return ideal.min(hi).max(lo);
+    ((pos as f64 / unit).floor() * unit).max(0.0) as u64
+}
+
+/// Round `pos` up to the next multiple of `bar` (project-length padding).
+pub fn round_up_to(pos: u64, bar: u64) -> u64 {
+    if bar == 0 {
+        pos
+    } else {
+        pos.div_ceil(bar).saturating_mul(bar)
     }
-    let mut best = ideal.clamp(lo, hi);
-    let mut best_abs = f32::MAX;
-    for k in lo..=hi {
-        let a = buf[k as usize].abs();
-        if a < best_abs {
-            best_abs = a;
-            best = k;
+}
+
+/// Level floor of the silence detector, in dB (everything below is silence).
+pub const TRIM_FLOOR_DB: f32 = -60.0;
+
+/// dB -> linear amplitude.
+pub fn db_to_amp(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// First and last non-silent sample window `[start, end)` over `thr`.
+/// `None` when the buffer is pure silence.
+pub fn trim_bounds(buf: &[f32], thr: f32) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut end = 0usize;
+    for (i, &v) in buf.iter().enumerate() {
+        if v.abs() >= thr {
+            if start.is_none() {
+                start = Some(i);
+            }
+            end = i + 1;
         }
     }
-    best
+    start.map(|s| (s, end))
 }
 
-/// Wrap-around linear crossfade: blend the last `f` samples (the tail) into
-/// the first `f` samples (the head) with complementary gains, so playback is
-/// continuous when the loop wraps from index `len-1` back to 0. In place.
-pub fn seam_crossfade(buf: &mut [f32], len: u32, f: u32) {
-    if f == 0 || len <= f {
-        return;
+/// Clip the silence off the start and end of `buf`: the content between the
+/// first and last sample over the [`TRIM_FLOOR_DB`] floor, with a ~5 ms edge
+/// fade on both sides so the new boundaries can never click. `None` when the
+/// input is pure silence (the caller keeps the original and says so).
+pub fn trim_silence(buf: &[f32], sr: u32) -> Option<Vec<f32>> {
+    let (s, e) = trim_bounds(buf, db_to_amp(TRIM_FLOOR_DB))?;
+    let keep = e - s;
+    let fade = ((sr as usize / 200).max(1)).min(keep / 2).max(1); // ~5 ms, never over half
+    let mut out = buf[s..e].to_vec();
+    for i in 0..fade.min(out.len()) {
+        let w = i as f32 / fade as f32;
+        out[i] *= w;
     }
-    let f = (f as usize).min((len / 4) as usize); // never more than a quarter of the loop
-    let l = len as usize;
-    for i in 0..f {
-        let w = (i + 1) as f32 / f as f32; // 0 → 1 across the window
-        let head = buf[i];
-        let tail = buf[l - f + i];
-        buf[i] = head * w + tail * (1.0 - w);
+    let n = out.len();
+    for i in 0..fade.min(n) {
+        let w = i as f32 / fade as f32;
+        out[n - 1 - i] *= w;
     }
+    Some(out)
 }
 
-/// Quantize one recorded track in place: snap its length to the grid, refine
-/// the cut to a zero crossing, pad with silence or truncate, and smooth the
-/// seam. Returns the new length.
-pub fn quantize_track(buf: &mut [f32], len: u32, target: u32, cap: u32, sr: u32) -> u32 {
-    let ideal = snap_length(len, target, cap);
-    // ±5 ms search window for the zero crossing (bounded by the loop itself).
-    let window = ((sr / 200).max(1)).min(ideal / 4);
-    let cut = refine_zero_crossing(buf, ideal, window, cap).max(target.min(cap));
-
-    if cut > len {
-        // Pad with silence up to the new length.
-        buf[len as usize..cut as usize].fill(0.0);
-    }
-    // Truncation needs no data move: playback only ever reads [0, cut).
-    seam_crossfade(buf, cut, (sr / 50).min(cut / 4)); // ~20 ms seam blend
-    cut
+/// Snap an asset's *content* to the quantize grid.
+///
+/// The leading silence is located, trimmed, and re-padded so the first
+/// transient lands exactly on a grid line (`unit` samples apart, anchored at
+/// sample 0 = bar 1 beat 1 of the metronome grid); the total length is then
+/// rounded up to a whole number of grid units so the clip ends on a line
+/// too. Everything between stays bit-identical. `None` for pure silence
+/// (the caller keeps the original and says so).
+pub fn quantize_asset(buf: &[f32], sr: u32, unit: f64) -> Option<Vec<f32>> {
+    let (s, e) = trim_bounds(buf, db_to_amp(TRIM_FLOOR_DB))?;
+    let unit = unit.max(1.0).round() as usize;
+    // Nearest grid line to the first transient (same law as `snap_start`).
+    let new_start = ((s as f64 / unit as f64).round() as usize) * unit;
+    let content = e - s;
+    // End on a grid line without cutting the tail.
+    let len = (new_start + content).div_ceil(unit) * unit;
+    let mut out = vec![0.0f32; len];
+    out[new_start..new_start + content].copy_from_slice(&buf[s..e]);
+    let _ = sr; // (kept for symmetry with trim_silence; grid is in samples)
+    Some(out)
 }
 
 #[cfg(test)]
@@ -118,80 +124,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_math() {
-        // 1 s loop @ 48 kHz, "2 bars of 4/4": bar = 24000, beat = 6000.
-        let (t, beat, bar) = compute_target(48_000, 2, 4, Unit::Beat).unwrap();
-        assert_eq!(t, 6000);
-        assert!((beat - 6000.0).abs() < 1e-9);
-        assert!((bar - 24_000.0).abs() < 1e-9);
-        let (t, _, _) = compute_target(48_000, 2, 4, Unit::Bar).unwrap();
-        assert_eq!(t, 24_000);
+    fn grid_math() {
+        // 120 BPM @ 48 kHz: beat = 24000 samples; eighth = 12000.
+        assert!((beat_samples(48_000, 120) - 24_000.0).abs() < 1e-9);
+        assert!((unit_samples(48_000, 120, 2) - 12_000.0).abs() < 1e-9);
+        // Triplets divide evenly too.
+        assert!((unit_samples(48_000, 120, 3) * 3.0 - 24_000.0).abs() < 1e-9);
+        // Guard against zero tempo / zero subdivision.
+        assert!(beat_samples(48_000, 0).is_finite());
+        assert!((unit_samples(48_000, 120, 0) - 24_000.0).abs() < 1e-9);
     }
 
     #[test]
-    fn target_errors() {
-        assert!(compute_target(0, 2, 4, Unit::Beat).is_err());
-        assert!(compute_target(96_000, 0, 4, Unit::Bar).is_err());
-        // 1 sample of loop, 1000 bars: grid finer than half a sample.
-        assert!(compute_target(1, 1000, 128, Unit::Beat).is_err());
+    fn snap_rounds_to_nearest_line() {
+        let u = 12_000.0;
+        assert_eq!(snap_start(0, u), 0);
+        assert_eq!(snap_start(5_000, u), 0); // below half -> down
+        assert_eq!(snap_start(6_000, u), 12_000); // half rounds up
+        assert_eq!(snap_start(20_000, u), 24_000); // above half -> up
+        assert_eq!(snap_start(36_001, u), 36_000);
+        // Degenerate units pass through.
+        assert_eq!(snap_start(123, 0.0), 123);
+        assert_eq!(snap_start(123, f64::NAN), 123);
     }
 
     #[test]
-    fn snap_nearest_multiple() {
-        assert_eq!(snap_length(10, 3, 100), 9); // 10/3 = 3.33 → 3×3
-        assert_eq!(snap_length(4, 3, 100), 3); // nearest multiple of 3 to 4
-        assert_eq!(snap_length(1, 3, 100), 3); // clamps up to one unit
-        assert_eq!(snap_length(97, 3, 100), 96); // nearest multiple: 96 (d=1) vs 99 (d=2)
-        assert_eq!(snap_length(5000, 3, 100), 100); // clamps to cap
+    fn floor_never_goes_up() {
+        let u = 12_000.0;
+        assert_eq!(floor_start(11_999, u), 0);
+        assert_eq!(floor_start(12_000, u), 12_000);
+        assert_eq!(floor_start(35_999, u), 24_000);
+        assert_eq!(floor_start(123, 0.0), 123);
     }
 
     #[test]
-    fn zero_crossing_refine() {
-        let mut buf = vec![0.5f32; 100];
-        buf[57] = 0.01; // quietest point
-        let k = refine_zero_crossing(&buf, 60, 10, 100);
-        assert_eq!(k, 57);
+    fn round_up_bars() {
+        assert_eq!(round_up_to(0, 96_000), 0);
+        assert_eq!(round_up_to(1, 96_000), 96_000);
+        assert_eq!(round_up_to(96_000, 96_000), 96_000);
+        assert_eq!(round_up_to(96_001, 96_000), 192_000);
+        assert_eq!(round_up_to(42, 0), 42, "bar 0 passes through");
     }
 
     #[test]
-    fn crossfade_continuity() {
-        let mut buf: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
-        let len = 16u32;
-        let f = 4u32;
-        let tail_first = buf[(len - f) as usize]; // sample that precedes the wrap region
-        let head_first = buf[0];
-        let last = buf[len as usize - 1];
-        seam_crossfade(&mut buf, len, f);
-        // The first sample is a blend dominated by the tail (continuation of
-        // what played before the wrap): out[0] = head*w + tail*(1-w), w=1/f.
-        let w = 1.0 / f as f32;
-        assert!((buf[0] - (head_first * w + tail_first * (1.0 - w))).abs() < 1e-6);
-        // Past the window the head is untouched.
-        assert!((buf[f as usize] - f as f32 * 0.1).abs() < 1e-6);
-        // The wrap jump shrank: |out[0] - out[len-1]| < |head - last|.
-        let raw_jump = (head_first - last).abs();
-        let new_jump = (buf[0] - buf[len as usize - 1]).abs();
-        assert!(new_jump < raw_jump);
-    }
-
-    #[test]
-    fn quantize_sine_to_grid() {
-        let sr = 48_000u32;
-        let mut buf = vec![0f32; 200_000];
-        // Fill with a sine so the cut point is never trivially silent.
-        for (i, s) in buf.iter_mut().enumerate().take(150_000) {
-            *s = (i as f64 * std::f64::consts::PI * 2.0 * 440.0 / sr as f64).sin() as f32;
+    fn silence_trim_bounds() {
+        let mut buf = vec![0.0f32; 1000];
+        for v in buf.iter_mut().take(1000) {
+            *v = 0.0;
         }
-        let len = 144_100u32; // 3.002 s — just off the 12 kHz grid point (12×)
-        let target = 12_000u32; // "beat"
-        let ideal = snap_length(len, target, 200_000);
-        let new_len = quantize_track(&mut buf, len, target, 200_000, sr);
-        // The cut lands on the grid within the ±5 ms zero-crossing window.
-        assert!(
-            (new_len as i64 - ideal as i64).abs() <= (sr / 200) as i64,
-            "cut {new_len} drifted from grid point {ideal}"
-        );
-        // And it is a plausible loop length.
-        assert!(new_len >= target && new_len <= len + sr / 200);
+        assert_eq!(trim_bounds(&buf, 0.001), None, "pure silence");
+        buf[200..500].fill(0.25);
+        assert_eq!(trim_bounds(&buf, 0.001), Some((200, 500)));
+    }
+
+    #[test]
+    fn silence_trim_cuts_edges_and_fades() {
+        let sr = 48_000u32;
+        let mut buf = vec![0.0f32; 48_000];
+        for (i, v) in buf.iter_mut().enumerate().skip(9_600).take(38_400 - 9_600) {
+            *v = ((i as f32) * 0.11).sin() * 0.5;
+        }
+        let out = trim_silence(&buf, sr).expect("content survives");
+        // Content length ≈ the non-silent window; edges are faded to (near) zero.
+        assert!((out.len() as i64 - 28_800).abs() <= 8, "kept {} samples", out.len());
+        assert!(out[0].abs() < 1e-3, "head faded");
+        assert!(out[out.len() - 1].abs() < 1e-3, "tail faded");
+        // Pure silence yields None so the caller can keep the original.
+        let silent = vec![0.0f32; 1000];
+        assert!(trim_silence(&silent, sr).is_none());
     }
 }

@@ -1,8 +1,9 @@
-//! JACK/PipeWire-JACK audio backend for simplooper.
+//! JACK/PipeWire-JACK audio backend for simplooper (DAW engine).
 //!
 //! A dedicated non-realtime "audio manager" thread owns the `jack::Client`.
 //! The GUI talks to it over an mpsc command channel and receives state
-//! updates (port lists, MIDI events, status) on a second channel.
+//! updates (port lists, MIDI events, finished takes, status) on a second
+//! channel.
 //!
 //! Port layout: the client registers a fixed pool of input/output slots
 //! (`in0..`, `out0..`) plus a MIDI input once at startup, and stays
@@ -14,6 +15,14 @@
 //! on PipeWire-JACK.) The realtime process handler reads two atomic
 //! "connected" masks and mixes only enabled slots, so no locking or stale
 //! port state ever enters the audio path.
+//!
+//! Playback model: ONE global transport clock drives the whole project. The
+//! musical content is an [`Arrangement`] (tracks → lanes → clips) plus an
+//! asset table, both shared as immutable Arc snapshots the GUI swaps in with
+//! [`Cmd::SetProject`]; the realtime path walks the timeline and sums every
+//! clip the playhead crosses. There are no per-track clocks and no overdub —
+//! recording captures raw input into a take buffer and hands the finished
+//! take back to the GUI (as an asset + clip placement) when stopped.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -24,6 +33,8 @@ use jack::{
     AudioIn, AudioOut, Client, ClientOptions, ClientStatus, Control, MidiIn, NotificationHandler,
     Port, PortFlags, PortId, ProcessHandler, ProcessScope,
 };
+
+use crate::arrange::Arrangement;
 
 pub const CLIENT_NAME: &str = "simplooper";
 const MIDI_PORT_SHORT: &str = "midi_in";
@@ -43,33 +54,34 @@ pub fn pan_gains(p: f32) -> (f32, f32) {
     (th.cos(), th.sin())
 }
 
-/// Number of simultaneous loops (tracks).
+/// Number of simultaneous tracks.
 pub const MAX_LOOPS: usize = 16;
 /// Per-track recording capacity: ~60 s @ 48 kHz (~30 s @ 96 kHz).
 pub const LOOP_CAP: u32 = 2_880_000;
 
-// Track states (AtomicU8 in the engine, mirrored to the GUI via Evt::LoopState).
+// Per-track recording states (AtomicU8 in the engine).
 pub const TR_IDLE: u8 = 0;
 pub const TR_REC: u8 = 1;
-pub const TR_PLAY: u8 = 2;
-pub const TR_OD: u8 = 3; // overdub = playing + writing live input
 
-/// MIDI value at which the per-loop gain slider sits at unity (0 dB): below
+/// MIDI value at which the per-track gain slider sits at unity (0 dB): below
 /// it cuts toward -inf, above it boosts toward [`GAIN_MAX_DB`].
 pub const GAIN_UNITY_MIDI: u8 = 80;
-/// Maximum boost of the per-loop gain slider (MIDI 127), in dB.
+/// Maximum boost of the per-track gain slider (MIDI 127), in dB.
 pub const GAIN_MAX_DB: f32 = 12.0;
 /// Linear amplitude of [`GAIN_MAX_DB`] (10^(12/20)).
 const GAIN_MAX_LIN: f32 = 1.584_893_2;
 
-/// Per-loop volume fader: MIDI 0..=127 → linear amplitude 0..=1
+/// Seek sentinel in the engine's seek slot: "no seek pending".
+pub const NO_SEEK: u64 = u64::MAX;
+
+/// Per-track volume fader: MIDI 0..=127 → linear amplitude 0..=1
 /// (0 = silence / -inf dB, 127 = 0 dB).
 #[inline]
 pub fn vol_amp(v: u8) -> f32 {
     v as f32 / 127.0
 }
 
-/// Per-loop gain trim: MIDI 0..=127 → linear amplitude (0 = silence / -inf,
+/// Per-track gain trim: MIDI 0..=127 → linear amplitude (0 = silence / -inf,
 /// [`GAIN_UNITY_MIDI`] = unity / 0 dB, 127 = +12 dB).
 #[inline]
 pub fn gain_amp(v: u8) -> f32 {
@@ -88,7 +100,7 @@ pub struct PortInfo {
     pub client: String,
 }
 
-/// One live per-loop effect slot: the refcounted effect instance plus the
+/// One live per-track effect slot: the refcounted effect instance plus the
 /// description needed to clone it for offline renders (never touched by the
 /// realtime path).
 pub struct FxSlot {
@@ -124,6 +136,10 @@ pub struct RawMidiMsg {
 /// bus, bit 1 = right bus (3 = mono downmix, the default).
 pub type OutSel = (String, u8);
 
+/// Immutable asset snapshot: sample buffers indexed by asset id, swapped in
+/// as one Arc whenever the rack changes. Clip lengths are the asset lengths.
+pub type AssetTable = Vec<Arc<[f32]>>;
+
 /// Commands from the GUI to the audio manager thread.
 pub enum Cmd {
     /// Re-enumerate remote audio ports and send them back.
@@ -136,87 +152,61 @@ pub enum Cmd {
     /// bit-exact old mono behaviour for centred mixes). A port routed to both
     /// gets the downmix, never two conflicting writes.
     Apply { ins: Vec<String>, outs: Vec<OutSel> },
-    /// Toggle recording on a loop track. From IDLE/PLAY this starts a fresh
-    /// capture (previous content is discarded); from REC it stops and keeps
-    /// the captured loop playing.
+    /// Start/stop a raw input capture on track `i`. Stopping sends the take
+    /// back as [`Evt::Take`] (armed at the playhead position it started in);
+    /// the GUI turns it into an asset + clip. Takes never touch the engine's
+    /// playback state.
     ToggleRecord { i: usize },
-    /// Toggle overdubbing on a loop track (playing + writing live input).
-    ToggleOverdub { i: usize },
-    /// Start/stop playback of a loop track.
-    TogglePlay { i: usize },
-    /// Undo the most recent overdub (across all tracks): the track it was
-    /// dubbed over reverts to the content it had before that overdub started.
-    /// The undone state goes on the redo stack.
-    UndoOverdub,
-    /// Re-apply the most recently undone overdub.
-    RedoOverdub,
-    /// Stop and erase a loop track.
-    ClearTrack { i: usize },
-    /// Replace track i's recording with `data` (decoded, engine-rate mono
-    /// samples; anything beyond the capacity is truncated). The track stops
-    /// first — importing replaces whatever was recorded before.
-    ImportTrack { i: usize, data: Vec<f32> },
-    /// Write one loop's recording to `path` in format `fmt`. Runs on the
-    /// manager thread (the GUI stays responsive; a Notice/Error event reports
-    /// the outcome).
+    /// Set / toggle a track's play/stop: while the transport runs, a *stopped*
+    /// track contributes nothing (its clips stay on the timeline untouched).
+    SetTrackOn { i: usize, on: bool },
+    ToggleTrackOn { i: usize },
+    /// Start the global transport from the current playhead position.
+    PlayAll,
+    /// Stop the global transport; the playhead holds its position.
+    StopAll,
+    /// Move the playhead (samples). Scrubbing sends these continuously.
+    Seek { pos: u64 },
+    /// Timeline loop toggle: wrap at the end of the project vs. park there.
+    SetLoop(bool),
+    /// Replace the engine's project snapshot (assets + arrangement + total
+    /// length). The RT handler picks the new Arcs up on the next cycle.
+    SetProject { assets: Arc<AssetTable>, arr: Arc<Arrangement>, len: u64 },
+    /// Write a track's rendered contribution (all its lanes, engine-rate
+    /// mixdown of the current project) to `path` in format `fmt`. Runs on
+    /// the manager thread; a Notice/Error event reports the outcome.
     ExportTrack {
         i: usize,
         path: std::path::PathBuf,
         fmt: crate::audio_io::ExportFormat,
     },
-    /// Render and write the whole dependent-mode ensemble (every loop at
-    /// position 0 for `root_loops` periods of the longest loop) to `path`.
-    /// Dependent mode is forced on before rendering — that is the only mode
-    /// in which a coherent whole-project export exists.
+    /// Render and write the whole project (every sounding track, all lanes,
+    /// mixer trims, pans and effects) to `path`.
     ExportProject {
         path: std::path::PathBuf,
         fmt: crate::audio_io::ExportFormat,
     },
-    /// true = dependent looping (finite ensemble clock), false = independent players.
-    SetDependent(bool),
-    /// GUI replaced track `i`'s effect chain (order = audio order). The slots
-    /// hold refcounted effect instances created on the GUI thread; the audio
-    /// thread picks the new table up on the next cycle without locking.
+    /// The GUI replaced track `i`'s effect chain (order = audio order). The
+    /// slots hold refcounted effect instances created on the GUI thread; the
+    /// audio thread picks the new table up on the next cycle without locking.
     SetTrackEffects { i: usize, chain: TrackFx },
-    /// The GUI selection moved to loop `i` (0-based). Input monitoring
-    /// follows the selected loop: its gain, volume, effect chain and pan
+    /// The GUI selection moved to track `i` (0-based). Input monitoring
+    /// follows the selected track: its gain, volume, effect chain and pan
     /// shape the live pass-through.
     SetSelected(usize),
-    /// Dependent-mode ensemble length in units of the longest ("root") loop,
-    /// clamped to 1..=64. The ensemble period is N root loops: every track
-    /// repeats within the period, and the clock wraps at the period end so
-    /// the loops keep playing forever (changing N while playing restarts the
-    /// ensemble from there).
-    SetRootLoops(u32),
-    /// Latency compensation: every FRESH recording discards its first `ms`
+    /// Latency compensation: every fresh take discards its first `ms`
     /// milliseconds of input, trimming the silence gap between pressing the
-    /// record button and that button click reaching the mic. Set to your
-    /// system's capture latency and the click lands exactly on the loop
-    /// start. Monitoring, overdubs and the output mix are never delayed.
-    /// Clamped to 0..=1000 ms.
+    /// record button and that button click reaching the mic. Monitoring and
+    /// the output mix are never delayed. Clamped to 0..=1000 ms.
     SetLatency { ms: f32 },
-    /// Metronome: on/off, tempo in BPM, subdivision in clicks per beat
+    /// Metronome: on/off, tempo in BPM, click subdivision in clicks per beat
     /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...), and beats
     /// per measure (the time-signature numerator; beat 1 of every measure
     /// gets the downbeat tone). Three distinct tones: downbeat, quarter note
-    /// and subdivision. The click goes to every selected output but is never
-    /// recorded into a loop.
+    /// and subdivision. Clicks land on the *project timeline grid*: while the
+    /// transport runs they tick at the transport tempo, and scrubbing the
+    /// playhead ticks the grid under it. Never recorded into a take.
     SetMetro { on: bool, bpm: u32, sub: u32, num: u32 },
-    /// Easy-quantize every loop against the chosen root loop's recorded length
-    /// (or, with `metro = true`, against the metronome grid: beat = 60/bpm
-    /// seconds, bar = beat x `num`; `bars` is then unused).
-    Quantize {
-        num: u32,
-        den: u32,
-        bars: u32,
-        unit: crate::quantize::Unit,
-        /// Which loop's recorded length defines the grid (0 = Loop 1).
-        root: usize,
-        /// true = quantize to the metronome tempo instead of the root loop.
-        metro: bool,
-        /// Metronome tempo in BPM (used only when `metro` is set).
-        bpm: u32,
-    },
     Quit,
 }
 
@@ -228,16 +218,16 @@ pub enum Evt {
     Ready { client_name: String, sample_rate: u32 },
     Ports { ins: Vec<PortInfo>, outs: Vec<PortInfo> },
     Applied { ins: usize, outs: usize },
-    /// Snapshot of all loop tracks (state + recorded length in samples).
-    LoopState { states: [u8; MAX_LOOPS], lens: [u32; MAX_LOOPS] },
-    /// A quantize pass finished; `summary` describes the grid and results.
-    Quantized { summary: String },
-    /// Overdub undo/redo availability changed (an overdub started, an
-    /// undo/redo ran, or a content-discarding command invalidated history).
-    UndoState { can_undo: bool, can_redo: bool },
-    Midi(RawMidiMsg),
-    /// Remote MIDI source ports currently wired into `simplooper:midi_in`
+    /// Transport state changed (the engine auto-stops at the project end
+    /// when the loop toggle is off; the GUI mirrors the flag).
+    Transport { on: bool },
+    /// A recording take finished: `at` is the playhead position when
+    /// recording started, `data` the captured mono samples. The GUI stores
+    /// it as an asset and places a clip; the engine keeps nothing.
+    Take { track: usize, at: u64, data: Arc<[f32]> },
+    /// A remote MIDI source ports currently wired into `simplooper:midi_in`
     /// (auto-connected; refreshed on port/client registration events).
+    Midi(RawMidiMsg),
     MidiSources(Vec<String>),
     /// A non-error status message worth showing in the top bar (e.g. a
     /// finished export).
@@ -258,8 +248,8 @@ pub struct Backend {
     pub xruns: Arc<AtomicU64>,
     /// MIDI events dropped because the GUI event queue was full.
     pub midi_drops: Arc<AtomicU64>,
-    /// Shared loop engine (GUI reads buffers for waveform rendering).
-    pub engine: Arc<LoopEngine>,
+    /// Shared engine (GUI reads atomics for transport display).
+    pub engine: Arc<Engine>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -273,7 +263,7 @@ impl Backend {
         let peak = Arc::new(AtomicU32::new(0));
         let xruns = Arc::new(AtomicU64::new(0));
         let midi_drops = Arc::new(AtomicU64::new(0));
-        let engine = LoopEngine::new();
+        let engine = Engine::new();
         let (t_gain, t_peak, t_xruns, t_midi_drops, t_engine) = (
             gain.clone(),
             peak.clone(),
@@ -317,54 +307,69 @@ impl Drop for Backend {
     }
 }
 
-/// The loop engine: sixteen pre-allocated recording buffers plus atomic
-/// per-track state/length, shared between the manager thread (commands) and
-/// the realtime handler (capture/playback).
+/// The transport engine: recording buffers, atomic transport/mixer state,
+/// and immutable Arc snapshots of the project (assets + arrangement), shared
+/// between the manager thread (commands, take extraction, renders) and the
+/// realtime handler (timeline mixing, capture).
 ///
 /// Concurrency discipline:
-/// - The audio thread is the only writer of `len` while a track records
-///   (`fetch_add`), and reads/writes sample data only for tracks whose state
-///   it snapshotted as non-IDLE.
-/// - The manager thread mutates buffers (clear/quantize) only after setting
-///   the track IDLE and letting one or two audio cycles elapse; `start_rec`
-///   zeroes the buffer *before* arming REC so RT never captures stale data.
-pub struct LoopEngine {
-    bufs: [*mut f32; MAX_LOOPS],
-    state: [AtomicU8; MAX_LOOPS],
-    len: [AtomicU32; MAX_LOOPS],
-    /// 0 = independent players, 1 = dependent (ensemble) mode.
-    mode: AtomicU8,
-    /// Bumped whenever the manager rewrites buffer contents (clear/quantize)
-    /// so the GUI can invalidate its waveform caches.
-    gen: AtomicU64,
-    /// Per-track read offset within [0, len) — published by the RT thread for
-    /// the GUI playback bars (independent mode).
-    pos: [AtomicU64; MAX_LOOPS],
-    /// Dependent-mode ensemble clock (samples) — shared playback-bar position.
-    master_pos: AtomicU64,
-    /// Dependent-mode ensemble length in units of the longest loop (>= 1).
-    root_loops: AtomicU32,
-    /// Latency compensation in samples (0 = off): every fresh recording
-    /// discards its first `latency` input samples (armed in `start_rec`,
-    /// consumed in `rec_sample`) so the click of pressing the record button
-    /// — caught a few ms late by the mic — becomes the FIRST sample of the
-    /// loop instead of landing a few ms into it. Monitoring, overdubs and
-    /// the output mix are never delayed.
+/// - The audio thread is the only writer of take lengths while recording
+///   (`fetch_add` discipline as before) and of the published playhead.
+/// - Project snapshots are swapped wholesale as Arcs (try_lock in RT, never
+///   blocks); a swap can never tear a clip mid-sample.
+/// - The manager mutates nothing the RT path reads except atomics and the
+///   quiesced take buffers (stop → one 20 ms sleep → read).
+pub struct Engine {
+    /// Per-track raw capture buffers (one take in flight per track).
+    rec_bufs: [*mut f32; MAX_LOOPS],
+    rec_len: [AtomicU32; MAX_LOOPS],
+    rec_state: [AtomicU8; MAX_LOOPS],
+    /// Playhead position (samples) when the current take started — reported
+    /// back with the finished take so the GUI places the clip there.
+    rec_at: [AtomicU64; MAX_LOOPS],
+    /// Latency compensation in samples (0 = off): every fresh take discards
+    /// its first `latency` input samples (armed in `start_rec`, consumed in
+    /// `rec_sample`) so the click of pressing the record button — caught a
+    /// few ms late by the mic — becomes the take's FIRST sample instead of
+    /// landing a few ms into it. Monitoring and the output mix are never
+    /// delayed.
     latency: AtomicU32,
     /// Per-track count of leading input samples still to discard for the
     /// current take; armed from `latency` by `start_rec`.
     rec_skip: [AtomicU32; MAX_LOOPS],
+    /// Bitmask of tracks whose take the RT handler auto-stopped at buffer
+    /// capacity. The manager polls + clears it (it owns the event channel)
+    /// and ships those takes to the GUI like any other finished take.
+    take_pending: AtomicU64,
+
+    // ---- global transport ------------------------------------------------
+    /// 1 = running (timeline advances), 0 = stopped (playhead holds).
+    transport_on: AtomicU8,
+    /// 1 = wrap the playhead at the project end, 0 = park at the end.
+    loop_tl: AtomicU8,
+    /// Playhead position in timeline samples (published by RT, seeks written
+    /// by the manager through `seek`).
+    pos: AtomicU64,
+    /// Pending seek target; `NO_SEEK` when none. The RT handler swaps this at
+    /// block start, which makes seeks race-free against RT position writes.
+    seek: AtomicU64,
+    /// Total project length in samples (>= 1 bar; the GUI guarantees it).
+    proj_len: AtomicU64,
+
+    // ---- mixer -----------------------------------------------------------
+    /// Per-track play/stop flag (mirror — the GUI is the source of truth;
+    /// MIDI/keybinds fire through the GUI too).
+    track_on: [AtomicU8; MAX_LOOPS],
     /// Per-track playback volume (linear amplitude as f32 bits; 1.0 = 0 dB).
-    /// Applied to the loop's output contribution only — recorded/overdubbed
-    /// content always stays at raw input level.
+    /// Applied to each clip's playback contribution only — recorded takes
+    /// always stay at raw input level.
     vol: [AtomicU32; MAX_LOOPS],
-    /// Per-track playback gain trim (linear amplitude as f32 bits;
-    /// 1.0 = 0 dB). Same output-only semantics as `vol`.
+    /// Per-track gain trim (linear amplitude as f32 bits; 1.0 = 0 dB).
     trk_gain: [AtomicU32; MAX_LOOPS],
     /// Per-track stereo pan position as f32 in [0, 1] (0 = hard left,
     /// 0.5 = centre). Equal-power split between the L and R mix buses.
     pan: [AtomicU32; MAX_LOOPS],
-    /// GUI-selected loop (0-based). Live input monitoring rides this
+    /// GUI-selected track (0-based). Live input monitoring rides this
     /// track's gain x volume, effect chain and pan (see `Proc::process`).
     selected: AtomicU8,
     /// Per-track live effect chains. The manager thread swaps the whole
@@ -372,6 +377,14 @@ pub struct LoopEngine {
     /// clone when `fx_gen` changes (try_lock — never blocks).
     fx: std::sync::Mutex<Arc<[TrackFx; MAX_LOOPS]>>,
     fx_gen: AtomicU64,
+
+    // ---- project snapshots -----------------------------------------------
+    assets: std::sync::Mutex<Arc<AssetTable>>,
+    assets_gen: AtomicU64,
+    arr: std::sync::Mutex<Arc<Arrangement>>,
+    arr_gen: AtomicU64,
+
+    // ---- metronome ---------------------------------------------------------
     /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat; beats per
     /// measure (time-signature numerator, default 4).
     metro_on: AtomicU8,
@@ -380,31 +393,42 @@ pub struct LoopEngine {
     metro_num: AtomicU32,
 }
 
-impl LoopEngine {
+impl Engine {
     pub fn new() -> Arc<Self> {
-        let mut bufs = [std::ptr::null_mut::<f32>(); MAX_LOOPS];
-        for buf in bufs.iter_mut() {
+        let mut rec_bufs = [std::ptr::null_mut::<f32>(); MAX_LOOPS];
+        for buf in rec_bufs.iter_mut() {
             let mut v = vec![0f32; LOOP_CAP as usize];
             *buf = v.as_mut_ptr();
             std::mem::forget(v); // ownership transfers to the engine
         }
         Arc::new(Self {
-            bufs,
-            state: core::array::from_fn(|_| AtomicU8::new(TR_IDLE)),
-            len: core::array::from_fn(|_| AtomicU32::new(0)),
-            mode: AtomicU8::new(0),
-            gen: AtomicU64::new(0),
-            pos: core::array::from_fn(|_| AtomicU64::new(0)),
-            master_pos: AtomicU64::new(0),
-            root_loops: AtomicU32::new(1),
+            rec_bufs,
+            rec_len: core::array::from_fn(|_| AtomicU32::new(0)),
+            rec_state: core::array::from_fn(|_| AtomicU8::new(TR_IDLE)),
+            rec_at: core::array::from_fn(|_| AtomicU64::new(0)),
             latency: AtomicU32::new(0),
             rec_skip: core::array::from_fn(|_| AtomicU32::new(0)),
+            take_pending: AtomicU64::new(0),
+            transport_on: AtomicU8::new(0),
+            loop_tl: AtomicU8::new(1),
+            pos: AtomicU64::new(0),
+            seek: AtomicU64::new(NO_SEEK),
+            // Empty project: an idle timeline as long as a take buffer, so
+            // a bare metronome run (transport stopped) never wraps/parks on
+            // a 1-sample grid. The GUI replaces this with the real length
+            // via Cmd::SetProject on every edit.
+            proj_len: AtomicU64::new(LOOP_CAP as u64),
+            track_on: core::array::from_fn(|_| AtomicU8::new(1)),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             selected: AtomicU8::new(0),
             fx: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| TrackFx::default()))),
             fx_gen: AtomicU64::new(0),
+            assets: std::sync::Mutex::new(Arc::new(Vec::new())),
+            assets_gen: AtomicU64::new(0),
+            arr: std::sync::Mutex::new(Arc::new(Arrangement::new())),
+            arr_gen: AtomicU64::new(0),
             metro_on: AtomicU8::new(0),
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
@@ -412,210 +436,148 @@ impl LoopEngine {
         })
     }
 
-    // ---- realtime access (audio thread) ---------------------------------
-
-    #[inline]
-    pub fn read(&self, i: usize, off: u32) -> f32 {
-        unsafe { *self.bufs[i].add(off as usize) }
-    }
-
-    #[inline]
-    pub fn write(&self, i: usize, off: u32, v: f32) {
-        unsafe { self.bufs[i].add(off as usize).write(v) };
-    }
+    // ---- take capture (audio thread writes, manager reads while quiesced) --
 
     /// Capture one dry-mixed sample into track i while recording. Returns
     /// true once the buffer is full (caller should auto-stop the take). The
     /// length counter never exceeds LOOP_CAP: the check happens before
-    /// advancing, so a loop that hits capacity mid-frame can't overshoot —
-    /// every consumer (UI waveform, playback reads) assumes len <= CAP.
+    /// advancing, so a take that hits capacity mid-frame can't overshoot.
     #[inline]
     pub fn rec_sample(&self, i: usize, v: f32) -> bool {
         // Latency compensation: a fresh take discards its first `latency`
         // input samples (armed in `start_rec`) so the click of the button
         // that started recording — heard a few ms late through the mic —
-        // becomes the loop's FIRST sample instead of landing ms into it.
+        // becomes the take's FIRST sample instead of landing ms into it.
         let skip = self.rec_skip[i].load(Ordering::Relaxed);
         if skip > 0 {
             self.rec_skip[i].store(skip - 1, Ordering::Relaxed);
             return false;
         }
-        let off = self.len[i].load(Ordering::Relaxed) as u64;
+        let off = self.rec_len[i].load(Ordering::Relaxed) as u64;
         if off < LOOP_CAP as u64 {
-            self.write(i, off as u32, v);
-            self.len[i].store((off + 1) as u32, Ordering::Relaxed);
+            self.rec_write(i, off as u32, v);
+            self.rec_len[i].store((off + 1) as u32, Ordering::Relaxed);
             false
         } else {
             true
         }
     }
 
-    // ---- manager access (track must be quiescent — see command docs) -----
-
-    pub fn state_of(&self, i: usize) -> u8 {
-        self.state[i].load(Ordering::Relaxed)
+    #[inline]
+    pub fn rec_write(&self, i: usize, off: u32, v: f32) {
+        unsafe { self.rec_bufs[i].add(off as usize).write(v) };
     }
 
-    pub fn len_of(&self, i: usize) -> u32 {
-        self.len[i].load(Ordering::Relaxed)
+    #[inline]
+    pub fn rec_read(&self, i: usize, off: u32) -> f32 {
+        unsafe { *self.rec_bufs[i].add(off as usize) }
     }
 
-    /// Stop a track and erase its buffer. Safe to call from the manager
-    /// thread: IDLE is stored first so RT stops touching the track before the
-    /// zero-fill begins (worst case: a few glitch samples at the boundary).
-    pub fn clear(&self, i: usize) {
-        self.state[i].store(TR_IDLE, Ordering::Relaxed);
-        let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
-        buf.fill(0.0f32);
-        self.len[i].store(0, Ordering::Relaxed);
-        self.gen.fetch_add(1, Ordering::Relaxed);
+    pub fn rec_state_of(&self, i: usize) -> u8 {
+        self.rec_state[i].load(Ordering::Relaxed)
     }
 
-    /// Stop track i and replace its recording with `data` (engine-rate mono
-    /// samples, truncated to capacity). Safe from the manager thread: IDLE is
-    /// stored first so RT stops reading before the buffer is rewritten.
-    pub fn import_track(&self, i: usize, data: &[f32]) {
-        self.state[i].store(TR_IDLE, Ordering::Relaxed);
-        let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
-        let n = data.len().min(LOOP_CAP as usize);
-        buf[..n].copy_from_slice(&data[..n]);
-        buf[n..].fill(0.0f32);
-        self.pos[i].store(0, Ordering::Relaxed);
-        self.len[i].store(n as u32, Ordering::Relaxed);
-        self.gen.fetch_add(1, Ordering::Relaxed);
+    /// RT: this track hit buffer capacity — flag the take for the manager
+    /// to pick up and ship to the GUI.
+    #[inline]
+    pub fn mark_take_pending(&self, i: usize) {
+        self.take_pending.fetch_or(1u64 << i, Ordering::SeqCst);
     }
 
-    /// Render the full dependent-mode ensemble — every track at position 0,
-    /// for `root_loops` periods of the longest loop — to mono f32 samples.
-    /// Used for whole-project export; None when no track has content.
-    pub fn render_ensemble(&self, root_loops: usize) -> Option<Vec<f32>> {
-        let lens = self.lens();
-        let max_len = lens.iter().max().copied().unwrap_or(0);
-        if max_len == 0 {
-            return None;
-        }
-        let periods = (root_loops.max(1) as u32 * max_len) as u64;
-        let mut out: Vec<f32> = vec![0.0f32; periods as usize];
-        for (t, &l32) in lens.iter().enumerate() {
-            let l = l32 as u64;
-            if l == 0 {
-                continue;
-            }
-            let buf = unsafe { std::slice::from_raw_parts(self.bufs[t], LOOP_CAP as usize) };
-            // Export mirrors the live mix: each track's playback trim
-            // (volume x gain) and effect chain ride the render. The chain
-            // uses FRESH private instances (phase 0) so the live instances
-            // the RT thread is advancing are never touched.
-            let tamp = self.loop_vol(t) * self.loop_gain(t);
-            // Pan rides the render too: the mono export is the (L + R)/sqrt2
-            // downmix of the panned contribution, matching a mono output port.
-            let (pgl, pgr) = pan_gains(self.loop_pan(t));
-            let pdown = (pgl + pgr) * F1S2;
-            let fx: Vec<Arc<crate::fx::Instance>> = {
-                let tb = self.fx.lock().unwrap();
-                tb[t].slots().iter().filter_map(|s| s.inst.spawn_fresh(&s.desc)).collect()
-            };
-            let mix = |x: f32| {
-                let mut s = x * tamp;
-                for f in &fx {
-                    s = f.process_private(s);
-                }
-                s
-            };
-            for p in 0..(periods / max_len as u64) {
-                let base = p * max_len as u64;
-                let start = (base % l) as usize;
-                let end = ((base + max_len as u64) % l) as usize;
-                if end > start {
-                    for k in 0..(end - start) {
-                        out[(base + k as u64) as usize] += mix(buf[start + k]) * pdown;
-                    }
-                } else {
-                    let first = (l - start as u64) as usize;
-                    for k in 0..first {
-                        out[(base + k as u64) as usize] += mix(buf[start + k]) * pdown;
-                    }
-                    for k in 0..end {
-                        out[(base + first as u64 + k as u64) as usize] += mix(buf[k]) * pdown;
-                    }
-                }
-            }
-        }
-        Some(out)
+    /// Manager: claim every flagged take (returns a bitmask; bit `i` =
+    /// track `i` has a capacity-stopped take ready to copy).
+    pub fn claim_takes(&self) -> u64 {
+        self.take_pending.swap(0, Ordering::SeqCst)
     }
 
-    /// Snapshot of all track lengths (samples).
-    pub fn lens(&self) -> [u32; MAX_LOOPS] {
-        core::array::from_fn(|i| self.len[i].load(Ordering::Relaxed))
+    pub fn rec_len_of(&self, i: usize) -> u32 {
+        self.rec_len[i].load(Ordering::Relaxed)
     }
 
-    /// Clone of track `i`'s recorded content (length + samples). Safe from
-    /// the manager thread while the track is not REC/OD: the RT thread only
-    /// reads buffer data during PLAY.
-    pub fn snapshot(&self, i: usize) -> (u32, Vec<f32>) {
-        let l = self.len_of(i);
-        (l, self.read_range(i, l).to_vec())
+    /// Playhead position when track `i`'s current take started.
+    pub fn rec_at(&self, i: usize) -> u64 {
+        self.rec_at[i].load(Ordering::Relaxed)
     }
 
-    /// Zero the buffer, arm the latency-compensation skip and start a fresh
-    /// capture on track i.
+    /// Zero the take buffer, arm the latency-compensation skip, remember the
+    /// playhead, and start capturing on track i.
     pub fn start_rec(&self, i: usize) {
-        self.state[i].store(TR_IDLE, Ordering::Relaxed);
-        let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
+        self.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.rec_bufs[i], LOOP_CAP as usize) };
         buf.fill(0.0f32);
-        self.len[i].store(0, Ordering::Relaxed);
+        self.rec_len[i].store(0, Ordering::Relaxed);
         // Snapshot the compensation at arm time: changing latency mid-take
         // must never retroactively shift a recording in progress.
         self.rec_skip[i].store(self.latency.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.state[i].store(TR_REC, Ordering::Relaxed);
+        self.rec_at[i].store(self.pos.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.rec_state[i].store(TR_REC, Ordering::Relaxed);
     }
 
-    /// Quantize every non-empty track in place (all tracks must be IDLE).
-    /// Returns the new lengths.
-    pub fn quantize_all(&self, target: u32, sr: u32) -> [u32; MAX_LOOPS] {
-        let mut out = [0u32; MAX_LOOPS];
-        for (i, o) in out.iter_mut().enumerate() {
-            let l = self.len[i].load(Ordering::Relaxed);
-            if l == 0 {
-                continue;
-            }
-            let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], LOOP_CAP as usize) };
-            *o = crate::quantize::quantize_track(buf, l, target, LOOP_CAP, sr);
-            self.len[i].store(*o, Ordering::Relaxed);
+    /// Stop capturing on track i (state first, so RT releases the buffer)
+    /// and clone the take's content. The caller must let one or two audio
+    /// cycles elapse between the stop and this read (same discipline the old
+    /// clear/quantize used); `finish_take` on the manager wraps that.
+    pub fn copy_take(&self, i: usize) -> (u64, Arc<[f32]>) {
+        self.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
+        let n = self.rec_len[i].load(Ordering::Relaxed) as usize;
+        let data = unsafe { std::slice::from_raw_parts(self.rec_bufs[i], n) };
+        (self.rec_at[i].load(Ordering::Relaxed), Arc::from(data))
+    }
+
+    // ---- global transport ---------------------------------------------------
+
+    pub fn transport_on(&self) -> bool {
+        self.transport_on.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn set_transport(&self, on: bool) {
+        self.transport_on.store(on as u8, Ordering::Relaxed);
+    }
+
+    pub fn loop_tl(&self) -> bool {
+        self.loop_tl.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn set_loop_tl(&self, on: bool) {
+        self.loop_tl.store(on as u8, Ordering::Relaxed);
+    }
+
+    /// Current playhead position (samples).
+    pub fn pos(&self) -> u64 {
+        self.pos.load(Ordering::Relaxed)
+    }
+
+    /// Request a playhead move. RT swaps `seek` at block start, so this is
+    /// safe while the transport runs (scrubbing).
+    pub fn seek_to(&self, p: u64) {
+        let p = p.min(self.proj_len.load(Ordering::Relaxed));
+        self.pos.store(p, Ordering::Relaxed);
+        self.seek.store(p, Ordering::Relaxed);
+    }
+
+    pub fn take_seek(&self) -> Option<u64> {
+        match self.seek.swap(NO_SEEK, Ordering::Relaxed) {
+            NO_SEEK => None,
+            p => Some(p),
         }
-        self.gen.fetch_add(1, Ordering::Relaxed);
-        out
     }
 
-    /// Read up to `count` samples of track i (GUI waveform rendering).
-    pub fn read_range(&self, i: usize, count: u32) -> &[f32] {
-        unsafe { std::slice::from_raw_parts(self.bufs[i], (count as usize).min(LOOP_CAP as usize)) }
+    pub fn proj_len(&self) -> u64 {
+        self.proj_len.load(Ordering::Relaxed)
     }
 
-    /// Current content-generation counter (GUI cache invalidation).
-    pub fn generation(&self) -> u64 {
-        self.gen.load(Ordering::Relaxed)
+    // ---- mixer --------------------------------------------------------------
+
+    pub fn track_on(&self, i: usize) -> bool {
+        self.track_on[i].load(Ordering::Relaxed) != 0
     }
 
-    // ---- GUI / test accessors -------------------------------------------
-
-    /// Per-track read offset within [0, len) — for the playback bar.
-    pub fn pos_of(&self, i: usize) -> u64 {
-        self.pos[i].load(Ordering::Relaxed)
+    pub fn set_track_on(&self, i: usize, on: bool) {
+        self.track_on[i].store(on as u8, Ordering::Relaxed);
     }
 
-    /// Dependent-mode ensemble clock (samples).
-    pub fn master_pos(&self) -> u64 {
-        self.master_pos.load(Ordering::Relaxed)
-    }
-
-    /// Dependent-mode ensemble length in units of the longest loop (>= 1).
-    pub fn root_loops(&self) -> u32 {
-        self.root_loops.load(Ordering::Relaxed)
-    }
-
-    /// Latency compensation in samples (0 = off). Each fresh recording
-    /// discards this many leading input samples.
+    /// Latency compensation in samples (0 = off). Each fresh take discards
+    /// this many leading input samples.
     pub fn latency_samples(&self) -> u32 {
         self.latency.load(Ordering::Relaxed)
     }
@@ -669,6 +631,41 @@ impl LoopEngine {
         self.fx_gen.load(Ordering::Relaxed)
     }
 
+    // ---- project snapshots ----------------------------------------------------
+
+    /// Replace the engine's project snapshot (any thread; RT refreshes when
+    /// either generation moves).
+    pub fn set_project(&self, assets: Arc<AssetTable>, arr: Arc<Arrangement>, len: u64) {
+        *self.assets.lock().unwrap() = assets;
+        self.assets_gen.fetch_add(1, Ordering::Relaxed);
+        *self.arr.lock().unwrap() = arr;
+        self.arr_gen.fetch_add(1, Ordering::Relaxed);
+        self.proj_len.store(len.max(1), Ordering::Relaxed);
+        let pl = self.proj_len.load(Ordering::Relaxed);
+        // A project can shrink under the playhead — keep it in bounds.
+        if self.pos.load(Ordering::Relaxed) > pl {
+            self.seek_to(pl);
+        }
+    }
+
+    pub fn assets(&self) -> Arc<AssetTable> {
+        self.assets.lock().unwrap().clone()
+    }
+
+    pub fn assets_gen(&self) -> u64 {
+        self.assets_gen.load(Ordering::Relaxed)
+    }
+
+    pub fn arrangement(&self) -> Arc<Arrangement> {
+        self.arr.lock().unwrap().clone()
+    }
+
+    pub fn arr_gen(&self) -> u64 {
+        self.arr_gen.load(Ordering::Relaxed)
+    }
+
+    // ---- metronome --------------------------------------------------------------
+
     /// Metronome state: (on, bpm, clicks per beat, beats per measure).
     pub fn metro(&self) -> (bool, u32, u32, u32) {
         (
@@ -678,165 +675,117 @@ impl LoopEngine {
             self.metro_num.load(Ordering::Relaxed),
         )
     }
+
+    // ---- offline rendering --------------------------------------------------------
+
+    /// Render the current project to mono f32 samples at the project length:
+    /// every clip of every *sounding* track (stopped tracks contribute
+    /// nothing — the export is what the mix plays). Each track's contribution
+    /// runs through fresh private effect instances (phase 0) after its
+    /// vol x gain trim, panned to the mono downmix — the same chain the live
+    /// mix applies. `None` when the project holds no clips.
+    pub fn render_project(&self) -> Option<Vec<f32>> {
+        self.render_tracks(None, self.proj_len() as usize)
+    }
+
+    /// Render one track's contribution (all lanes; the track's play/stop
+    /// flag is ignored when a track export is explicitly requested).
+    pub fn render_track(&self, t: usize) -> Option<Vec<f32>> {
+        self.render_tracks(Some(t), self.proj_len() as usize)
+    }
+
+    fn render_tracks(&self, only: Option<usize>, len: usize) -> Option<Vec<f32>> {
+        let arr = self.arrangement();
+        let assets = self.assets();
+        if only.is_none() && arr.is_empty() {
+            return None;
+        }
+        let mut out = vec![0.0f32; len.max(1)];
+        let mut any = false;
+        for t in 0..MAX_LOOPS {
+            if let Some(want) = only {
+                if t != want {
+                    continue;
+                }
+            } else if !self.track_on(t) {
+                continue; // exports mirror the live mix
+            }
+            let tamp = self.loop_vol(t) * self.loop_gain(t);
+            let (pgl, pgr) = pan_gains(self.loop_pan(t));
+            let pdown = (pgl + pgr) * F1S2;
+            let chain = self.fx.lock().unwrap()[t].clone();
+            for lane in &arr.tracks[t].lanes {
+                for cl in &lane.clips {
+                    let data = match assets.get(cl.asset as usize) {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    any = true;
+                    // Fresh private instances per clip: every clip starts at
+                    // effect phase 0, and the live chain is never advanced.
+                    let fx: Vec<Arc<crate::fx::Instance>> = chain
+                        .slots()
+                        .iter()
+                        .filter_map(|s| s.inst.spawn_fresh(&s.desc))
+                        .collect();
+                    let mix = |x: f32| {
+                        let mut s = x * tamp;
+                        for f in &fx {
+                            s = f.process_private(s);
+                        }
+                        s
+                    };
+                    let start = cl.pos as usize;
+                    let end = (start + data.len()).min(len);
+                    for (o, k) in out[start..end].iter_mut().enumerate() {
+                        *k += mix(data[o]) * pdown;
+                    }
+                }
+            }
+        }
+        if any {
+            Some(out)
+        } else {
+            None
+        }
+    }
 }
 
-impl Drop for LoopEngine {
+impl Drop for Engine {
     fn drop(&mut self) {
         use std::alloc::{dealloc, Layout};
         let layout = Layout::array::<f32>(LOOP_CAP as usize).expect("valid layout");
-        for p in self.bufs.iter() {
+        for p in self.rec_bufs.iter() {
             unsafe { dealloc(*p as *mut u8, layout) };
         }
     }
 }
 
-// The raw pointers are only ever dereferenced from the audio thread (sample
-// R/W) or the manager thread while the owning track is quiescent; the Arc
+// The raw pointers are only ever dereferenced from the audio thread (take
+// sample writes) or the manager thread while the take is quiesced; the Arc
 // keeps the engine alive for as long as either thread exists.
-unsafe impl Send for LoopEngine {}
-unsafe impl Sync for LoopEngine {}
+unsafe impl Send for Engine {}
+unsafe impl Sync for Engine {}
 
-/// Snapshot of all tracks, for Evt::LoopState.
-fn loop_state(engine: &LoopEngine) -> ([u8; MAX_LOOPS], [u32; MAX_LOOPS]) {
-    let mut states = [0u8; MAX_LOOPS];
-    let mut lens = [0u32; MAX_LOOPS];
-    for i in 0..MAX_LOOPS {
-        states[i] = engine.state_of(i);
-        lens[i] = engine.len_of(i);
-    }
-    (states, lens)
-}
-
-fn send_loop_state(engine: &LoopEngine, tx: &SyncSender<Evt>) {
-    let (states, lens) = loop_state(engine);
-    let _ = tx.send(Evt::LoopState { states, lens });
-}
-
-fn send_undo_state(hist: &OdHistory, tx: &SyncSender<Evt>) {
-    let _ = tx.try_send(Evt::UndoState {
-        can_undo: hist.can_undo(),
-        can_redo: hist.can_redo(),
-    });
-}
-
-/// Max overdub snapshots kept per stack. Each snapshot is one track buffer
-/// (up to LOOP_CAP floats), so 8 deep costs at most ~92 MB per stack in the
-/// absolute worst case (sixteen 60 s tracks) and far less in practice.
-pub const MAX_OD_HISTORY: usize = 8;
-
-/// One overdub-undo entry: a track's full content plus whether it was
-/// playing, captured right before an overdub started (or, for a redo entry,
-/// the state captured at undo time).
-struct OdSnapshot {
-    track: usize,
-    data: Vec<f32>,
-    playing: bool,
-}
-
-/// Global overdub undo/redo history — manager-thread state only, owned by
-/// the audio manager loop.
-///
-/// Every overdub start pushes the dubbed track's pre-overdub buffer onto the
-/// undo stack (and clears the redo stack, like any fresh edit). Undo stops
-/// the track, lets the RT thread quiesce, swaps the buffer for the snapshot,
-/// and pushes the overdubbed state onto the redo stack; redo swaps back.
-/// Commands that discard or rewrite a track's content (fresh record, clear,
-/// import, quantize) invalidate that track's entries so an undo can never
-/// resurrect audio the user deliberately threw away.
-#[derive(Default)]
-pub struct OdHistory {
-    undo: Vec<OdSnapshot>,
-    redo: Vec<OdSnapshot>,
-}
-
-impl OdHistory {
-    pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
-    }
-
-    pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
-    }
-
-    /// An overdub is starting on track `i`: capture its current content.
-    /// MUST be called before arming TR_OD — while the track still reads as
-    /// PLAY/IDLE the RT thread never writes its buffer.
-    pub fn begin(&mut self, engine: &LoopEngine, i: usize) {
-        let playing = engine.state_of(i) == TR_PLAY;
-        let (_, data) = engine.snapshot(i);
-        self.undo.push(OdSnapshot { track: i, data, playing });
-        while self.undo.len() > MAX_OD_HISTORY {
-            self.undo.remove(0);
-        }
-        // A fresh edit invalidates the redo branch.
-        self.redo.clear();
-    }
-
-    /// Undo the most recent overdub. Returns the affected track index, or
-    /// None when the undo stack is empty.
-    pub fn undo(&mut self, engine: &LoopEngine) -> Option<usize> {
-        let s = self.undo.pop()?;
-        let t = s.track;
-        Self::swap_in(engine, s, &mut self.redo);
-        Some(t)
-    }
-
-    /// Re-apply the most recently undone overdub.
-    pub fn redo(&mut self, engine: &LoopEngine) -> Option<usize> {
-        let s = self.redo.pop()?;
-        let t = s.track;
-        Self::swap_in(engine, s, &mut self.undo);
-        Some(t)
-    }
-
-    /// Drop every entry for track `i` (its content was discarded/rewritten).
-    pub fn invalidate_track(&mut self, i: usize) {
-        self.undo.retain(|s| s.track != i);
-        self.redo.retain(|s| s.track != i);
-    }
-
-    /// Drop everything (a quantize rewrote every buffer in place).
-    pub fn clear_all(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
-    }
-
-    /// Restore snapshot `s` into its track and push the state being replaced
-    /// onto `stack` (the opposite direction's stack).
-    fn swap_in(engine: &LoopEngine, s: OdSnapshot, stack: &mut Vec<OdSnapshot>) {
-        // Was the track audible before we stop it? (Undo during a live
-        // overdub counts as playing.)
-        let cur_playing = matches!(engine.state_of(s.track), TR_PLAY | TR_OD);
-        // Stop first, then let the RT thread quiesce before rewriting the
-        // buffer (same discipline as clear/quantize).
-        engine.state[s.track].store(TR_IDLE, Ordering::Relaxed);
+/// Manager-side record toggle: start a fresh capture, or stop the take and
+/// hand it to the GUI. Stopping always leaves the engine ready for the next
+/// take; empty stops (button mashing) are silently dropped.
+fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
+    if engine.rec_state_of(i) == TR_REC {
+        engine.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
+        // The GUI owns this take now; drop any capacity-stop flag so the
+        // manager poll doesn't ship the same take twice.
+        engine.take_pending.fetch_and(!(1u64 << i), Ordering::SeqCst);
+        // Let the RT thread quiesce before cloning the take buffer.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let (_, cur_data) = engine.snapshot(s.track);
-        stack.push(OdSnapshot { track: s.track, data: cur_data, playing: cur_playing });
-        while stack.len() > MAX_OD_HISTORY {
-            stack.remove(0);
+        let (at, data) = engine.copy_take(i);
+        if data.is_empty() {
+            let _ = tx.try_send(Evt::Notice(format!("track {}: empty take discarded", i + 1)));
+        } else {
+            let _ = tx.try_send(Evt::Take { track: i, at, data });
         }
-        engine.import_track(s.track, &s.data);
-        engine.state[s.track].store(
-            if s.playing && !s.data.is_empty() { TR_PLAY } else { TR_IDLE },
-            Ordering::Relaxed,
-        );
-    }
-}
-
-/// Manager-side record toggle: start a fresh capture, or stop and keep the
-/// captured loop playing.
-fn toggle_record(engine: &LoopEngine, i: usize) {
-    match engine.state_of(i) {
-        TR_REC => {
-            let st = if engine.len_of(i) > 0 { TR_PLAY } else { TR_IDLE };
-            engine.state[i].store(st, Ordering::Relaxed);
-        }
-        TR_OD => engine.state[i].store(TR_PLAY, Ordering::Relaxed),
-        _ => {
-            // IDLE or PLAY: fresh capture (previous content is discarded).
-            engine.start_rec(i);
-        }
+    } else {
+        engine.start_rec(i);
     }
 }
 
@@ -847,7 +796,7 @@ fn run(
     peak: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
     midi_drops: Arc<AtomicU64>,
-    engine: Arc<LoopEngine>,
+    engine: Arc<Engine>,
 ) {
     // Test-only kill switch: headless GUI tests must not open PipeWire-JACK
     // clients at all. Spawning and closing dozens of clients per suite races
@@ -930,26 +879,24 @@ fn run(
         gain: gain.clone(),
         peak: peak.clone(),
         engine: engine.clone(),
-        prev_state: [TR_IDLE; MAX_LOOPS],
+        prev_rec: [TR_IDLE; MAX_LOOPS],
         rec_full: 0,
-        pos: [0u64; MAX_LOOPS],
-        master_pos: 0,
-        prev_mode: 0,
-        prev_root: 1,
+        pos: 0,
+        prev_transport: false,
+        prev_metro: false,
         sr,
-        metro_next: 0,
+        metro_idx: 0i64,
         metro_start: -1,
-        metro_beat_start: 0,
-        metro_beat_len: 0,
-        metro_beat: 0,
-        metro_k: 0,
-        metro_sub_eff: 1,
         metro_tone: 0,
-        prev_metro_on: false,
         sample_no: 0,
         fx_cache: engine.fx_table(),
         fx_cache_gen: engine.fx_gen(),
         fx_rt: Vec::new(),
+        arr: engine.arrangement(),
+        arr_cache_gen: engine.arr_gen(),
+        assets: engine.assets(),
+        assets_cache_gen: engine.assets_gen(),
+        clip_buf: Vec::new(),
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -981,9 +928,6 @@ fn run(
     let mut cur_in: Vec<Option<String>> = vec![None; MAX_SLOTS];
     let mut cur_out: Vec<Option<(String, u8)>> = vec![None; MAX_SLOTS];
 
-    // Overdub undo/redo history (manager-thread state only).
-    let mut hist = OdHistory::default();
-
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Cmd::Refresh) => send_ports(active.as_client(), &evt_tx),
@@ -1001,115 +945,41 @@ fn run(
                 );
             }
             Ok(Cmd::ToggleRecord { i }) => {
-                toggle_record(&engine, i);
-                // A fresh capture discards the old content — any history
-                // entry for this track would resurrect discarded audio.
-                if engine.state_of(i) == TR_REC {
-                    hist.invalidate_track(i);
-                    send_undo_state(&hist, &evt_tx);
-                }
-                send_loop_state(&engine, &evt_tx);
+                toggle_record(&engine, i.min(MAX_LOOPS - 1), &evt_tx);
             }
-            Ok(Cmd::ToggleOverdub { i }) => {
-                match engine.state_of(i) {
-                    TR_OD => engine.state[i].store(TR_PLAY, Ordering::Relaxed),
-                    TR_PLAY => {
-                        // Snapshot BEFORE arming OD (RT must not be writing).
-                        hist.begin(&engine, i);
-                        engine.state[i].store(TR_OD, Ordering::Relaxed);
-                    }
-                    TR_IDLE if engine.len_of(i) > 0 => {
-                        hist.begin(&engine, i);
-                        engine.state[i].store(TR_OD, Ordering::Relaxed);
-                    }
-                    _ => {} // IDLE with no content, or REC: ignore
-                }
-                send_undo_state(&hist, &evt_tx);
-                send_loop_state(&engine, &evt_tx);
+            Ok(Cmd::SetTrackOn { i, on }) => {
+                engine.set_track_on(i.min(MAX_LOOPS - 1), on);
             }
-            Ok(Cmd::UndoOverdub) => match hist.undo(&engine) {
-                Some(t) => {
-                    let _ = evt_tx.send(Evt::Notice(format!("undid overdub on loop {}", t + 1)));
-                    send_undo_state(&hist, &evt_tx);
-                    send_loop_state(&engine, &evt_tx);
-                }
-                None => {
-                    let _ = evt_tx.send(Evt::Notice("nothing to undo".into()));
-                }
-            },
-            Ok(Cmd::RedoOverdub) => match hist.redo(&engine) {
-                Some(t) => {
-                    let _ = evt_tx.send(Evt::Notice(format!("redid overdub on loop {}", t + 1)));
-                    send_undo_state(&hist, &evt_tx);
-                    send_loop_state(&engine, &evt_tx);
-                }
-                None => {
-                    let _ = evt_tx.send(Evt::Notice("nothing to redo".into()));
-                }
-            },
-            Ok(Cmd::TogglePlay { i }) => {
-                match engine.state_of(i) {
-                    TR_IDLE if engine.len_of(i) > 0 => {
-                        engine.state[i].store(TR_PLAY, Ordering::Relaxed)
-                    }
-                    TR_PLAY | TR_OD => engine.state[i].store(TR_IDLE, Ordering::Relaxed),
-                    TR_REC => {
-                        // Committing the take via play: keep it playing if non-empty.
-                        let st = if engine.len_of(i) > 0 { TR_PLAY } else { TR_IDLE };
-                        engine.state[i].store(st, Ordering::Relaxed)
-                    }
-                    _ => {}
-                }
-                send_loop_state(&engine, &evt_tx);
-            }
-            Ok(Cmd::ClearTrack { i }) => {
-                engine.clear(i);
-                hist.invalidate_track(i);
-                send_undo_state(&hist, &evt_tx);
-                send_loop_state(&engine, &evt_tx);
-            }
-            Ok(Cmd::ImportTrack { i, data }) => {
-                // The import dialog + decode already ran on the GUI thread;
-                // this is just the buffer swap (track is quiesced by import).
+            Ok(Cmd::ToggleTrackOn { i }) => {
                 let i = i.min(MAX_LOOPS - 1);
-                engine.import_track(i, &data);
-                hist.invalidate_track(i);
-                send_undo_state(&hist, &evt_tx);
-                send_loop_state(&engine, &evt_tx);
+                let on = !engine.track_on(i);
+                engine.set_track_on(i, on);
+            }
+            Ok(Cmd::PlayAll) => {
+                // Playing at (or past) the end starts over from the top.
+                if engine.pos() >= engine.proj_len() {
+                    engine.seek_to(0);
+                }
+                engine.set_transport(true);
+                let _ = evt_tx.try_send(Evt::Transport { on: true });
+            }
+            Ok(Cmd::StopAll) => {
+                engine.set_transport(false);
+                let _ = evt_tx.try_send(Evt::Transport { on: false });
+            }
+            Ok(Cmd::Seek { pos }) => engine.seek_to(pos),
+            Ok(Cmd::SetLoop(on)) => engine.set_loop_tl(on),
+            Ok(Cmd::SetProject { assets, arr, len }) => {
+                engine.set_project(assets, arr, len);
             }
             Ok(Cmd::ExportTrack { i, path, fmt }) => {
                 let i = i.min(MAX_LOOPS - 1);
-                let n = engine.len_of(i);
-                if n == 0 {
-                    let _ = evt_tx.send(Evt::Error(format!(
-                        "export: loop {} has no recording",
-                        i + 1
-                    )));
-                } else {
-                    let samples = engine.read_range(i, n).to_vec();
-                    match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
-                        Ok(()) => {
-                            let _ = evt_tx.send(Evt::Notice(format!(
-                                "exported loop {} → {}",
-                                i + 1,
-                                path.display()
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
-                        }
-                    }
-                }
-            }
-            Ok(Cmd::ExportProject { path, fmt }) => {
-                // Whole-project export only exists in dependent mode — force
-                // it on before rendering (the GUI checkbox mirrors this).
-                engine.mode.store(1, Ordering::Relaxed);
-                match engine.render_ensemble(engine.root_loops() as usize) {
+                match engine.render_track(i) {
                     Some(samples) => match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
                         Ok(()) => {
                             let _ = evt_tx.send(Evt::Notice(format!(
-                                "exported ensemble ({} samples) → {}",
+                                "exported track {} ({} samples) → {}",
+                                i + 1,
                                 samples.len(),
                                 path.display()
                             )));
@@ -1119,24 +989,38 @@ fn run(
                         }
                     },
                     None => {
-                        let _ = evt_tx.send(Evt::Error(
-                            "export: no recorded audio in any loop".into(),
-                        ));
+                        let _ = evt_tx.send(Evt::Error(format!(
+                            "export: track {} has no placed clips",
+                            i + 1
+                        )));
                     }
                 }
             }
-            Ok(Cmd::SetDependent(dep)) => {
-                engine.mode.store(if dep { 1 } else { 0 }, Ordering::Relaxed);
-                send_loop_state(&engine, &evt_tx);
+            Ok(Cmd::ExportProject { path, fmt }) => {
+                match engine.render_project() {
+                    Some(samples) => match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
+                        Ok(()) => {
+                            let _ = evt_tx.send(Evt::Notice(format!(
+                                "exported project ({} samples) → {}",
+                                samples.len(),
+                                path.display()
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
+                        }
+                    },
+                    None => {
+                        let _ = evt_tx
+                            .send(Evt::Error("export: no clips placed in any track".into()));
+                    }
+                }
             }
             Ok(Cmd::SetTrackEffects { i, chain }) => {
                 engine.set_track_fx(i.min(MAX_LOOPS - 1), chain);
             }
             Ok(Cmd::SetSelected(i)) => {
                 engine.selected.store(i.min(MAX_LOOPS - 1) as u8, Ordering::Relaxed);
-            }
-            Ok(Cmd::SetRootLoops(n)) => {
-                engine.root_loops.store(n.clamp(1, 64), Ordering::Relaxed);
             }
             Ok(Cmd::SetLatency { ms }) => {
                 let ms = ms.clamp(0.0, 1000.0);
@@ -1150,85 +1034,21 @@ fn run(
                 engine.metro_sub.store(sub.clamp(1, 16), Ordering::Relaxed);
                 engine.metro_num.store(num.clamp(1, 16), Ordering::Relaxed);
             }
-            Ok(Cmd::Quantize { num, den, bars, unit, root, metro, bpm }) => {
-                // Grid source: the metronome tempo, or the root loop's
-                // recorded length (`bars` is unused in metronome mode).
-                let grid = if metro {
-                    if bpm == 0 || num == 0 {
-                        Err("quantize to metronome: tempo and numerator must be at least 1".into())
-                    } else {
-                        let beat = 60.0 * sample_rate as f64 / bpm as f64;
-                        let bar = beat * num as f64;
-                        let target_f = match unit {
-                            crate::quantize::Unit::Beat => beat,
-                            crate::quantize::Unit::Bar => bar,
-                        };
-                        if target_f < 0.5 {
-                            Err("grid too fine: raise the tempo or the numerator".into())
-                        } else {
-                            Ok(((target_f + 0.5) as u32, beat, bar))
-                        }
-                    }
-                } else if den == 0 || num == 0 || bars == 0 {
-                    Err("quantize: numerator, denominator and bars must be at least 1".into())
-                } else {
-                    let len1 = engine.len_of(root.min(MAX_LOOPS - 1));
-                    crate::quantize::compute_target(len1, bars, num, unit)
-                };
-                match grid {
-                    Ok((target, beat, bar)) => {
-                        // Stop everything and let the audio thread quiesce
-                        // before buffers are rewritten in place.
-                        for i in 0..MAX_LOOPS {
-                            engine.state[i].store(TR_IDLE, Ordering::Relaxed);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                        let lens = engine.quantize_all(target, sample_rate);
-                        // Every buffer was rewritten in place — no overdub
-                        // snapshot still describes its track.
-                        hist.clear_all();
-                        send_undo_state(&hist, &evt_tx);
-                        let eff_bpm = 60.0 / (beat / sample_rate as f64);
-                        let unit_name = match unit {
-                            crate::quantize::Unit::Beat => "beat",
-                            crate::quantize::Unit::Bar => "bar",
-                        };
-                        let mut parts: Vec<String> = Vec::new();
-                        for (i, &l) in lens.iter().enumerate() {
-                            if l > 0 {
-                                parts.push(format!(
-                                    "L{} → {} smp ({}×{unit_name})",
-                                    i + 1,
-                                    l,
-                                    (l as f64 / target as f64).round()
-                                ));
-                            }
-                        }
-                        let grid_desc = if metro {
-                            format!("metronome {bpm} BPM, {num}/{den}")
-                        } else {
-                            format!(
-                                "{num}/{den}, {bars} bar(s), root loop {}, ≈{eff_bpm:.1} BPM",
-                                root + 1
-                            )
-                        };
-                        let summary = format!(
-                            "{grid_desc}: beat={} smp, bar={} smp → {}",
-                            beat.round(),
-                            bar.round(),
-                            if parts.is_empty() { "nothing to quantize".into() } else { parts.join(", ") }
-                        );
-                        eprintln!("[simplooper] quantize: {summary}");
-                        let _ = evt_tx.send(Evt::Quantized { summary });
-                        send_loop_state(&engine, &evt_tx);
-                    }
-                    Err(e) => {
-                        let _ = evt_tx.send(Evt::Error(format!("quantize: {e}")));
-                    }
-                }
-            }
             Ok(Cmd::Quit) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Takes the RT handler auto-stopped at buffer capacity never
+                // saw a stop command, so they wait in the engine until the
+                // manager claims them here.
+                let mut pend = engine.claim_takes();
+                while pend != 0 {
+                    let i = pend.trailing_zeros() as usize;
+                    pend &= !(1u64 << i);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    let (at, data) = engine.copy_take(i);
+                    if !data.is_empty() {
+                        let _ = evt_tx.try_send(Evt::Take { track: i, at, data });
+                    }
+                }
                 // No command pending: re-derive the MIDI source set. This is
                 // what makes bindings work when a device (re)appears on a new
                 // port name — e.g. hardware that gets a fresh ALSA/JACK port
@@ -1555,11 +1375,25 @@ struct RawPorts {
 
 unsafe impl Send for RawPorts {}
 
+/// One block's worth of live clips: a raw pointer to the asset data offset to
+/// the window start, and the window `[i0, i1)` of block-relative sample
+/// indices the clip covers. Rebuilt per block (cheap — tens of clips); the
+/// sample loop then does zero arithmetic per clip beyond `ptr.add(i - i0)`.
+struct ClipEntry {
+    track: u8,
+    ptr: *const f32,
+    i0: usize,
+    i1: usize,
+}
+
+unsafe impl Send for ClipEntry {}
+
 /// Realtime process handler. No allocation, no locks, no I/O: the slot pool
 /// is fixed at startup and its raw port pointers are cached here; per-cycle
-/// work is a handful of atomic loads plus direct buffer access. Loop capture
-/// and playback happen inline in the sample loop (the engine buffers are
-/// pre-allocated; `len` is written with `fetch_add` while recording).
+/// work is a handful of atomic loads plus one pass over the arrangement's
+/// clips to build this block's entry list. The global transport advances the
+/// playhead (or follows seeks), clips are summed where the playhead crosses
+/// them, and takes capture raw input inline while armed.
 struct Proc {
     midi_in: Port<MidiIn>,
     ports: RawPorts,
@@ -1570,41 +1404,29 @@ struct Proc {
     midi_drops: Arc<AtomicU64>,
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
-    engine: Arc<LoopEngine>,
-    // RT-local loop state (audio thread only).
-    prev_state: [u8; MAX_LOOPS],
+    engine: Arc<Engine>,
+    // RT-local take-capture state (audio thread only).
+    prev_rec: [u8; MAX_LOOPS],
     /// Tracks that hit LOOP_CAP while recording: suppresses the auto-stop
-    /// state store + LoopState event from re-firing on every remaining sample
-    /// of the block. Cleared on the track's next state edge.
+    /// state store from re-firing on every remaining sample of the block.
+    /// Cleared on the track's next state edge.
     rec_full: u16,
-    /// Independent-mode play position per track.
-    pos: [u64; MAX_LOOPS],
-    /// Dependent-mode ensemble clock (samples since the ensemble started).
-    master_pos: u64,
-    prev_mode: u8,
-    /// Last root-loops value seen; a change restarts the ensemble.
-    prev_root: u32,
-    /// Engine sample rate (for metronome / latency math).
+    /// RT-local playhead (the engine atomic is the published copy).
+    pos: u64,
+    /// Last transport flag; the falling edge publishes an auto-stop event.
+    prev_transport: bool,
+    /// Metronome flag of the previous block (activation edge, below).
+    prev_metro: bool,
+    /// Engine sample rate (for metronome math).
     sr: u32,
-    /// Metronome clock: absolute sample of the next click, start sample of
-    /// the click currently sounding (-1 = idle), and the beat-grid state:
-    /// start sample and length of the current beat, the index of the next
-    /// quarter note within the measure (0 = downbeat), the index of the next
-    /// click within the beat (0 = quarter note), the subdivision in force
-    /// for the current beat, and the tone of the click currently sounding
-    /// (0 = downbeat, 1 = quarter note, 2 = subdivision).
-    metro_next: u64,
+    /// Metronome clock: the grid index (click number on the timeline) last
+    /// emitted (-1 = nothing yet, so a transport start on a grid line clicks
+    /// immediately), the absolute sample the current click started at
+    /// (-1 = idle) and its tone (0 = downbeat, 1 = quarter, 2 = subdivision).
+    metro_idx: i64,
     metro_start: i64,
-    metro_beat_start: u64,
-    metro_beat_len: u64,
-    metro_beat: u32,
-    metro_k: u32,
-    metro_sub_eff: u32,
     metro_tone: u8,
-    /// Last metronome on/off flag; the rising edge re-arms the grid so the
-    /// first click is always a downbeat, immediately on activation.
-    prev_metro_on: bool,
-    /// Absolute sample counter (metronome timeline).
+    /// Absolute sample counter (click envelope clock).
     sample_no: u64,
     /// Cached effect-chain table; refreshed from the engine when fx_gen
     /// moves (rare, user-driven — the only allocation left on this thread).
@@ -1613,6 +1435,14 @@ struct Proc {
     /// Per-track, per-slot cached slider snapshots (+ the instance
     /// generation they were read at), refreshed per block on change.
     fx_rt: Vec<Vec<FxRt>>,
+    /// Cached project snapshots; refreshed when either generation moves.
+    arr: Arc<Arrangement>,
+    arr_cache_gen: u64,
+    assets: Arc<AssetTable>,
+    assets_cache_gen: u64,
+    /// Reusable per-block clip window list (taken out of self during the
+    /// block so the sample loop can call `&mut self` effect code freely).
+    clip_buf: Vec<ClipEntry>,
 }
 
 /// RT-side snapshot of one effect instance's sliders.
@@ -1622,7 +1452,7 @@ struct FxRt {
 }
 
 impl Proc {
-    /// Run one loop-output sample through the track's effect chain (the
+    /// Run one track-output sample through the track's effect chain (the
     /// volume x gain trim has already been multiplied into `x`).
     #[inline]
     fn fx_mix(&mut self, t: usize, x: f32) -> f32 {
@@ -1640,9 +1470,46 @@ impl Proc {
             }
             // SAFETY: the live chain is advanced by this thread only, and
             // `rt.p` holds the instance's current slider snapshot.
-            s = unsafe { inst.call_sample(s, &rt.p) };
+            s = unsafe { inst.call_sample(s, &rt.p) }
         }
         s
+    }
+
+    /// Build this block's clip windows for the timeline span `[p0, p0 + n)`.
+    /// `entries` is reused across blocks (cleared, never re-allocated).
+    fn collect_clips(&self, p0: u64, n: usize, entries: &mut Vec<ClipEntry>) {
+        entries.clear();
+        let span_end = p0.saturating_add(n as u64);
+        for (t, track) in self.arr.tracks.iter().enumerate() {
+            if !self.engine.track_on(t) {
+                continue;
+            }
+            for lane in &track.lanes {
+                for cl in &lane.clips {
+                    let data = match self.assets.get(cl.asset as usize) {
+                        Some(d) if !d.is_empty() => d,
+                        _ => continue,
+                    };
+                    let c0 = cl.pos;
+                    let c1 = c0.saturating_add(data.len() as u64);
+                    let w0 = c0.max(p0);
+                    let w1 = c1.min(span_end);
+                    if w0 < w1 {
+                        // The entry's pointer already includes the offset from
+                        // the clip start to the window start, so the sample
+                        // loop reads `ptr.add(i - i0)` with no per-sample math.
+                        let off = (w0 - cl.pos) as usize;
+                        let base = unsafe { data.as_ptr().add(off) };
+                        entries.push(ClipEntry {
+                            track: t as u8,
+                            ptr: base,
+                            i0: (w0 - p0) as usize,
+                            i1: (w1 - p0) as usize,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1666,17 +1533,32 @@ impl ProcessHandler for Proc {
         let out_mask_l = self.mask_out_l.load(Ordering::Relaxed);
         let out_mask_r = self.mask_out_r.load(Ordering::Relaxed);
 
-        // Per-cycle snapshot of the loop engine (atomics are only read here).
-        let st_now: [u8; MAX_LOOPS] = core::array::from_fn(|i| {
-            self.engine.state[i].load(Ordering::Relaxed)
-        });
-        let lens: [u32; MAX_LOOPS] = core::array::from_fn(|i| {
-            self.engine.len[i].load(Ordering::Relaxed)
-        });
-        let mode = self.engine.mode.load(Ordering::Relaxed);
+        // --- engine snapshot for this cycle (atomics read once per block) ---
+        let transport = self.engine.transport_on();
+        let seek = self.engine.take_seek();
+        let proj_len = self.engine.proj_len().max(1);
+        let looping = self.engine.loop_tl();
+
+        // Project snapshots: refresh Arcs when a generation moved (try_lock —
+        // never blocks on the manager thread). Swapping the Arrangement also
+        // re-derives nothing else; clip windows are rebuilt per block anyway.
+        let ag = self.engine.arr_gen();
+        if ag != self.arr_cache_gen {
+            if let Ok(a) = self.engine.arr.try_lock() {
+                self.arr = a.clone();
+                self.arr_cache_gen = ag;
+            }
+        }
+        let asg = self.engine.assets_gen();
+        if asg != self.assets_cache_gen {
+            if let Ok(a) = self.engine.assets.try_lock() {
+                self.assets = a.clone();
+                self.assets_cache_gen = asg;
+            }
+        }
         // Pick up edited effect chains (user action only; try_lock so the
         // audio path can never block on the manager thread).
-        let fxg = self.engine.fx_gen.load(Ordering::Relaxed);
+        let fxg = self.engine.fx_gen();
         if fxg != self.fx_cache_gen {
             if let Ok(tb) = self.engine.fx.try_lock() {
                 self.fx_cache = tb.clone();
@@ -1690,64 +1572,94 @@ impl ProcessHandler for Proc {
                     .collect();
             }
         }
+
         // Per-track output trim (volume x gain, linear) snapshotted once per
-        // cycle; applied to each loop's PLAYBACK contribution only, so the
-        // mix level rides the slider while recorded content stays at raw
-        // input level (overdub writes below always use the undamped `src_in`).
+        // cycle; applied to each clip's PLAYBACK contribution only, so the
+        // mix level rides the slider while recorded takes stay at raw input.
         let mut amp = [1.0f32; MAX_LOOPS];
         // Equal-power pan gains per track, snapshotted with the trim.
         let mut pgl = [F1S2; MAX_LOOPS];
         let mut pgr = [F1S2; MAX_LOOPS];
+        // Tracks whose clips can sound at all this cycle: sounding (play)
+        // AND not recording... (takes are raw — capture ignores the mix).
+        let mut audible = [false; MAX_LOOPS];
         for (t, a) in amp.iter_mut().enumerate() {
             *a = f32::from_bits(self.engine.vol[t].load(Ordering::Relaxed))
                 * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
             let (l, r) = pan_gains(f32::from_bits(self.engine.pan[t].load(Ordering::Relaxed)));
             pgl[t] = l;
             pgr[t] = r;
+            audible[t] = transport && self.engine.track_on(t);
         }
-        // Input monitoring follows the selected loop: its gain x volume,
-        // effect chain and pan shape the live pass-through (recording and
-        // overdubs still capture the raw, unprocessed `src_in`).
+
+        // Input monitoring follows the selected track: its gain x volume,
+        // effect chain and pan shape the live pass-through (takes capture
+        // the raw, unprocessed `src_in`).
         let sel = (self.engine.selected.load(Ordering::Relaxed) as usize).min(MAX_LOOPS - 1);
         let (mon_amp, mon_l, mon_r) = (amp[sel], pgl[sel], pgr[sel]);
-        // Compact list of the non-IDLE tracks: the sample loop iterates only
+
+        // Compact list of recording tracks: the sample loop iterates only
         // these instead of all MAX_LOOPS slots per sample.
-        let mut active: [u8; MAX_LOOPS] = [0u8; MAX_LOOPS];
-        let mut nact = 0usize;
+        let st_now: [u8; MAX_LOOPS] =
+            core::array::from_fn(|i| self.engine.rec_state[i].load(Ordering::Relaxed));
+        let mut rec_tracks: [u8; MAX_LOOPS] = [0u8; MAX_LOOPS];
+        let mut nrec = 0usize;
         for (t, &s) in st_now.iter().enumerate() {
-            if s != TR_IDLE {
-                active[nact] = t as u8;
-                nact += 1;
+            if s != self.prev_rec[t] {
+                self.rec_full &= !(1u16 << t);
+                self.prev_rec[t] = s;
+            }
+            if s == TR_REC {
+                rec_tracks[nrec] = t as u8;
+                nrec += 1;
             }
         }
-        let any_loop_active = nact > 0;
+        let any_rec = nrec > 0;
 
-        if in_mask == 0 && (out_mask_l | out_mask_r) == 0 && !any_loop_active {
-            return Control::Continue; // nothing connected: idle
+        let clip_sound = transport
+            && self
+                .arr
+                .tracks
+                .iter()
+                .enumerate()
+                .any(|(t, tr)| self.engine.track_on(t) && tr.lanes.iter().any(|l| !l.clips.is_empty()));
+        let metro_on = self.engine.metro().0;
+        if in_mask == 0
+            && (out_mask_l | out_mask_r) == 0
+            && !any_rec
+            && !clip_sound
+            && !metro_on
+        {
+            return Control::Continue; // nothing connected, nothing playing: idle
         }
 
-        // --- state edges (the manager changed something between cycles) ----
-        if mode != self.prev_mode {
-            // Mode switch: restart the ensemble clock and all positions.
-            self.master_pos = 0;
-            for i in 0..MAX_LOOPS {
-                self.pos[i] = 0;
-            }
-            self.prev_mode = mode;
+        // --- transport position for this block ------------------------------
+        let prev_pos = self.pos;
+        if let Some(p) = seek {
+            self.pos = p.min(proj_len);
         }
-        for (i, &now) in st_now.iter().enumerate() {
-            let prev = self.prev_state[i];
-            if prev == now {
-                continue;
-            }
-            // Any state change re-arms the capacity auto-stop for this track.
-            self.rec_full &= !(1u16 << i);
-            // A fresh start from IDLE/REC restarts the position; OD entered
-            // from PLAY keeps playing where it left off.
-            if (now == TR_PLAY || now == TR_OD) && prev != TR_PLAY && prev != TR_OD {
-                self.pos[i] = 0;
-            }
-            self.prev_state[i] = now;
+        let p0 = self.pos;
+        // Does the clock advance this block? Transport on = full playback;
+        // a bare metronome keeps the (always-visible) playhead rolling on
+        // the grid without sounding clips. Transport stopped AND metro off:
+        // the playhead holds — stop means stop.
+        let advance = transport || metro_on;
+        // End handling for a non-looping transport: clip the block at the
+        // project end and park there (auto-stop).
+        let mut block_n = n;
+        let mut auto_stop = false;
+        if advance && !looping && p0.saturating_add(n as u64) > proj_len {
+            block_n = (proj_len - p0.min(proj_len)) as usize;
+            auto_stop = true;
+        }
+
+        // Build this block's clip windows over [p0, p0 + block_n). The list
+        // lives in a local (taken out of self) so the sample loop below can
+        // call `&mut self` effect code while iterating it.
+        let mut entries = std::mem::take(&mut self.clip_buf);
+        entries.clear();
+        if clip_sound {
+            self.collect_clips(p0, block_n, &mut entries);
         }
 
         // Cache this cycle's input buffers (raw pointers are stable). Only
@@ -1800,57 +1712,57 @@ impl ProcessHandler for Proc {
         let ins = &in_bufs[..nin];
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
-        // Metronome parameters for this cycle (click is added to the output
-        // mix only — never to `dry`, so it can never be recorded into a loop).
-        let (metro_on, metro_bpm, metro_sub, metro_num) = self.engine.metro();
-        let metro_bpm = metro_bpm.clamp(20, 300).max(1);
-        let metro_sub = metro_sub.clamp(1, 16);
-        let metro_num = metro_num.clamp(1, 16);
-        if metro_on && !self.prev_metro_on {
-            // Rising edge: re-arm the grid so the very first click is a
-            // downbeat, right now — the metronome always starts directly on
-            // the first beat of a measure.
-            self.metro_beat = 0;
-            self.metro_k = 0;
-            self.metro_sub_eff = metro_sub;
-            self.metro_beat_len = ((self.sr as u64 * 60) / metro_bpm as u64).max(1);
-            self.metro_beat_start = self.sample_no;
-            self.metro_next = self.sample_no;
-            self.metro_start = -1;
+
+        // Metronome grid on the timeline: click k at timeline sample
+        // `k * sub_len` (sub = clicks per beat). Track the grid index last
+        // emitted so playhead crossings — while playing OR while scrubbing —
+        // fire exactly one click each. Re-anchored on transport starts and
+        // seeks (the position jump itself must not burst-fire).
+        let metro_bpm = self.engine.metro_bpm.load(Ordering::Relaxed).clamp(20, 300).max(1);
+        let metro_sub = self.engine.metro_sub.load(Ordering::Relaxed).clamp(1, 16);
+        let metro_num = self.engine.metro_num.load(Ordering::Relaxed).clamp(1, 16);
+        let sub_len = (60.0 * self.sr as f64 / metro_bpm as f64) / metro_sub as f64;
+        // The next click is the first grid line at or after the playhead.
+        // Re-anchor on transport starts and backward seeks; a forward seek
+        // keeps the old anchor so crossing grid lines while scrubbing still
+        // fires one click each.
+        if seek.is_some_and(|p| p <= prev_pos)
+            || (transport && !self.prev_transport)
+            || (metro_on && !self.prev_metro)
+        {
+            // Activating the click (or starting/seeking back into a run)
+            // drops the anchor one grid line behind the playhead, so the
+            // very first block fires the click at the current line.
+            self.metro_idx = (self.pos as f64 / sub_len).ceil() as i64 - 1;
         }
-        self.prev_metro_on = metro_on;
+        self.prev_transport = transport;
+        self.prev_metro = metro_on;
+        let seeked = seek.is_some();
         let metro_dur = (self.sr / 40).max(2); // 25 ms click
         let metro_decay = self.sr as f32 * 0.012;
-        let dependent = mode == 1;
-        // Dependent-mode ensemble: the longest PLAYING/overdubbing track is
-        // the "root" loop; the ensemble period is `root_loops` copies of it.
-        // Every track repeats continuously (p % len) across the period, so
-        // shorter recordings tile horizontally, and at the period end the
-        // clock wraps — the ensemble loops forever, no gaps, ever.
-        let root = self.engine.root_loops.load(Ordering::Relaxed).max(1);
-        if root != self.prev_root {
-            // Ensemble length changed: restart so it plays exactly N fresh
-            // root loops from here.
-            self.prev_root = root;
-            self.master_pos = 0;
-        }
-        let mut lmax = 0u64;
-        if dependent {
-            for &ti in &active[..nact] {
-                let t = ti as usize;
-                if st_now[t] == TR_PLAY || st_now[t] == TR_OD {
-                    lmax = lmax.max(lens[t] as u64);
-                }
-            }
-        }
-        let period = lmax * root as u64;
 
-        // Per-track read offsets for the GUI playback bars, republished every
-        // 8 samples (RT-cheap; display resolution is far coarser than that).
-        let mut pos_now: [u64; MAX_LOOPS] = core::array::from_fn(|t| self.pos[t]);
+        // Mixer gate: while the transport runs, every sounding track's chain
+        // processes each sample (so delay/reverb tails keep decaying across
+        // silent gaps instead of freezing). With no clips out and no effect
+        // chains there is nothing to run at all. `has_entries` is
+        // block-constant: the accumulator only needs refilling when this
+        // block actually holds clip windows.
+        let has_entries = !entries.is_empty();
+        let mut mixer_live = clip_sound;
+        if transport && !mixer_live {
+            mixer_live = (0..MAX_LOOPS)
+                .any(|t| self.engine.track_on(t) && !self.fx_cache[t].is_empty());
+        }
+        // Per-track sample accumulators for the clip mix.
+        let mut acc = [0.0f32; MAX_LOOPS];
 
         let mut peak_val: u32 = 0;
+        let mut pos_now = self.pos;
         for i in 0..n {
+            // Output buffer writes beyond `block_n` (the auto-stop tail of a
+            // non-looping block) still need to emit silence.
+            let live = i < block_n;
+
             // Dry mix of the connected inputs.
             let mut dry = 0.0f32;
             for b in ins {
@@ -1858,99 +1770,68 @@ impl ProcessHandler for Proc {
             }
             // Live input for this sample. Latency compensation is NOT a
             // running input delay: it only discards the first `latency`
-            // samples of a fresh take (engine `rec_skip`), so monitoring and
-            // overdubs stay exactly aligned with the loop grid while the
+            // samples of a fresh take (engine `rec_skip`), so monitoring
+            // stays exactly aligned with the timeline grid while the
             // button-press silence at a take's start gets trimmed away.
             let src_in = dry;
 
-            // Loop engine step: the panned contribution, shared by all
-            // output slots (each slot takes L, R or the mono downmix).
+            // Take capture (raw input; independent of the mix and of the
+            // transport — an armed track records whenever there is input,
+            // even while the transport is parked at the project end).
+            if any_rec {
+                for &ti in &rec_tracks[..nrec] {
+                    let t = ti as usize;
+                    if self.engine.rec_sample(t, src_in) && self.rec_full & (1u16 << t) == 0 {
+                        // Capacity reached: stop capturing into this track;
+                        // the manager still hasn't been told, so finish the
+                        // take here and hand it over asynchronously.
+                        self.rec_full |= 1u16 << t;
+                        self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                        self.engine.mark_take_pending(t);
+                    }
+                }
+            }
+
+            // Clip mix: sum the entries covering this sample into their
+            // track accumulators, then run the mixer over every sounding
+            // track (chains keep decaying through silent gaps).
             let mut play_l = 0.0f32;
             let mut play_r = 0.0f32;
-            if any_loop_active {
-                // Ensemble position in dependent mode (before advancing).
-                let p = if period > 0 { self.master_pos % period } else { 0 };
-                for &ti in &active[..nact] {
-                    let t = ti as usize;
-                    let st = st_now[t];
-                    if st == TR_REC {
-                        // Contiguous capture from the start of the buffer.
-                        if self.engine.rec_sample(t, src_in) && self.rec_full & (1u16 << t) == 0 {
-                            // Capacity reached: stop capturing into this loop,
-                            // keep playing (the buffer is full of content).
-                            // The bit guard keeps the remaining samples of
-                            // this block from re-firing the store + event.
-                            self.rec_full |= 1u16 << t;
-                            self.engine.state[t].store(TR_PLAY, Ordering::Relaxed);
-                            let (states, lens_snap) = loop_state(&self.engine);
-                            let _ = self.tx.try_send(Evt::LoopState { states, lens: lens_snap });
-                        }
-                    } else if st == TR_PLAY || st == TR_OD {
-                        let l = lens[t] as u64;
-                        if l > 0 {
-                            if dependent {
-                                // Repeat semantics: the recording tiles across
-                                // the whole ensemble period.
-                                let off = p % l;
-                                // One read serves playback and the overdub mix
-                                // (OD sums live input onto the take in place).
-                                let old = self.engine.read(t, off as u32);
-                                // Effects (if any) run after gain x volume.
-                                let m = self.fx_mix(t, old * amp[t]);
-                                play_l += m * pgl[t];
-                                play_r += m * pgr[t];
-                                if st == TR_OD {
-                                    // Additive overdub: layer the live input
-                                    // on top of the existing recording at its
-                                    // original level — never replace it.
-                                    self.engine.write(t, off as u32, old + src_in);
-                                }
-                                pos_now[t] = off;
-                            } else {
-                                let off = self.pos[t] % l;
-                                let old = self.engine.read(t, off as u32);
-                                let m = self.fx_mix(t, old * amp[t]);
-                                play_l += m * pgl[t];
-                                play_r += m * pgr[t];
-                                if st == TR_OD {
-                                    self.engine.write(t, off as u32, old + src_in);
-                                }
-                                pos_now[t] = off;
-                                self.pos[t] += 1;
-                            }
-                        } else {
-                            pos_now[t] = 0;
+            if live && mixer_live {
+                if has_entries {
+                    acc.fill(0.0);
+                    for e in entries.iter() {
+                        if i >= e.i0 && i < e.i1 {
+                            acc[e.track as usize] += unsafe { *e.ptr.add(i - e.i0) };
                         }
                     }
                 }
-                // Advance the ensemble clock only while something is actually
-                // playing: a stopped ensemble stays put, so REC-only cycles
-                // can't drift the phase of a later playback.
-                if dependent && period > 0 {
-                    self.master_pos += 1;
+                for (t, &a) in acc.iter().enumerate() {
+                    if audible[t] {
+                        let m = self.fx_mix(t, a * amp[t]);
+                        play_l += m * pgl[t];
+                        play_r += m * pgr[t];
+                    }
                 }
-            }
-
-            // Publish playback positions ~every 8 samples.
-            if i & 7 == 7 {
-                for (t, &p) in pos_now.iter().enumerate() {
-                    self.engine.pos[t].store(p, Ordering::Relaxed);
-                }
-                self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
             }
 
             // Metronome click (added to the output mix only — `dry` never
-            // sees it, so it can never be recorded into a loop).
+            // sees it, so it can never be recorded into a take).
             let mut click = 0.0f32;
-            if metro_on {
-                if self.sample_no >= self.metro_next {
+            if live && metro_on && (advance || seeked) {
+                let p = p0 + i as u64;
+                let idx = (p as f64 / sub_len) as i64;
+                if idx > self.metro_idx {
+                    self.metro_idx = idx;
                     self.metro_start = self.sample_no as i64;
                     // Tone of this click: the first quarter note of the
                     // measure is the downbeat, the other quarter notes get
                     // the plain quarter tone, everything in between gets the
                     // subdivision tone.
-                    self.metro_tone = if self.metro_k == 0 {
-                        if self.metro_beat == 0 {
+                    let beat = (idx / metro_sub as i64) % metro_num as i64;
+                    let k = idx % metro_sub as i64;
+                    self.metro_tone = if k == 0 {
+                        if beat == 0 {
                             0
                         } else {
                             1
@@ -1958,54 +1839,29 @@ impl ProcessHandler for Proc {
                     } else {
                         2
                     };
-                    // Schedule the next click: subdivision clicks land at
-                    // even fractions of the current beat; after the last one
-                    // the next click is the next quarter note.
-                    self.metro_k += 1;
-                    if self.metro_k < self.metro_sub_eff.max(1) {
-                        let s = self.metro_sub_eff.max(1) as u64;
-                        self.metro_next = self.metro_beat_start
-                            + self.metro_k as u64 * self.metro_beat_len / s;
-                    } else {
-                        // Next quarter note: rescan tempo, beats-per-measure
-                        // and subdivision here, so a change made mid-beat
-                        // takes effect exactly on that next quarter note.
-                        self.metro_beat = (self.metro_beat + 1) % metro_num.max(1);
-                        self.metro_beat_len =
-                            ((self.sr as u64 * 60) / metro_bpm as u64).max(1);
-                        self.metro_sub_eff = metro_sub;
-                        self.metro_k = 0;
-                        self.metro_beat_start += self.metro_beat_len;
-                        self.metro_next = self.metro_beat_start;
-                        if self.metro_next <= self.sample_no {
-                            // Tempo change outran the schedule: resync.
-                            self.metro_beat_start = self.sample_no;
-                            self.metro_next = self.sample_no + self.metro_beat_len;
-                        }
-                    }
                 }
-                if self.metro_start >= 0 {
-                    let k = self.sample_no as i64 - self.metro_start;
-                    if k >= 0 && (k as u32) < metro_dur {
-                        let kf = k as f32;
-                        // Three distinct tones: downbeat (high, loudest),
-                        // quarter note (mid), subdivision (low, softest).
-                        let (f, amp) = match self.metro_tone {
-                            0 => (1760.0f32, 0.5f32),
-                            1 => (1175.0, 0.35),
-                            _ => (880.0, 0.25),
-                        };
-                        click = (kf * std::f32::consts::TAU * f / self.sr as f32).sin()
-                            * (-kf / metro_decay).exp()
-                            * amp;
-                    } else {
-                        self.metro_start = -1;
-                    }
+            }
+            if self.metro_start >= 0 {
+                let k = self.sample_no as i64 - self.metro_start;
+                if k >= 0 && (k as u32) < metro_dur {
+                    let kf = k as f32;
+                    // Three distinct tones: downbeat (high, loudest),
+                    // quarter note (mid), subdivision (low, softest).
+                    let (f, a) = match self.metro_tone {
+                        0 => (1760.0f32, 0.5f32),
+                        1 => (1175.0, 0.35),
+                        _ => (880.0, 0.25),
+                    };
+                    click = (kf * std::f32::consts::TAU * f / self.sr as f32).sin()
+                        * (-kf / metro_decay).exp()
+                        * a;
+                } else {
+                    self.metro_start = -1;
                 }
             }
             self.sample_no += 1;
 
-            // Live input rides the selected loop's chain/trim/pan; the click
+            // Live input rides the selected track's chain/trim/pan; the click
             // always sits dead centre. At unity trim and centre pan the L/R
             // pair still sums to the historical unity mono mix.
             let mon = self.fx_mix(sel, src_in * mon_amp);
@@ -2013,8 +1869,8 @@ impl ProcessHandler for Proc {
             let v_l = (mon * mon_l + clickc + play_l) * g;
             let v_r = (mon * mon_r + clickc + play_r) * g;
             // The output mix is NEVER delayed: what the user hears stays
-            // exactly on the loop grid (latency compensation only trims the
-            // start of a fresh take — see `LoopEngine::rec_sample`).
+            // exactly on the timeline grid (latency compensation only trims
+            // the start of a fresh take — see `Engine::rec_sample`).
             let av = v_l.abs().max(v_r.abs());
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
@@ -2031,18 +1887,35 @@ impl ProcessHandler for Proc {
             for b in &out_bufs_r[..nr] {
                 unsafe { *b.add(i) = v_r };
             }
+
+            // Advance the transport clock (only while running).
+            if live && advance {
+                pos_now += 1;
+            }
         }
-        // Continuous ensemble: at the period end the clock simply wraps and
-        // every track keeps looping. (At most one block of samples can
-        // overshoot the boundary — content is continuous, so no glitch.)
-        if dependent && period > 0 && self.master_pos >= period {
-            self.master_pos = 0;
+
+        // Give the clip window list back for the next block.
+        self.clip_buf = entries;
+
+        // Continuous loop: at the project end the playhead wraps; a
+        // non-looping transport parks at the end and auto-stops (an event
+        // wakes the GUI so its button mirrors reality).
+        if advance {
+            if looping && pos_now >= proj_len {
+                pos_now -= proj_len;
+                // Wrap re-anchors the metronome grid without a burst.
+                self.metro_idx = (pos_now as f64 / sub_len).ceil() as i64 - 1;
+            }
+            self.pos = pos_now.min(proj_len);
         }
-        // Publish final positions for this block.
-        for (t, &p) in pos_now.iter().enumerate() {
-            self.engine.pos[t].store(p, Ordering::Relaxed);
+        if auto_stop && transport {
+            self.engine.set_transport(false);
+            self.prev_transport = false;
+            let _ = self.tx.try_send(Evt::Transport { on: false });
         }
-        self.engine.master_pos.store(self.master_pos, Ordering::Relaxed);
+        // Publish the playhead for the GUI (display resolution is far
+        // coarser than the block rate).
+        self.engine.pos.store(self.pos, Ordering::Relaxed);
         self.peak.store(peak_val, Ordering::Relaxed);
 
         Control::Continue
@@ -2076,9 +1949,11 @@ fn describe_err(e: jack::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrange::Clip;
 
-    /// The ensemble render must run each track's effect chain (on private
-    /// instances, leaving the live ones untouched) after the vol x gain trim.
+    /// The project render must run each track's effect chain (on private
+    /// instances, leaving the live ones untouched) after the vol x gain trim,
+    /// and honour per-track play/stop, panning and clip placement.
     #[test]
     fn pan_gains_are_equal_power_and_mono_safe() {
         // Hard positions.
@@ -2102,8 +1977,22 @@ mod tests {
     }
 
     #[test]
+    fn engine_fresh() {
+        let e = Engine::new();
+        for i in 0..MAX_LOOPS {
+            assert_eq!(e.rec_state_of(i), TR_IDLE);
+            assert_eq!(e.rec_len_of(i), 0);
+            assert!(e.track_on(i), "tracks start sounding");
+        }
+        assert!(!e.transport_on());
+        assert_eq!(e.pos(), 0);
+        assert!(e.loop_tl(), "the timeline loops by default");
+        assert_eq!(e.take_seek(), None);
+    }
+
+    #[test]
     fn loop_pan_defaults_centre_and_clamps() {
-        let e = LoopEngine::new();
+        let e = Engine::new();
         assert!((e.loop_pan(3) - 0.5).abs() < 1e-9, "default is centre");
         e.set_loop_pan(3, 0.25);
         assert!((e.loop_pan(3) - 0.25).abs() < 1e-6);
@@ -2114,7 +2003,165 @@ mod tests {
     }
 
     #[test]
-    fn render_ensemble_applies_effect_chain() {
+    fn seek_clamps_and_publishes() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 1000);
+        e.seek_to(400);
+        assert_eq!(e.pos(), 400);
+        assert_eq!(e.take_seek(), Some(400));
+        assert_eq!(e.take_seek(), None);
+        // Seeks clamp to the project end.
+        e.seek_to(5000);
+        assert_eq!(e.pos(), 1000);
+    }
+
+    #[test]
+    fn take_capture_and_finish_roundtrip() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 10_000);
+        e.seek_to(500);
+        e.start_rec(2);
+        assert_eq!(e.rec_state_of(2), TR_REC);
+        assert_eq!(e.rec_at(2), 500, "the take remembers where the playhead was");
+        // Simulate RT capture.
+        for k in 0..100u32 {
+            e.rec_write(2, k, k as f32 * 0.01);
+        }
+        e.rec_len[2].store(100, Ordering::Relaxed);
+        let (at, data) = e.copy_take(2);
+        assert_eq!(at, 500);
+        assert_eq!(data.len(), 100);
+        assert!((data[50] - 0.5).abs() < 1e-6);
+        assert_eq!(e.rec_state_of(2), TR_IDLE);
+    }
+
+    /// Latency compensation is a START-of-take skip: a fresh recording
+    /// discards its first `latency` input samples (so the button click that
+    /// started it — a few ms late through the mic — lands at content[0]),
+    /// while everything after the skip is captured live.
+    #[test]
+    fn latency_skips_silence_at_recording_start() {
+        let e = Engine::new();
+        e.latency.store(5, Ordering::Relaxed);
+        e.start_rec(0);
+        assert_eq!(e.rec_state_of(0), TR_REC);
+        for k in 1..=10 {
+            assert!(!e.rec_sample(0, k as f32));
+        }
+        // The first 5 samples were discarded; content starts at sample #6 —
+        // exactly the latency-compensated moment.
+        let (_at, data) = e.copy_take(0);
+        assert_eq!(&data[..], &[6.0, 7.0, 8.0, 9.0, 10.0]);
+
+        // A second take re-arms from the current latency, and a latency of 0
+        // records immediately.
+        e.latency.store(0, Ordering::Relaxed);
+        e.start_rec(0);
+        assert!(!e.rec_sample(0, 42.0));
+        assert_eq!(e.rec_len_of(0), 1);
+        assert_eq!(e.rec_read(0, 0), 42.0);
+    }
+
+    /// Changing the latency mid-take must not retroactively shift the
+    /// recording in progress: the skip is armed at start_rec time.
+    #[test]
+    fn latency_change_mid_take_does_not_shift_recording() {
+        let e = Engine::new();
+        e.latency.store(3, Ordering::Relaxed);
+        e.start_rec(0);
+        assert!(!e.rec_sample(0, 1.0)); // consumes one armed skip
+        e.latency.store(5000, Ordering::Relaxed); // huge change mid-take
+        assert!(!e.rec_sample(0, 2.0)); // armed skip has 2 left
+        assert!(!e.rec_sample(0, 3.0)); // ...and captures nothing more
+        assert!(!e.rec_sample(0, 4.0)); // skip exhausted: capture resumes
+        let (_at, data) = e.copy_take(0);
+        assert_eq!(&data[..], &[4.0], "only the samples after the armed 3-sample skip");
+    }
+
+    #[test]
+    fn rec_sample_never_overshoots_capacity() {
+        let e = Engine::new();
+        // Fill exactly to capacity, one sample at a time (RT path).
+        for _ in 0..LOOP_CAP {
+            assert!(!e.rec_sample(0, 1.0));
+        }
+        assert_eq!(e.rec_len_of(0), LOOP_CAP);
+        // Once full, further samples must report "full" and must not push the
+        // counter past LOOP_CAP.
+        for _ in 0..1024 {
+            assert!(e.rec_sample(0, 0.0));
+        }
+        assert_eq!(e.rec_len_of(0), LOOP_CAP);
+    }
+
+    /// Helper: two assets, track 0 clip at 0, track 1 clip offset by 1000.
+    fn two_track_project() -> (Arc<Engine>, Arc<[f32]>, Arc<[f32]>) {
+        let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 2000]);
+        let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 2000]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+        arr.insert(1, 0, Clip { asset: 1, pos: 1000 });
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![a0.clone(), a1.clone()]), Arc::new(arr), 4000);
+        (e, a0, a1)
+    }
+
+    #[test]
+    fn render_project_places_mutes_and_mixes() {
+        let (e, _a0, _a1) = two_track_project();
+        let out = e.render_project().expect("clips exist");
+        assert_eq!(out.len(), 4000);
+        // [0,1000): only track 0's asset (unity trims, centre pan).
+        assert!((out[500] - 0.5).abs() < 1e-6);
+        // [1000,2000): both assets summed additively.
+        assert!((out[1500] - 0.75).abs() < 1e-6);
+        // [2000,3000): track 1 only.
+        assert!((out[2500] - 0.25).abs() < 1e-6);
+        assert!((out[3999]).abs() < 1e-9, "past the last clip is silence");
+
+        // Stopping a track mutes it in the render (the mix truth).
+        e.set_track_on(0, false);
+        let out = e.render_project().unwrap();
+        assert!(out[500].abs() < 1e-9);
+        assert!((out[2500] - 0.25).abs() < 1e-6);
+
+        // Volume trim rides the render.
+        e.set_track_on(0, true);
+        e.set_loop_vol(1, 0.5);
+        let out = e.render_project().unwrap();
+        assert!((out[2500] - 0.125).abs() < 1e-5, "half volume");
+
+        // Single-track export ignores the mute flag (explicit request).
+        e.set_loop_vol(1, 1.0); // reset the trim so the level reads pure
+        e.set_track_on(1, false);
+        let one = e.render_track(1).unwrap();
+        assert!((one[2500] - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn render_child_lanes_stack() {
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 1000]);
+        let mut arr = Arrangement::new();
+        // Two clips of the same asset overlapping on different lanes.
+        arr.insert(4, 0, Clip { asset: 0, pos: 0 });
+        arr.insert(4, 1, Clip { asset: 0, pos: 500 });
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![a]), Arc::new(arr), 2000);
+        let out = e.render_project().unwrap();
+        assert!((out[250] - 0.5).abs() < 1e-6);
+        assert!((out[750] - 1.0).abs() < 1e-6, "lanes sum additively");
+    }
+
+    #[test]
+    fn render_empty_project_is_none() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 1000);
+        assert!(e.render_project().is_none());
+        assert!(e.render_track(0).is_none());
+    }
+
+    #[test]
+    fn render_applies_effect_chain() {
         if !crate::fx::rustc_available() {
             return; // environments without a compiler skip the loader
         }
@@ -2126,31 +2173,31 @@ mod tests {
         reg.rescan();
         assert!(reg.desc("template").is_some(), "template must load");
 
-        let e = LoopEngine::new();
-        let n = 4000usize;
-        e.import_track(0, &vec![0.5f32; n]);
-        e.set_loop_vol(0, 1.0);
-        e.set_loop_gain(0, 1.0);
+        let e = Engine::new();
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 4000]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+        e.set_project(Arc::new(vec![a]), Arc::new(arr), 4000);
         let desc = reg.desc("template").unwrap().clone();
 
         // No chain: the render is the content itself (trim = 1).
-        let plain = e.render_ensemble(1).unwrap();
-        assert!(plain.iter().take(n).all(|&v| (v - 0.5).abs() < 1e-6));
+        let plain = e.render_project().unwrap();
+        assert!(plain.iter().take(4000).all(|&v| (v - 0.5).abs() < 1e-6));
 
         // Template at depth 0: exact pass-through, per the ABI contract.
         let inst0 = reg.create_instance("template", 48000.0, &[0.0, 4.0, 1.0, 1.0]).unwrap();
         e.set_track_fx(0, TrackFx { slots: std::sync::Arc::new(vec![FxSlot { inst: inst0, desc: desc.clone() }]) });
         assert_eq!(e.fx_gen(), 1);
-        let thru = e.render_ensemble(1).unwrap();
-        assert!(thru.iter().take(n).all(|&v| (v - 0.5).abs() < 1e-3), "depth 0 must pass through");
+        let thru = e.render_project().unwrap();
+        assert!(thru.iter().take(4000).all(|&v| (v - 0.5).abs() < 1e-3), "depth 0 must pass through");
 
         // depth 1 / mix 1: the tremolo must dip the render (a full LFO
         // cycle lands inside the 4000-sample window at 4 Hz).
         let inst1 = reg.create_instance("template", 48000.0, &[1.0, 4.0, 1.0, 1.0]).unwrap();
         e.set_track_fx(0, TrackFx { slots: std::sync::Arc::new(vec![FxSlot { inst: inst1.clone(), desc }]) });
         assert_eq!(e.fx_gen(), 2);
-        let wet = e.render_ensemble(1).unwrap();
-        let lo = wet.iter().take(n).copied().fold(f32::MAX, f32::min);
+        let wet = e.render_project().unwrap();
+        let lo = wet.iter().take(4000).copied().fold(f32::MAX, f32::min);
         assert!(lo < 0.45, "tremolo must modulate the render (min was {lo})");
         // Rendering ran on private clones: the live instance is untouched.
         assert_eq!(inst1.param(0), 1.0);
@@ -2159,248 +2206,19 @@ mod tests {
     }
 
     #[test]
-    fn engine_fresh() {
-        let e = LoopEngine::new();
-        for i in 0..MAX_LOOPS {
-            assert_eq!(e.state_of(i), TR_IDLE);
-            assert_eq!(e.len_of(i), 0);
-            assert!(e.read_range(i, 64).iter().all(|&s| s == 0.0));
-        }
-        assert_eq!(e.generation(), 0);
+    fn set_project_bounds_the_playhead() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 10_000);
+        e.seek_to(9_000);
+        // A project can shrink under the playhead — it clamps to the new end.
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 1_000);
+        assert_eq!(e.pos(), 1_000);
+        assert_eq!(e.proj_len(), 1_000);
     }
 
     #[test]
-    fn engine_rec_clear_roundtrip() {
-        let e = LoopEngine::new();
-        let g0 = e.generation();
-        e.start_rec(1);
-        assert_eq!(e.state_of(1), TR_REC);
-        assert_eq!(e.len_of(1), 0);
-        // Simulate RT capture.
-        for k in 0..100u32 {
-            e.write(1, k, k as f32 * 0.01);
-        }
-        e.len[1].store(100, Ordering::Relaxed);
-        assert!((e.read_range(1, 100)[50] - 0.5).abs() < 1e-6);
-        e.clear(1);
-        assert_eq!(e.state_of(1), TR_IDLE);
-        assert_eq!(e.len_of(1), 0);
-        assert!(e.read_range(1, 100).iter().all(|&s| s == 0.0));
-        assert!(e.generation() > g0);
-    }
-
-    #[test]
-    fn engine_quantize_all_snap() {
-        let e = LoopEngine::new();
-        let sr = 48_000u32;
-        // Track 0: a sine, length slightly off the grid.
-        let len = 144_100u32;
-        for k in 0..len {
-            e.write(0, k, (k as f64 * std::f64::consts::TAU / 109.0).sin() as f32);
-        }
-        e.len[0].store(len, Ordering::Relaxed);
-        let target = 12_000u32;
-        let lens = e.quantize_all(target, sr);
-        // Empty track stays untouched.
-        assert_eq!(lens[1], 0);
-        let ideal = crate::quantize::snap_length(len, target, LOOP_CAP);
-        let w = (sr / 200).min(ideal / 4) as i64;
-        let nl = lens[0] as i64;
-        assert!((nl - ideal as i64).abs() <= w + 64, "new len {nl} vs ideal {ideal}");
-        assert!(lens[0] >= target);
-        // Content far from the seam is preserved.
-        let mid = (ideal / 2) as usize;
-        let expect = (mid as f64 * std::f64::consts::TAU / 109.0).sin() as f32;
-        assert!((e.read(0, mid as u32) - expect).abs() < 1e-5);
-    }
-
-    #[test]
-    fn toggle_record_state_machine() {
-        let e = LoopEngine::new();
-        toggle_record(&e, 2); // IDLE -> REC (fresh capture)
-        assert_eq!(e.state_of(2), TR_REC);
-        e.len[2].store(500, Ordering::Relaxed); // simulate RT capture
-        toggle_record(&e, 2); // REC with content -> PLAY
-        assert_eq!(e.state_of(2), TR_PLAY);
-        assert_eq!(e.len_of(2), 500);
-        toggle_record(&e, 2); // PLAY -> fresh REC (content discarded)
-        assert_eq!(e.state_of(2), TR_REC);
-        assert_eq!(e.len_of(2), 0);
-        toggle_record(&e, 2); // REC with no content -> IDLE
-        assert_eq!(e.state_of(2), TR_IDLE);
-    }
-
-    /// Latency compensation is a START-of-take skip: a fresh recording
-    /// discards its first `latency` input samples (so the button click that
-    /// started it — a few ms late through the mic — lands at content[0]),
-    /// while everything after the skip is captured live.
-    #[test]
-    fn latency_skips_silence_at_recording_start() {
-        let e = LoopEngine::new();
-        e.latency.store(5, Ordering::Relaxed);
-        toggle_record(&e, 0); // IDLE -> fresh REC arms the skip
-        assert_eq!(e.state_of(0), TR_REC);
-        for k in 1..=10 {
-            assert!(!e.rec_sample(0, k as f32));
-        }
-        // The first 5 samples were discarded; content starts at sample #6 —
-        // exactly the latency-compensated moment.
-        let (len, data) = e.snapshot(0);
-        assert_eq!(len, 5);
-        assert_eq!(data, vec![6.0, 7.0, 8.0, 9.0, 10.0]);
-
-        // A second take re-arms from the current latency, and a latency of 0
-        // records immediately.
-        e.latency.store(0, Ordering::Relaxed);
-        toggle_record(&e, 0); // REC -> PLAY
-        toggle_record(&e, 0); // PLAY -> fresh REC (skip 0)
-        assert!(!e.rec_sample(0, 42.0));
-        assert_eq!(e.len_of(0), 1);
-        assert_eq!(e.read(0, 0), 42.0);
-    }
-
-    /// Changing the latency mid-take must not retroactively shift the
-    /// recording in progress: the skip is armed at start_rec time.
-    #[test]
-    fn latency_change_mid_take_does_not_shift_recording() {
-        let e = LoopEngine::new();
-        e.latency.store(3, Ordering::Relaxed);
-        toggle_record(&e, 0);
-        assert!(!e.rec_sample(0, 1.0)); // consumes one armed skip
-        e.latency.store(5000, Ordering::Relaxed); // huge change mid-take
-        assert!(!e.rec_sample(0, 2.0)); // armed skip has 2 left
-        assert!(!e.rec_sample(0, 3.0)); // ...and captures nothing more
-        assert!(!e.rec_sample(0, 4.0)); // skip exhausted: capture resumes
-        let (len, data) = e.snapshot(0);
-        assert_eq!(len, 1, "only the samples after the armed 3-sample skip");
-        assert_eq!(data, vec![4.0]);
-    }
-
-    #[test]
-    fn rec_sample_never_overshoots_capacity() {
-        let e = LoopEngine::new();
-        // Fill exactly to capacity, one sample at a time (RT path).
-        for _ in 0..LOOP_CAP {
-            assert!(!e.rec_sample(0, 1.0));
-        }
-        assert_eq!(e.len_of(0), LOOP_CAP);
-        // Once full, further samples must report "full" and must not push the
-        // counter past LOOP_CAP (the old fetch_add could overshoot by up to a
-        // frame, which made the dependent tiled waveform index out of bounds).
-        for _ in 0..1024 {
-            assert!(e.rec_sample(0, 0.0));
-        }
-        assert_eq!(e.len_of(0), LOOP_CAP);
-    }
-
-    /// Fill track `i` with a constant and mark it playing (manager-side).
-    fn fill_playing(e: &LoopEngine, i: usize, n: u32, v: f32) {
-        for k in 0..n {
-            e.write(i, k, v);
-        }
-        e.len[i].store(n, Ordering::Relaxed);
-        e.state[i].store(TR_PLAY, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn overdub_undo_redo_roundtrip() {
-        let e = LoopEngine::new();
-        fill_playing(&e, 2, 1000, 0.25);
-        let mut h = OdHistory::default();
-        assert!(!h.can_undo() && !h.can_redo());
-        assert!(h.undo(&e).is_none(), "undo on empty history is a no-op");
-
-        // Overdub starts: snapshot, then simulate the additive write (0.25-0.1).
-        h.begin(&e, 2);
-        assert!(h.can_undo() && !h.can_redo());
-        for k in 0..1000 {
-            e.write(2, k, 0.15);
-        }
-
-        // Undo: buffer back to the pre-overdub content, track resumes playing.
-        assert_eq!(h.undo(&e), Some(2));
-        assert_eq!(e.state_of(2), TR_PLAY);
-        assert_eq!(e.len_of(2), 1000);
-        assert!(e.read_range(2, 1000).iter().all(|&v| (v - 0.25).abs() < 1e-9));
-        assert!(
-            !h.can_undo() && h.can_redo(),
-            "the only entry was undone: nothing left to undo, redo available"
-        );
-
-        // Redo: the overdubbed content comes back.
-        assert_eq!(h.redo(&e), Some(2));
-        assert_eq!(e.state_of(2), TR_PLAY);
-        assert!(e.read_range(2, 1000).iter().all(|&v| (v - 0.15).abs() < 1e-9));
-        assert!(!h.can_redo());
-
-        // Undo again (redo must stay reachable).
-        h.undo(&e);
-        assert!(e.read_range(2, 1000).iter().all(|&v| (v - 0.25).abs() < 1e-9));
-        assert!(h.can_redo());
-    }
-
-    #[test]
-    fn overdub_undo_stacks_across_tracks_and_fresh_begin_clears_redo() {
-        let e = LoopEngine::new();
-        fill_playing(&e, 0, 500, 0.1);
-        fill_playing(&e, 1, 700, 0.2);
-        let mut h = OdHistory::default();
-
-        // Two overdubs on two tracks; undo pops the most recent first.
-        h.begin(&e, 0);
-        for k in 0..500 {
-            e.write(0, k, 0.9);
-        }
-        h.begin(&e, 1);
-        for k in 0..700 {
-            e.write(1, k, 0.8);
-        }
-        assert_eq!(h.undo(&e), Some(1), "undo must take the LAST overdub");
-        assert!(e.read_range(1, 700).iter().all(|&v| (v - 0.2).abs() < 1e-9));
-        // Track 0 keeps its overdubbed content until its own undo.
-        assert!(e.read_range(0, 500).iter().all(|&v| (v - 0.9).abs() < 1e-9));
-        assert_eq!(h.undo(&e), Some(0));
-        assert!(e.read_range(0, 500).iter().all(|&v| (v - 0.1).abs() < 1e-9));
-
-        // A fresh overdub invalidates the redo branch.
-        assert!(h.can_redo());
-        h.begin(&e, 0);
-        assert!(!h.can_redo(), "a new edit clears redo");
-    }
-
-    #[test]
-    fn overdub_history_invalidation_and_cap() {
-        let e = LoopEngine::new();
-        fill_playing(&e, 3, 100, 0.5);
-        let mut h = OdHistory::default();
-        h.begin(&e, 3);
-        h.begin(&e, 3);
-        assert_eq!(h.undo(&e), Some(3));
-        // Clearing the track drops its entries in BOTH directions.
-        h.invalidate_track(3);
-        assert!(!h.can_undo() && !h.can_redo());
-
-        // Depth cap: only the newest MAX_OD_HISTORY snapshots survive.
-        for _ in 0..(MAX_OD_HISTORY + 5) {
-            h.begin(&e, 3);
-        }
-        assert_eq!(h.undo.len(), MAX_OD_HISTORY);
-        h.clear_all();
-        assert!(!h.can_undo() && !h.can_redo());
-    }
-
-    #[test]
-    fn overdub_undo_of_paused_track_stays_paused() {
-        let e = LoopEngine::new();
-        fill_playing(&e, 1, 100, 0.5);
-        e.state[1].store(TR_IDLE, Ordering::Relaxed); // paused with content
-        let mut h = OdHistory::default();
-        h.begin(&e, 1);
-        assert!(!h.undo(&e).is_none());
-        assert_eq!(
-            e.state_of(1),
-            TR_IDLE,
-            "undo restores playback state, not forced playback"
-        );
+    fn metro_defaults_roundtrip() {
+        let e = Engine::new();
+        assert_eq!(e.metro(), (false, 120, 1, 4));
     }
 }
