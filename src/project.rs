@@ -22,8 +22,10 @@ use crate::config::TrackFxSave;
 
 /// Magic value of the `format` field.
 pub const FORMAT: &str = "simplooper-project";
-/// Format version written by this build (v1).
-pub const VERSION: u32 = 1;
+/// Format version written by this build. v2 (0.3.0) moved the mixer volume
+/// to the -inf..=+6 dB MIDI scale (115 = 0 dB, was 127 = 0 dB); v1 files are
+/// migrated on load.
+pub const VERSION: u32 = 2;
 /// File extension (no dot) of project files.
 pub const EXT: &str = "simplooper";
 
@@ -91,12 +93,12 @@ pub struct Project {
 }
 
 impl Project {
-    /// Magic + version check.
+    /// Magic + version check (v1 is accepted and migrated by [`load`]).
     fn validate(&self) -> Result<(), String> {
         if self.format != FORMAT {
             return Err("not a simplooper project file".into());
         }
-        if self.version != VERSION {
+        if self.version == 0 || self.version > VERSION {
             return Err(format!("unsupported project version {}", self.version));
         }
         Ok(())
@@ -133,9 +135,15 @@ pub fn save(path: &Path, pr: &Project) -> Result<(), String> {
 
 pub fn load(path: &Path) -> Result<Project, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let pr: Project = serde_json::from_str(&s)
+    let mut pr: Project = serde_json::from_str(&s)
         .map_err(|e| format!("{}: invalid project file ({e})", path.display()))?;
     pr.validate()?;
+    if pr.version == 1 {
+        // v1 volumes were MIDI-linear (127 = 0 dB); convert to the dB scale.
+        for t in &mut pr.tracks {
+            t.vol = crate::config::vol_midi_from_legacy(t.vol);
+        }
+    }
     Ok(pr)
 }
 
@@ -196,6 +204,30 @@ mod tests {
             }],
             assets: vec![ProjAsset { name: "kick".into(), file: "/x/kick.wav".into() }],
         }
+    }
+
+    #[test]
+    fn v1_project_volumes_migrate_on_load() {
+        // v1 saved 127 = 0 dB (MIDI-linear); the loader converts to the
+        // dB scale where 115 = 0 dB.
+        let dir = std::env::temp_dir().join(format!("sp-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("old.simplooper");
+        std::fs::write(&p, r#"{"format":"simplooper-project","version":1,"name":"old",
+            "metro":{"bpm":120,"num":4,"sub":3},
+            "quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},
+            "playhead":0,
+            "tracks":[{"vol":127,"gain":80,"pan":64,"on":true,"fx":[],"lanes":[[],[]]}],
+            "assets":[]}"#).unwrap();
+        let loaded = load(&p).unwrap();
+        assert_eq!(loaded.tracks[0].vol, crate::ui::VOL_UNITY_MIDI, "127 -> 0 dB");
+        assert_eq!(loaded.tracks[0].gain, 80, "gain domain unchanged");
+        assert_eq!(loaded.tracks[0].pan, 64);
+        // Future versions are still refused.
+        let bad = p.with_file_name("future.simplooper");
+        std::fs::write(&bad, r#"{"format":"simplooper-project","version":99,"name":"x","metro":{"bpm":120,"num":4,"sub":3},"quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},"playhead":0,"tracks":[],"assets":[]}"#).unwrap();
+        assert!(load(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

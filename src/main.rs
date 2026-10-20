@@ -1,9 +1,11 @@
 //! simplooper — a minimalist clip-based audio DAW for Linux (JACK / PipeWire).
 //!
-//! Sixteen tracks on a global, draggable playhead: asset-rack drag & drop
-//! onto a metronome-defined bar grid, additive child lanes, takes that
-//! record into rack assets + auto-placed clips, metronome-anchored
-//! quantize/trim, `.simplooper` projects, per-track effects, MIDI action
+//! Sixteen tracks on a global, draggable playhead with a global loop region
+//! (area / current longest / whole song). Asset-rack drag & drop onto a
+//! metronome-defined bar grid, a right-docked Mixer aligned per track,
+//! clip copy/paste, additive child lanes, takes that record into rack assets
+//! and auto-placed clips, metronome-anchored quantize/trim, a bundled TR-808
+//! sample pack, `.simplooper` projects, per-track effects, MIDI action
 //! mapping plus keyboard shortcuts, live mix passthrough and a MIDI monitor.
 
 /// Bundled application icon (placeholder for now — see assets/icon.png).

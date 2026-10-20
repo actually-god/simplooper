@@ -107,9 +107,28 @@ pub struct Config {
     /// Snap freshly recorded takes' placement to the quantize grid.
     #[serde(default = "default_true")]
     pub auto_quantize: bool,
-    /// Timeline loop toggle: wrap the playhead at the end of the project.
+    /// Timeline loop toggle: wrap the playhead at the end of the loop
+    /// region (see `loop_mode` below).
     #[serde(default = "default_true")]
     pub loop_tl: bool,
+    /// Loop region mode: 0 = area (dragged handles on the ruler),
+    /// 1 = current longest (0 → last clip end), 2 = whole song.
+    #[serde(default = "default_loop_mode")]
+    pub loop_mode: usize,
+    /// Area loop bounds in samples (mode 0; end 0 = "not set yet" → 2 bars
+    /// once the sample rate is known).
+    #[serde(default)]
+    pub loop_area_start: u64,
+    #[serde(default)]
+    pub loop_area_end: u64,
+    /// Master output volume, MIDI range (0 = -inf, 115 = 0 dB, 127 = +6 dB
+    /// — the same `vol_amp` mapping every track volume uses).
+    #[serde(default = "default_master_vol")]
+    pub master_vol: u8,
+    /// False only in configs written before 0.3.0, where volume was
+    /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
+    #[serde(default)]
+    pub vol_scale_v2: bool,
     /// Where `.simplooper` project files live (empty = `~/simplooper-projects`).
     #[serde(default)]
     pub project_dir: String,
@@ -148,6 +167,11 @@ impl Default for Config {
             snap_sub: default_grid_sub(),
             auto_quantize: default_true(),
             loop_tl: default_true(),
+            loop_mode: default_loop_mode(),
+            loop_area_start: 0,
+            loop_area_end: 0,
+            master_vol: default_master_vol(),
+            vol_scale_v2: true,
             project_dir: String::new(),
             rack_folders: Vec::new(),
             fx_dir: String::new(),
@@ -158,6 +182,28 @@ impl Default for Config {
 
 fn default_gui_scale() -> f32 {
     1.0
+}
+
+/// "Current longest" is the default loop region mode (index 1 of
+/// `["area", "current longest", "whole song"]`).
+fn default_loop_mode() -> usize {
+    1
+}
+
+/// Master volume default = 0 dB on the `vol_amp` MIDI mapping.
+fn default_master_vol() -> u8 {
+    115
+}
+
+/// Convert a pre-0.3 MIDI-linear fader (0 = silence, 127 = 0 dB, plain
+/// linear amplitude) onto the current dB-scale MIDI value. Shared by the
+/// config migration and the v1 project loader.
+pub fn vol_midi_from_legacy(v: u8) -> u8 {
+    if v == 0 {
+        return 0;
+    }
+    let db = 20.0 * (v as f32 / 127.0).log10();
+    crate::ui::vol_midi(db)
 }
 
 fn default_metro_bpm() -> u32 {
@@ -193,10 +239,30 @@ impl Config {
 
     /// Load the config, falling back to defaults on any error.
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => Self::default(),
+        let raw = std::fs::read_to_string(Self::path());
+        let mut cfg: Self = match &raw {
+            Ok(s) => match serde_json::from_str(s) {
+                Ok(c) => c,
+                Err(e) => {
+                    // A torn/invalid write must never be silently replaced:
+                    // keep it next to the config for recovery, start fresh.
+                    let _ = std::fs::rename(Self::path(), Self::path().with_extension("corrupt"));
+                    eprintln!("[simplooper] config invalid ({e}) — saved as config.corrupt, using defaults");
+                    return Self::default();
+                }
+            },
+            Err(_) => return Self::default(),
+        };
+        if !cfg.vol_scale_v2 {
+            // Pre-0.3 config: volumes were MIDI-linear (127 = 0 dB).
+            cfg.master_vol = vol_midi_from_legacy(cfg.master_vol);
+            for v in &mut cfg.trk_vol {
+                *v = vol_midi_from_legacy(*v);
+            }
+            cfg.vol_scale_v2 = true;
+            cfg.save().ok();
         }
+        cfg
     }
 
     /// Save the config; creates the directory if needed.
@@ -236,7 +302,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip() {
+    fn legacy_volume_faders_migrate_to_db_scale() {
+        use crate::ui::VOL_UNITY_MIDI;
+        // Old scale: 127 = 0 dB, linear amplitude. New: 115 = 0 dB.
+        assert_eq!(vol_midi_from_legacy(127), VOL_UNITY_MIDI);
+        assert_eq!(vol_midi_from_legacy(0), 0);
+        assert_eq!(vol_midi_from_legacy(64), 104); // -5.94 dB
+        // Monotone and never exceeds unity below 127.
+        let mut prev = 0u8;
+        for v in 0..=127u8 {
+            let m = vol_midi_from_legacy(v);
+            assert!(m >= prev, "not monotone at {v}");
+            prev = m;
+        }
+    }
+
+    #[test]
+    fn config_roundtrip() {
         let cfg = Config {
             shortcuts: vec![Some("R".into()), None, Some("Space".into())],
             midi: vec![MidiBinding {
@@ -256,6 +338,11 @@ mod tests {
             snap_sub: 2,
             auto_quantize: false,
             loop_tl: false,
+            loop_mode: 1,
+            loop_area_start: 24,
+            loop_area_end: 192_000,
+            master_vol: 100,
+            vol_scale_v2: true,
             project_dir: "/tmp/projects".into(),
             rack_folders: vec!["/tmp/samples".into(), "/tmp/takes".into()],
             fx_dir: "/tmp/effects".into(),

@@ -26,6 +26,7 @@ pub mod midi;
 pub mod ports;
 pub mod project;
 pub mod quantize;
+pub mod samples808;
 pub mod ui;
 
 pub use midi::{MidiAction, MidiBind, MidiMsg};

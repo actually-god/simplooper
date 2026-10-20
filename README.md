@@ -14,7 +14,7 @@ shortcuts, per-track effects, and clean export.
 
 ## Features
 
-- **16-track timeline DAW model** — no loop modes, no per-track clocks: one
+- **16-track timeline DAW model** — no per-track clocks or loop modes: one
   global transport and one **always-on playhead** over a bar/beat grid derived
   from the metronome. Press play or stop **anywhere** — the position is kept;
   **drag the playhead** across the ruler or any lane to scrub to the exact
@@ -28,7 +28,9 @@ shortcuts, per-track effects, and clean export.
   that overlap simply add together.
 - **Child lanes** — every track has a base lane plus any number of child
   lanes (`+ child` / `- child` in the row). Children stack additively on the
-  same track mixer (vol, gain, pan, effects). When a recording or a drop
+  same track mixer (vol, gain, pan, effects). **Ctrl+C / Ctrl+V / Ctrl+D**
+  copy, paste and duplicate clips — a paste lands on the track nearest your
+  last click, right at the playhead. When a recording or a drop
   would land **on top of existing clip material, a child lane opens
   automatically** — you can never punch a hole in another clip by accident.
 - **Record → take → clip** — each track keeps its **REC** button (and its
@@ -59,14 +61,28 @@ shortcuts, per-track effects, and clean export.
   shows every project in the folder newest-first, and the projects folder
   itself is a setting. Audio is never embedded — derived assets are written
   next to the project and missing files are re-found by name.
-- **Per-track mixer & effects** — each track row stacks **vol** (0 = −∞ …
-  127 = 0 dB), **gain**, and **pan** (−100…+100, equal power; editable dB /
-  position text boxes + raw MIDI readout), and its own runtime-compiled
-  **effects chain** (same effect engine as before: Rust scripts hot-compiled
-  with rustc, per-effect sliders, scripted custom GUIs, user presets).
-  Effects run after vol × gain, per track, live and in export renders.
+- **Mixer dock & effects** — a **Mixer** panel docked right of the timeline
+  holds every track's full strip, each one aligned to its track block: name,
+  REC, play gate, child-lane buttons, **vol** (−∞…+6 dB), **gain**, **pan**
+  (−100…+100, equal power; editable dB / position text boxes + raw MIDI
+  readout) and **FX…**, all scrolling in lockstep with the timeline. The
+  **master volume** (top bar) spans the same −∞…+6 dB range. Effects are
+  per-track runtime-compiled chains (Rust scripts hot-compiled with rustc,
+  per-effect sliders, scripted custom GUIs, user presets) running after
+  vol × gain, live and in export renders.
+- **Global loop region** — a **loop** toggle plus mode dropdown on the grid
+  toolbar: **current longest** (default — wraps at the end of the longest
+  playing clip), **whole song**, or **area** with draggable start/end
+  handles on the ruler (default bar 1 → bar 2, snap-aware). The playhead
+  draws as one unbroken line across all tracks, and with looping off it
+  parks at the region end.
+- **Bundled TR-808 pack** — fourteen one-shots sampled from a real Roland
+  TR-808 (kick, sub, snares, clap, closed/open hats, crash, cowbell, three
+  toms, rimshot, clave) seed themselves into the app data dir and open as
+  the default rack folder on a fresh install (public-domain lineage; see
+  `samples/808/CREDITS.md`).
 - **Settings menu** — hamburger (top-left): input/output port picker (per
-  output **L** / **R** / both), master gain, projects folder, latency
+  output **L** / **R** / both), projects folder, latency
   compensation, MIDI + keyboard bindings for every action.
 - **MIDI binding** — every action — per-track record / clear / play-gate,
   track select, **play all** / **stop all**, metronome, export, per-track
@@ -75,7 +91,8 @@ shortcuts, per-track effects, and clean export.
   travel). Everything persists between sessions.
 - **Keyboard shortcuts** — `Space` play/stop all, `R` record, `C` clear,
   `E` export prompt, `M` metronome, `1`–`4` select track (5–16 bindable),
-  Ctrl+S save (Ctrl+Shift+S rename). All rebindable; ignored while typing
+  Ctrl+S save (Ctrl+Shift+S rename), Ctrl+C/Ctrl+V/Ctrl+D clip
+  copy/paste/duplicate. All rebindable; ignored while typing
   in text boxes; auto-repeat never re-fires.
 - **Import / export** — export one track (its mixer + chain baked in) or the
   whole project as WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
@@ -219,6 +236,8 @@ src/
 ├── audio_io.rs import decoding (symphonia) + export (WAV/FLAC native,
 │              MP3/OGG via ffmpeg, resampled with rubato)
 ├── config.rs  JSON config: $XDG_CONFIG_HOME/simplooper/config.json
+├── samples808.rs  bundled TR-808 pack: embedded WAVs + startup seeding
+│              into $XDG_DATA_HOME/simplooper/samples/808 (default rack folder)
 ├── fx.rs      effects framework: scan/compile/cache/load effect scripts,
 │              ABI validation, per-track chains, RT-safe parameter relay
 ├── fxgui.rs   per-effect editor windows: auto sliders or scripted GUIs
@@ -257,8 +276,12 @@ src/
   manager thread (`Evt::Take`), which saves the WAV into the primary rack
   folder, appends the asset, and places the clip at the take's start
   position — opening a child lane when the base lane is occupied there.
-- **Loop wrap / end**: with **loop** on (default) the playhead wraps at the
-  project end; with it off the transport parks at the end and stops.
+- **Loop region**: the engine keeps `loop_start`/`loop_end` samples and a
+  mode (area / longest / whole song). `region_end()` resolves the wrap point
+  each block (longest = furthest playing clip end, min = the region's end);
+  the playhead wraps there, or parks and stops when looping is off. The UI
+  pushes the region whenever the handles move; area handles drag on the ruler
+  with snap, mirrored live from the RT position stream so dragging keeps up.
 
 ## Packaging (Arch / AUR)
 
@@ -270,7 +293,7 @@ instructions.
 
 Repo-side obligations that keep the package healthy:
 
-- Every release is a **tag** (`git tag v0.2.0 && git push origin v0.2.0`) —
+- Every release is a **tag** (`git tag v0.3.0 && git push origin v0.3.0`) —
   the PKGBUILD's `source=` URL points at that tarball, so don't force-move
   public tags once the AUR package references them; release new versions
   instead.
@@ -293,7 +316,7 @@ makepkg's default `$srcdir=$PWD/src` collides with Rust's own `src/`.
 cargo test -- --test-threads=1
 ```
 
-Unit tests (77) cover MIDI parsing/binding and shortcut-table migration,
+Unit tests (85) cover MIDI parsing/binding and shortcut-table migration,
 quantize/silence-trim math, the arrangement model (placement, snapping,
 child-lane creation on overlap, removal rules), the asset store, the
 `.simplooper` project format, and engine render/mixing. The e2e suite (7

@@ -1,23 +1,31 @@
 //! egui front-end for simplooper: a small DAW — sixteen tracks with child
-//! lanes, a global draggable playhead, an asset rack, clip-based
-//! arrangement, metronome-anchored quantize and `.simplooper` projects.
+//! lanes, a global draggable playhead, a global loop region, an asset rack,
+//! clip copy/paste, clip-based arrangement, metronome-anchored quantize and
+//! `.simplooper` projects.
 //!
 //! Layout:
-//! - top bar: hamburger (settings), status, transport (play/stop/loop),
-//!   position readout, tempo + metronome, Save / Save as / Load / Export,
-//!   peak meter, master gain
-//! - left panel: ASSET RACK — folder list (primary = recordings land there),
-//!   one draggable row per audio file, project assets below
-//! - central: grid toolbar (auto-quantize, quantize/snap subdivisions,
-//!   asset quantize/trim, zoom) above the timeline: a ruler pinned above
-//!   the track scroll + one block per track (header, ALWAYS-visible mixer
-//!   with the FX button, lane strips with clips); clips drag with snap,
-//!   and pressing the pinned ruler or any empty grid area scrubs the
-//!   playhead (both map the identical x window; wheel/trackpad pans)
+//! - top bar: hamburger (settings), status, transport, position readout,
+//!   tempo + metronome, Save / Save as / Load / Export, peak meter, master
+//!   volume (dB scale, −∞…+6)
+//! - left panel: ASSET RACK — folder list (primary = recordings land there;
+//!   defaults to the seeded [`crate::samples808`] pack), one row per audio
+//!   file, project assets below
+//! - central: grid toolbar (loop toggle + mode, auto-quantize,
+//!   quantize/snap subdivisions, zoom — also Ctrl+wheel; Shift+wheel pans
+//!   horizontally) above the timeline: a ruler pinned above the track
+//!   scroll (scrub + draggable loop handles) and one seamless block per
+//!   track (flush lane strips, hairline separators, one continuous playhead
+//!   line). Track geometry is shared with the mixer via [`App::track_rows`].
+//! - right panel: MIXER dock — one strip per track, vertically aligned with
+//!   its timeline block: name/REC/play-gate/child buttons, vol/gain/pan
+//!   sliders with dB text boxes, FX button; scrolls in lockstep
 //! - the settings panel docks to the LEFT of the asset rack when open
 //! - bottom: MIDI monitor
 //! - windows: settings, effects, effect editor, knob learner, export,
 //!   save-project prompt, load-project browser
+//!
+//! Clipboard: one clip lives in `clip_clipboard`; paste targets the track
+//! nearest the last grid click (`paste_track`), at the playhead.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -136,17 +144,45 @@ fn key_from_name(s: &str) -> Option<egui::Key> {
 }
 
 // --- per-loop level controls ---------------------------------------------
-// MIDI knobs/sliders send 0..=127. Both mappings anchor 0 at silence
-// (-inf dB); the sliders in each track row show the resulting dB.
+// MIDI knobs/sliders send 0..=127. Volume runs -inf dB (silence) at 0 up to
+// **+6 dB** at 127; the sliders show the resulting dB.
 
+/// MIDI value of 0 dB on the volume sliders (-inf..=+6 dB range).
+pub const VOL_UNITY_MIDI: u8 = 115;
 
-/// Volume mapping: 0 = silence, 127 = 0 dB, ~0.47 dB per step down from
-/// there (~-60 dB at 1) — linear in dB so the slider feels even.
+/// Volume mapping: 0 = silence (-inf), 1 = -60 dB, [`VOL_UNITY_MIDI`] =
+/// exactly 0 dB, 127 = +6 dB — linear in dB on each leg so the slider feels
+/// even, with the 0 dB point sitting where the track/master defaults are.
 pub fn vol_amp(v: u8) -> f32 {
+    let db = if v <= VOL_UNITY_MIDI {
+        (v as f32 - 1.0) * (60.0 / (VOL_UNITY_MIDI as f32 - 1.0)) - 60.0
+    } else {
+        (v as f32 - VOL_UNITY_MIDI as f32) * (6.0 / (127.0 - VOL_UNITY_MIDI as f32))
+    };
     if v == 0 {
         0.0
     } else {
-        10f32.powf((127 - v as i32) as f32 * (-60.0 / 127.0) / 20.0)
+        10f32.powf(db / 20.0)
+    }
+}
+
+/// dB -> volume MIDI value for the -inf..=+6 dB range (inverse of
+/// [`vol_amp`]; finite values floor at 1, "-inf" is 0).
+pub fn vol_midi(db: f32) -> u8 {
+    if !db.is_finite() || db <= -60.0 {
+        return if db == f32::NEG_INFINITY { 0 } else { 1 };
+    }
+    if db >= 6.0 {
+        return 127;
+    }
+    if db <= 0.0 {
+        (1.0 + (db + 60.0) * ((VOL_UNITY_MIDI - 1) as f32 / 60.0))
+            .round()
+            .clamp(1.0, VOL_UNITY_MIDI as f32) as u8
+    } else {
+        (VOL_UNITY_MIDI as f32 + db * ((127 - VOL_UNITY_MIDI) as f32 / 6.0))
+            .round()
+            .clamp(VOL_UNITY_MIDI as f32, 127.0) as u8
     }
 }
 
@@ -289,15 +325,25 @@ const COL_CLIP_SEL: Color32 = Color32::from_rgb(128, 200, 255);
 const COL_GHOST: Color32 = Color32::from_rgb(120, 160, 120);
 const COL_BAR_LINE: Color32 = Color32::from_gray(120);
 const COL_BEAT_LINE: Color32 = Color32::from_gray(68);
-
-
+/// Nominal lane-strip height in the grid. A track's block is
+/// `lanes × LANE_H`, never shorter than `TRACK_MIN_H` (the height its
+/// mixer strip needs), so clips get tall waveforms and the mixer stays
+/// aligned strip-to-track.
+const LANE_H: f32 = 48.0;
+const TRACK_MIN_H: f32 = 96.0;
+/// Separation bar painted between adjacent tracks (the only gap left).
+const TRACK_SEP: f32 = 3.0;
+/// Loop region modes (see [`App::loop_mode`]); index = config value.
+const LOOP_MODES: [&str; 3] = ["area", "current longest", "whole song"];
 
 /// The user's home folder (projects default to `~/simplooper-projects`).
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
 }
 
-
+/// The whole application: engine backend handle, persistent UI state, and
+/// the per-frame layout cache (`row_h` → [`App::track_rows`]) that keeps the
+/// timeline blocks and the Mixer dock strip-per-track aligned.
 pub struct App {
     backend: Backend,
 
@@ -313,7 +359,8 @@ pub struct App {
     sel_out: HashMap<String, u8>,
     applied: Option<(usize, usize)>,
     applied_ports: Option<(Vec<String>, Vec<OutSel>)>,
-    gain: f32,
+    /// Master output volume, MIDI-range (-inf..=+6 dB via [`vol_amp`]).
+    master_midi: u8,
     /// GUI zoom factor (Settings → GUI); 1.0 = default UI size.
     gui_scale: f32,
     show_settings: bool,
@@ -331,8 +378,17 @@ pub struct App {
     // --- DAW state ---
     /// Track targeted by keyboard/MIDI "selected" actions.
     selected: usize,
-    /// Timeline loop: wrap at project end vs. park there.
+    /// Timeline loop: wrap the playhead at the loop region's end (mode
+    /// below) vs. park at the project end.
     loop_tl: bool,
+    /// Loop region mode: 0 = area (dragged handles), 1 = current longest
+    /// (0 → last clip end), 2 = whole song (0 → project end).
+    loop_mode: usize,
+    /// Area loop bounds in samples (mode 0; end 0 = "not set yet" → 2 bars
+    /// once the sample rate is known).
+    loop_area: (u64, u64),
+    /// Which area-handle is being dragged on the ruler (0 = start, 1 = end).
+    drag_loop_handle: Option<u8>,
     metro_on: bool,
     metro_bpm: String,
     metro_num: String,
@@ -359,8 +415,17 @@ pub struct App {
     /// Horizontal view offset of the timeline in px (shared by the pinned
     /// ruler and every lane strip — the playhead stays one straight line).
     hscroll: f32,
+    /// Vertical scroll offset of the track stack, shared with the mixer
+    /// panel so each mixer strip stays aligned with its track.
+    vscroll: f32,
     /// Selected clip (track, lane, clip index).
     sel_clip: Option<(usize, usize, usize)>,
+    /// Track owning the last primary press inside the grid — clipboard
+    /// paste targets this track (falls back to `selected`).
+    last_click_track: Option<usize>,
+    /// Clip copy buffer: just the asset (paste re-places it at the playhead
+    /// on the last-clicked track, opening a child lane when busy).
+    copied_asset: Option<u32>,
 
     // --- asset rack ---
     rack: Vec<RackFolder>,
@@ -460,7 +525,8 @@ impl App {
         }
         // Per-track levels: pad persisted vectors and push into the engine
         // atomics — those are the live source of truth for the RT thread.
-        let trk_vol = core::array::from_fn(|i| cfg.trk_vol.get(i).copied().unwrap_or(127));
+        let trk_vol =
+            core::array::from_fn(|i| cfg.trk_vol.get(i).copied().unwrap_or(VOL_UNITY_MIDI));
         let trk_gain =
             core::array::from_fn(|i| cfg.trk_gain.get(i).copied().unwrap_or(GAIN_UNITY_MIDI));
         let trk_pan = core::array::from_fn(|i| cfg.trk_pan.get(i).copied().unwrap_or(64));
@@ -488,8 +554,18 @@ impl App {
                     .collect(),
             ))
         };
-        let mut rack: Vec<RackFolder> =
-            cfg.rack_folders.iter().map(|p| RackFolder::new(p.clone())).collect();
+        // Bundled 808 pack: seed it into the app data dir; it becomes the
+        // default rack folder when the user has configured none — takes then
+        // record into it and every 808 voice is one drag away.
+        let seeded = crate::samples808::seed_pack();
+        let mut rack: Vec<RackFolder> = cfg
+            .rack_folders
+            .iter()
+            .map(|p| RackFolder::new(p.clone()))
+            .collect();
+        if rack.is_empty() {
+            rack.push(RackFolder::new(seeded.to_string_lossy().into_owned()));
+        }
         for f in rack.iter_mut() {
             f.rescan();
         }
@@ -505,7 +581,7 @@ impl App {
             sel_out,
             applied: None,
             applied_ports,
-            gain: 1.0,
+            master_midi: cfg.master_vol.min(127),
             gui_scale: cfg.gui_scale.clamp(0.7, 1.6),
             show_settings: false,
             trk_vol,
@@ -516,6 +592,9 @@ impl App {
             levels_dirty: false,
             selected: 0,
             loop_tl: cfg.loop_tl,
+            loop_mode: cfg.loop_mode.min(2),
+            loop_area: (cfg.loop_area_start, cfg.loop_area_end),
+            drag_loop_handle: None,
             metro_on: false,
             metro_bpm: cfg.metro_bpm.to_string(),
             metro_num: cfg.metro_num.clamp(1, 16).to_string(),
@@ -534,7 +613,10 @@ impl App {
             drag_clip: None,
             scrub_drag: false,
             hscroll: 0.0,
+            vscroll: 0.0,
             sel_clip: None,
+            last_click_track: None,
+            copied_asset: None,
             rack,
             sel_asset: None,
             proj_name: String::new(),
@@ -734,6 +816,46 @@ impl App {
 
         if ctx.text_edit_focused() {
             return;
+        }
+
+        // Clip clipboard: Ctrl/Cmd+C copies the selected clip's asset,
+        // Ctrl/Cmd+V places it at the playhead on the last grid-clicked
+        // track (busy lanes open a child lane automatically). Handled
+        // before action firing so a bare C/V binding never double-fires.
+        let (ccopy, cpaste) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::C),
+                i.modifiers.command && i.key_pressed(egui::Key::V),
+            )
+        });
+        if ccopy || cpaste {
+            if ccopy {
+                if let Some((t, k, ci)) = self.sel_clip {
+                    if let Some(c) = self.arr.tracks[t].lanes[k].clips.get(ci) {
+                        self.copied_asset = Some(c.asset);
+                        let nm = self
+                            .assets
+                            .get(c.asset as usize)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_default();
+                        self.status = format!("copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead");
+                    }
+                }
+            }
+            if cpaste {
+                if let Some(a) = self.copied_asset {
+                    let t = self.last_click_track.unwrap_or(self.selected);
+                    let len = self.asset_len(a);
+                    let pos = self.backend.engine.pos();
+                    let lane = self.arr.place_auto(t, a, len, pos);
+                    let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
+                    self.sel_clip = Some((t, lane, li));
+                    self.push_project();
+                    self.status =
+                        format!("pasted at the playhead \u{b7} track {} {}", t + 1, if lane == 0 { "track" } else { "child lane" });
+                }
+            }
+            return; // swallow the key
         }
 
         // The knob wizard is its own learn mode: it does NOT set
@@ -1056,12 +1178,66 @@ impl App {
 
     /// Hand the current project (asset table + arrangement + length) to the
     /// engine as one immutable snapshot.
+    /// End of the last clip on any track/lane (0 when the grid is empty) —
+    /// the "current longest" loop region end.
+    fn last_clip_end(&self) -> u64 {
+        let mut e = 0u64;
+        for tr in self.arr.tracks.iter() {
+            for l in tr.lanes.iter() {
+                for c in l.clips.iter() {
+                    e = e.max(c.pos.saturating_add(self.asset_len(c.asset)));
+                }
+            }
+        }
+        e
+    }
+
+    /// The loop region the engine should use right now (samples):
+    /// *area* = the dragged ruler handles (unset end = 2 bars from 0),
+    /// *current longest* = 0 → last clip end, *whole song* = 0 → project
+    /// end. Degenerate areas collapse back to the 2-bar default.
+    fn loop_region_eff(&self) -> (u64, u64) {
+        if self.sample_rate == 0 {
+            return (0, 0);
+        }
+        match self.loop_mode {
+            0 => {
+                let (mut s, mut e) = self.loop_area;
+                if e == 0 {
+                    e = 2 * self.bar_samples();
+                }
+                if e <= s {
+                    s = 0;
+                    e = 2 * self.bar_samples();
+                }
+                (s, e)
+            }
+            1 => (0, self.last_clip_end()),
+            _ => (0, self.total_len()),
+        }
+    }
+
+    /// Push the effective loop region to the audio engine.
+    fn send_loop_region(&mut self) {
+        let (s, e) = self.loop_region_eff();
+        self.backend.cmd(Cmd::SetLoopRegion { start: s, end: e });
+    }
+
+    /// Height of one track's grid block — and of the mixer strip aligned
+    /// with it (both read this, so they can never drift apart).
+    fn track_h(&self, t: usize) -> f32 {
+        let lanes = self.arr.tracks[t].lanes.len().max(1) as f32;
+        (lanes * LANE_H).max(TRACK_MIN_H)
+    }
+
     fn push_project(&mut self) {
         let table: Arc<Vec<Arc<[f32]>>> =
             Arc::new(self.assets.iter().map(|a| a.data.clone()).collect());
         let arr = Arc::new(self.arr.clone());
         let len = self.total_len();
         self.backend.cmd(Cmd::SetProject { assets: table, arr, len });
+        // "current longest" / "whole song" regions follow the arrangement.
+        self.send_loop_region();
     }
 
     fn send_metro(&mut self) {
@@ -1116,6 +1292,11 @@ impl App {
             snap_sub: SUBDIVISIONS[self.snap_sub].0,
             auto_quantize: self.auto_quantize,
             loop_tl: self.loop_tl,
+            loop_mode: self.loop_mode,
+            loop_area_start: self.loop_area.0,
+            loop_area_end: self.loop_area.1,
+            master_vol: self.master_midi,
+            vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
@@ -1506,6 +1687,7 @@ impl App {
         self.auto_quantize = pr.quantize.auto;
         self.loop_tl = pr.quantize.loop_tl;
         self.backend.cmd(Cmd::SetLoop(self.loop_tl));
+        self.send_loop_region();
         self.proj_name = pr.name.clone();
         self.show_load = false;
         self.send_metro();
@@ -1808,7 +1990,9 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
-        self.backend.gain.store(self.gain.to_bits(), Ordering::Relaxed);
+        // Master volume: same -inf..=+6 dB MIDI mapping as every track.
+        let mamp = vol_amp(self.master_midi);
+        self.backend.gain.store(mamp.to_bits(), Ordering::Relaxed);
 
         if self.sel_sent != self.selected {
             self.sel_sent = self.selected;
@@ -1834,6 +2018,7 @@ impl App {
             settings_panel(ui, self);
         }
         rack_panel(ui, self);
+        mixer_panel(ui, self);
         midi_monitor(ui, self);
         central_panels(ui, self);
 
@@ -1841,6 +2026,7 @@ impl App {
         // must not stick (rack drops now run on egui's native DnD).
         if !ui.ctx().input(|i| i.pointer.any_down()) {
             self.scrub_drag = false;
+            self.drag_loop_handle = None;
         }
 
         if self.show_export {
@@ -1913,10 +2099,6 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
             if play_btn.clicked() {
                 app.backend.cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
             }
-            if ui.checkbox(&mut app.loop_tl, "loop").on_hover_text("Wrap at the end of the project").changed() {
-                app.backend.cmd(Cmd::SetLoop(app.loop_tl));
-                app.save_config();
-            }
             ui.label(RichText::new(pos_label(app)).monospace());
 
             // ---- metronome / grid tempo ----
@@ -1965,7 +2147,25 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                         color,
                     );
                 }
-                ui.add(Slider::new(&mut app.gain, 0.0..=2.0).suffix(" gain"));
+                ui.label(RichText::new("vol").strong().small());
+                let mut mv = app.master_midi as i16;
+                if ui
+                    .add_sized(
+                        egui::vec2(84.0, 18.0),
+                        Slider::new(&mut mv, 0..=127).show_value(false),
+                    )
+                    .on_hover_text("Master volume: -inf .. +6 dB")
+                    .changed()
+                {
+                    app.master_midi = mv.clamp(0, 127) as u8;
+                    app.levels_dirty = true;
+                }
+                ui.label(
+                    RichText::new(db_str(vol_amp(app.master_midi)))
+                        .monospace()
+                        .small(),
+                )
+                .on_hover_text("Master output volume");
                 if ui.button("Export").clicked() {
                     app.show_export = true;
                 }
@@ -2081,9 +2281,11 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         let sel = app.sel_asset.is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
                         // Full-width row: a plain selectable_label shrink-wraps
                         // to the text, leaving most of the row dead to clicks.
-                        let avail = ui.available_size();
+                        // Fixed slim rows: sizing to available_size() made
+                        // every row fill the panel (the "huge hat" bug).
+                        let w = ui.available_width();
                         let row = ui.add_sized(
-                            avail,
+                            egui::vec2(w, 20.0),
                             egui::Button::selectable(sel, RichText::new(&name).small()),
                         );
                         // ONE click_and_drag response for the row: a separate
@@ -2147,9 +2349,9 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     ui.label(RichText::new("project assets").weak().small());
                     for (k, name, dirty) in extra {
                         let sel = app.sel_asset == Some(k);
-                        let avail = ui.available_size();
+                        let w = ui.available_width();
                         let row = ui.add_sized(
-                            avail,
+                            egui::vec2(w, 20.0),
                             egui::Button::selectable(
                                 sel,
                                 RichText::new(format!("{}{}", name, if dirty { " *" } else { "" })).small(),
@@ -2196,6 +2398,119 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
 }
 
 
+/// The mixer dock: every track's controls, as one strip per track, pinned
+/// to the right like the asset rack. Strip heights come from [`App::track_h`]
+/// and the column is offset by the grid's scroll — so each strip sits exactly
+/// level with its track, and clips/waveforms get the grid's full height.
+fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
+    egui::Panel::right("mixer")
+        .resizable(true)
+        .default_size(250.0)
+        .min_size(210.0)
+        .show(ui, |ui| {
+            ui.heading(RichText::new("MIXER").strong());
+            ui.separator();
+            let base = ui.available_rect_before_wrap();
+            // Clip to the visible column, then lay strips out on absolute
+            // rects shifted by the grid's vertical scroll (shared offset —
+            // the alignment is the whole point of this panel).
+            ui.shrink_clip_rect(base);
+            let mut y = base.min.y - app.vscroll;
+            for t in 0..MAX_LOOPS {
+                let th = app.track_h(t);
+                if y + th >= base.min.y && y <= base.max.y {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(base.min.x, y),
+                        egui::vec2(base.width(), th),
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt(("mixstrip", t))
+                            .max_rect(r)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| mixer_strip(ui, app, t),
+                    );
+                }
+                y += th + TRACK_SEP;
+            }
+            let _ = ui.allocate_exact_size(base.size(), Sense::hover());
+        });
+}
+
+/// One track's mixer strip: select / record / mute / child lanes, then the
+/// vol-gain-pan stack and the FX chain chips.
+fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
+    let sel = app.selected == t;
+    let rec = app.backend.engine.rec_state_of(t) == TR_REC;
+    let on = app.backend.engine.track_on(t);
+    let nl = app.arr.tracks[t].lanes.len();
+    let clips: usize = app.arr.tracks[t].lanes.iter().map(|l| l.clips.len()).sum();
+    ui.horizontal(|ui| {
+        let head = ui
+            .selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong())
+            .on_hover_text("Click to select \u{b7} right-click this track's grid clears its clips");
+        if head.clicked() {
+            app.selected = t;
+        }
+        let rec_lbl = if rec { "STOP" } else { "REC" };
+        if ui
+            .small_button(RichText::new(rec_lbl).color(if rec {
+                Color32::from_rgb(255, 90, 90)
+            } else {
+                Color32::from_rgb(220, 180, 120)
+            }))
+            .on_hover_text(
+                "Record: the take becomes an asset plus a clip at the playhead; \
+                 recording over an occupied lane opens a child lane automatically",
+            )
+            .clicked()
+        {
+            app.toggle_record(t);
+        }
+        if ui
+            .small_button(if on { "on" } else { "mute" })
+            .on_hover_text(
+                "While the transport runs, a muted track contributes nothing \
+                 (its clips stay on the timeline)",
+            )
+            .clicked()
+        {
+            app.backend.cmd(Cmd::ToggleTrackOn { i: t });
+        }
+        if ui
+            .small_button("+")
+            .on_hover_text("Add a child lane (stacks additively)")
+            .clicked()
+        {
+            app.arr.add_lane(t);
+            app.push_project();
+        }
+        if nl > 1
+            && ui
+                .small_button("-")
+                .on_hover_text("Remove the last child lane")
+                .clicked()
+        {
+            app.arr.remove_lane(t, nl - 1);
+            app.push_project();
+        }
+        ui.label(RichText::new(format!("{clips}c/{nl}L")).weak().small());
+    });
+    for kind in [KIND_VOL, KIND_GAIN, KIND_PAN] {
+        level_row(ui, app, t, kind);
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("FX")
+            .on_hover_text("This track's effects: enable scripts, reorder the chain, open editors")
+            .clicked()
+        {
+            app.fx_window = Some(t);
+        }
+        fx_buttons(ui, app, t);
+    });
+}
+
 /// The toolbar row above the timeline: quantize / snap controls, asset
 /// actions, loop and zoom.
 fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
@@ -2229,6 +2544,45 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 }
             });
         ui.separator();
+        // ---- looping (grid header) ----
+        let mut lt = app.loop_tl;
+        if ui
+            .checkbox(&mut lt, "loop")
+            .on_hover_text(
+                "Wrap the playhead at the end of the loop region instead of \
+                 parking at the project end",
+            )
+            .changed()
+        {
+            app.loop_tl = lt;
+            app.backend.cmd(Cmd::SetLoop(app.loop_tl));
+            app.send_loop_region();
+            app.save_config();
+        }
+        let mut mch = false;
+        ui.add_enabled_ui(app.loop_tl, |ui| {
+            egui::ComboBox::from_id_salt("loop_mode_cb")
+                .selected_text(LOOP_MODES[app.loop_mode.min(2)])
+                .show_ui(ui, |ui| {
+                    for (n, s) in LOOP_MODES.iter().enumerate() {
+                        if ui.selectable_value(&mut app.loop_mode, n, *s).changed() {
+                            mch = true;
+                        }
+                    }
+                });
+        });
+        if mch {
+            app.send_loop_region();
+            app.save_config();
+        }
+        if app.loop_tl && app.loop_mode == 0 {
+            ui.label(
+                RichText::new("(drag the ruler handles)")
+                    .weak()
+                    .small(),
+            );
+        }
+        ui.separator();
         ui.label("zoom");
         if ui.add(Slider::new(&mut app.px_per_sec, 24.0..=1200.0).show_value(false)).changed() {}
     });
@@ -2242,28 +2596,54 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         let total = app.total_len().max(1);
         let px = app.px_per_sec as f64;
         let w = ((total as f64 / sr) * px).max(640.0) as f32;
-        // Horizontal view offset: trackpad / tilt-wheel pans; clamped so the
-        // strip can never scroll past the project end. Shared by the ruler
-        // and every lane strip -> aligned grids, one straight playhead.
         if ui.input(|i| !i.pointer.any_down()) {
             app.scrub_drag = false;
         }
-        let dx = ui.input(|i| i.smooth_scroll_delta.x);
-        if dx != 0.0 {
-            app.hscroll -= dx;
+        // Wheel routing over the grid: Ctrl/Cmd+wheel zooms the timeline
+        // (same state as the zoom slider), Shift+wheel pans horizontally,
+        // the plain wheel scrolls the track stack. Handled before the
+        // ScrollArea can claim the delta.
+        let area = ui.available_rect_before_wrap();
+        if ui.rect_contains_pointer(area) {
+            let (ctrl, shift) =
+                ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            let dx = ui.input(|i| i.smooth_scroll_delta.x);
+            if ctrl && dy != 0.0 {
+                app.px_per_sec = (app.px_per_sec * (1.0 + dy * 0.004)).clamp(24.0, 1200.0);
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            } else if shift && (dx != 0.0 || dy != 0.0) {
+                app.hscroll -= dx + dy;
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            } else if dx != 0.0 {
+                app.hscroll -= dx;
+            }
         }
         let avail = ui.available_width().max(200.0);
         app.hscroll = app.hscroll.clamp(0.0, (w - avail).max(0.0));
         // Pinned ruler: always visible above the track scroll (it used to
         // scroll away with the content), same width + x origin as the lanes.
         ruler_row(ui, app, avail, px, sr);
-        egui::ScrollArea::vertical()
+        let grid_top = ui.cursor().min;
+        let out = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for t in 0..MAX_LOOPS {
                     track_block(ui, app, t, avail, px, sr);
                 }
             });
+        // The mixer panel mirrors this offset so strips stay aligned.
+        app.vscroll = out.state.offset.y;
+        // One continuous playhead across the whole track stack (drawn over
+        // lanes AND separation bars, so it shows no break).
+        let gx = x_of(grid_top.x - app.hscroll, app.backend.engine.pos(), sr, px);
+        let gr = egui::Rect::from_min_max(grid_top, ui.max_rect().right_bottom());
+        if gx >= gr.min.x && gx <= gr.max.x {
+            ui.painter().line_segment(
+                [egui::pos2(gx, gr.min.y), egui::pos2(gx, gr.max.y)],
+                egui::Stroke::new(1.6, COL_PLAYHEAD),
+            );
+        }
     });
 }
 
@@ -2313,14 +2693,18 @@ fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, px: f64, sr: f64, 
             }
         }
     }
-    // Playhead.
-    let pos = app.backend.engine.pos();
-    let x = x_of(x0, pos, sr, px);
-    if x >= rect.min.x && x <= rect.max.x {
-        p.line_segment(
-            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
-            egui::Stroke::new(1.6, COL_PLAYHEAD),
-        );
+    // Playhead: the ruler paints its own segment; the track stack gets ONE
+    // continuous line painted over lanes and separation bars together (see
+    // `central_panels`), so it never breaks at a track boundary.
+    if ruler {
+        let pos = app.backend.engine.pos();
+        let x = x_of(x0, pos, sr, px);
+        if x >= rect.min.x && x <= rect.max.x {
+            p.line_segment(
+                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                egui::Stroke::new(1.6, COL_PLAYHEAD),
+            );
+        }
     }
 }
 
@@ -2331,8 +2715,69 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, 20.0), Sense::click_and_drag());
     let x0 = rect.min.x - app.hscroll;
     paint_grid(ui, app, rect, px, sr, true, x0);
+    // Loop region on the ruler ("grid header"): a shaded span, plus two
+    // draggable handles in area mode. Handles follow the snap setting.
+    let (ls, le) = app.loop_region_eff();
+    let hx0 = x_of(x0, ls, sr, px);
+    let hx1 = x_of(x0, le, sr, px);
+    if app.loop_tl && le > ls {
+        let band = egui::Rect::from_min_max(
+            egui::pos2(hx0.max(rect.min.x), rect.min.y),
+            egui::pos2(hx1.min(rect.max.x), rect.max.y),
+        );
+        if band.width() > 0.5 {
+            ui.painter().rect_filled(
+                band,
+                0.0,
+                Color32::from_rgba_premultiplied(90, 150, 230, 55),
+            );
+        }
+        if app.loop_mode == 0 {
+            for hx in [hx0, hx1] {
+                if hx > rect.min.x - 4.0 && hx < rect.max.x + 4.0 {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(hx - 3.0, rect.min.y),
+                            egui::vec2(6.0, rect.height()),
+                        ),
+                        1.0,
+                        Color32::from_rgb(130, 185, 255),
+                    );
+                }
+            }
+        }
+    }
     if let Some(pt) = resp.interact_pointer_pos() {
-        if (resp.dragged() || resp.clicked()) && rect.contains(pt) {
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            app.drag_loop_handle = if app.loop_tl
+                && app.loop_mode == 0
+                && (pt.x - hx0).abs().min((pt.x - hx1).abs()) <= 7.0
+            {
+                Some(if (pt.x - hx0).abs() <= (pt.x - hx1).abs() { 0 } else { 1 })
+            } else {
+                None
+            };
+        }
+        if let Some(h) = app.drag_loop_handle {
+            if resp.dragged() {
+                let snapu = app.snap_unit();
+                let pos = snap_start(s_at(x0, pt.x, sr, px), snapu);
+                let bar = app.bar_samples();
+                let (mut s, mut e) =
+                    (app.loop_area.0, if app.loop_area.1 == 0 { 2 * bar } else { app.loop_area.1 });
+                if h == 0 {
+                    s = pos.min(e.saturating_sub(1));
+                } else {
+                    e = pos.max(s + 1);
+                }
+                app.loop_area = (s, e);
+                app.send_loop_region();
+            }
+            if resp.drag_stopped() {
+                app.drag_loop_handle = None;
+                app.save_config();
+            }
+        } else if (resp.dragged() || resp.clicked()) && rect.contains(pt) {
             let pos = s_at(x0, pt.x, sr, px);
             app.backend.cmd(Cmd::Seek { pos });
         }
@@ -2342,78 +2787,18 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
     }
 }
 
-/// Everything for one track: header row (right-click = clear clips), the
-/// always-visible mixer with the FX button, then one lane strip per lane
-/// (track + child lanes).
+/// One track's grid block: every lane strip, edge to edge with zero spacing,
+/// closed by a thin separation bar. All controls live in the mixer panel —
+/// this block's height is exactly [`App::track_h`], which the mixer shares.
 fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: f64) {
-    let sel = app.selected == t;
-    let rec = app.backend.engine.rec_state_of(t) == TR_REC;
-    let on = app.backend.engine.track_on(t);
-    let clips: usize = app.arr.tracks[t].lanes.iter().map(|l| l.clips.len()).sum();
-    ui.add_space(3.0);
-    let head = ui.horizontal(|ui| {
-        let head = ui
-            .selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong())
-            .on_hover_text("Click to select \u{b7} right-click anywhere in the header clears this track's clips");
-        if head.clicked() {
-            app.selected = t;
-        }
-        let rec_lbl = if rec { "STOP REC" } else { "REC" };
-        if ui
-            .button(RichText::new(rec_lbl).color(if rec { Color32::from_rgb(255, 90, 90) } else { Color32::from_rgb(220, 180, 120) }))
-            .on_hover_text("Record: the take becomes an asset plus a clip at the playhead; recording over an occupied lane opens a child lane automatically")
-            .clicked()
-        {
-            app.toggle_record(t);
-        }
-        if ui
-            .button(if on { "PLAYED" } else { "muted" })
-            .on_hover_text("While the transport runs, a muted track contributes nothing (its clips stay on the timeline)")
-            .clicked()
-        {
-            app.backend.cmd(Cmd::ToggleTrackOn { i: t });
-        }
-        if ui.button("+ child").on_hover_text("Add a child lane (stacks additively)").clicked() {
-            app.arr.add_lane(t);
-            app.push_project();
-        }
-        let nl = app.arr.tracks[t].lanes.len();
-        if nl > 1 && ui.button("- child").on_hover_text("Remove the last child lane").clicked() {
-            app.arr.remove_lane(t, nl - 1);
-            app.push_project();
-        }
-        ui.label(RichText::new(format!("{} clip(s) \u{b7} {} lane(s)", clips, nl)).weak().small());
-    });
-    // Right-click anywhere on the header removes the track's clips. Read
-    // from the global pointer state and hit-tested against the header rect:
-    // 0.36 has no secondary-only Sense, and a click-sensing overlay would
-    // steal primary clicks from the buttons underneath.
-    let rmb = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
-    if rmb && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| head.response.rect.contains(p)) {
-        app.clear_track(t);
+    let th = app.track_h(t);
+    let nl = app.arr.tracks[t].lanes.len().max(1);
+    let lane_h = th / nl as f32;
+    for k in 0..nl {
+        lane_row(ui, app, t, k, w, px, sr, lane_h);
     }
-    // Mixer is always visible (was: only the selected track). The FX button
-    // sits directly right of the slider stack, with the chain chips below it.
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            for kind in [KIND_VOL, KIND_GAIN, KIND_PAN] {
-                level_row(ui, app, t, kind);
-            }
-        });
-        ui.vertical(|ui| {
-            if ui
-                .button("FX")
-                .on_hover_text("This track's effects: enable scripts, reorder the chain, open parameter editors")
-                .clicked()
-            {
-                app.fx_window = Some(t);
-            }
-            fx_buttons(ui, app, t);
-        });
-    });
-    for k in 0..app.arr.tracks[t].lanes.len() {
-        lane_row(ui, app, t, k, w, px, sr);
-    }
+    let (r, _) = ui.allocate_exact_size(egui::vec2(w, TRACK_SEP), Sense::hover());
+    ui.painter().rect_filled(r, 0.0, Color32::from_rgb(56, 56, 64));
 }
 
 /// One lane strip: grid + clips + interactions, clipped to its own rect and
@@ -2421,8 +2806,9 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
 /// grid scrubs the playhead; clips drag with snap; rack drags arrive through
 /// egui's native drag-and-drop (the old cross-response handoff dropped
 /// nothing because the rack owned the pointer).
-fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f64, sr: f64) {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), Sense::click_and_drag());
+#[allow(clippy::too_many_arguments)] // (grid geometry) + (view state) tuples read worse
+fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f64, sr: f64, h: f32) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag());
     let x0 = rect.min.x - app.hscroll;
     let snapu = app.snap_unit();
     let sel_clip = app.sel_clip;
@@ -2444,7 +2830,7 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
     ui.painter().text(
         rect.min + egui::vec2(4.0, 1.0),
         egui::Align2::LEFT_TOP,
-        if k == 0 { "track" } else { "child" },
+        format!("T{} {}", t + 1, if k == 0 { "track" } else { "child" }),
         egui::FontId::proportional(9.0),
         Color32::from_gray(110),
     );
@@ -2525,7 +2911,10 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
         }
         return; // the drop consumed this frame's pointer
     }
+    // Any primary press in the grid remembers this track as the paste
+    // target ("paste into the nearest track to the last click").
     if resp.drag_started_by(egui::PointerButton::Primary) {
+        app.last_click_track = Some(t);
         if let Some(pt) = resp.interact_pointer_pos() {
             if rect.contains(pt) {
                 let pos = s_at(x0, pt.x, sr, px);
@@ -2571,6 +2960,7 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
         // if the click landed on empty grid.
         if let Some(pt) = resp.interact_pointer_pos() {
             if rect.contains(pt) {
+                app.last_click_track = Some(t);
                 let pos = s_at(x0, pt.x, sr, px);
                 match clips.iter().position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset)) {
                     Some(ci) => app.sel_clip = Some((t, k, ci)),
@@ -2581,6 +2971,14 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
                 }
             }
         }
+    }
+    // Right-click anywhere in the track's grid clears its clips — the old
+    // header gesture (headers moved to the mixer). Read from the global
+    // pointer state: 0.36 has no secondary-only Sense, and a click-sensing
+    // overlay would steal primary clicks from the widgets underneath.
+    let rmb = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+    if rmb && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| rect.contains(p)) {
+        app.clear_track(t);
     }
 }
 
@@ -2764,7 +3162,7 @@ fn level_parse(kind: u8, s: &str) -> Option<u8> {
                 return None;
             }
             let v = match kind {
-                KIND_VOL => 127.0 + db * (127.0 / 60.0),
+                KIND_VOL => vol_midi(db) as f32,
                 _ => GAIN_UNITY_MIDI as f32 + db / 0.215,
             };
             Some(v.round().clamp(1.0, 127.0) as u8)
@@ -3931,13 +4329,15 @@ mod tests {
         };
         assert_eq!(total(&app), 1, "drag-drop placed exactly one clip");
         assert!(app.sel_clip.is_some(), "the dropped clip is selected");
-        assert_eq!(app.status, "clip placed on track 1 \u{b7} track");
+        assert_eq!(app.status, "clip placed on track 2 \u{b7} track");
 
         // Right-click the Track-1 header (probe the small header band): it
         // must clear the clip.
         let mut cleared = false;
-        for y in (104..=150).step_by(3) {
-            let p = egui::pos2(300.0, y as f32);
+        // Right-click now lives on the track's grid strip (headers moved to
+        // the mixer): sweep the drop lane's vertical neighbourhood.
+        for y in (198..=236).step_by(3) {
+            let p = egui::pos2(500.0, y as f32);
             frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
             frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
             if total(&app) == 0 {
@@ -3949,6 +4349,38 @@ mod tests {
     }
 
     #[test]
+    fn loop_region_follows_mode() {
+        let mut app = headless_app("loopmode");
+        // 120 bpm, 4/4 at 48 kHz -> one bar = 96_000 samples.
+        app.metro_bpm = "120".into();
+        app.metro_num = "4".into();
+        assert_eq!(app.bar_samples(), 96_000);
+        app.loop_mode = 0;
+        app.loop_area = (0, 0);
+        assert_eq!(app.loop_region_eff(), (0, 192_000), "area default = 2 bars");
+        app.loop_area = (24_000, 96_000);
+        assert_eq!(app.loop_region_eff(), (24_000, 96_000), "dragged handles win");
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        let len = app.asset_len(a);
+        app.loop_mode = 1;
+        app.arr.insert(0, 0, Clip { asset: a, pos: 48_000 });
+        assert_eq!(app.loop_region_eff(), (0, 48_000 + len), "longest = last clip end");
+        app.loop_mode = 2;
+        assert_eq!(app.loop_region_eff(), (0, app.total_len()));
+    }
+
+    #[test]
+    fn track_height_grows_with_lanes() {
+        let mut app = headless_app("trackh");
+        assert_eq!(app.track_h(0), 96.0, "one lane = the mixer minimum");
+        app.arr.add_lane(0);
+        assert_eq!(app.track_h(0), 96.0, "two lanes still fit the minimum");
+        app.arr.add_lane(0);
+        assert_eq!(app.track_h(0), 144.0, "three lanes extend the track");
+    }
+
+    #[test]
     fn key_names_roundtrip() {
         for k in [egui::Key::A, egui::Key::Num3, egui::Key::F7, egui::Key::Space, egui::Key::M] {
             assert_eq!(key_from_name(&key_debug(k)), Some(k), "roundtrip {k:?}");
@@ -3957,10 +4389,20 @@ mod tests {
 
     #[test]
     fn level_text_roundtrip() {
-        // Volume: 127 = 0 dB; dB text parses back to the same knob.
-        let s = level_display(KIND_VOL, 127);
-        assert_eq!(level_parse(KIND_VOL, &s), Some(127));
+        // Volume spans -inf..=+6 dB: 0 = -inf, VOL_UNITY_MIDI = 0 dB,
+        // 127 = +6 dB, and every dB text parses back to the same knob.
+        assert_eq!(db_num(vol_amp(0)), "-inf");
+        assert_eq!(level_display(KIND_VOL, VOL_UNITY_MIDI), "+0.0");
+        assert_eq!(level_display(KIND_VOL, 127), "+6.0");
+        assert_eq!(level_parse(KIND_VOL, "+0.0"), Some(VOL_UNITY_MIDI));
+        assert_eq!(level_parse(KIND_VOL, "+6.0"), Some(127));
         assert_eq!(level_parse(KIND_VOL, "-inf"), Some(0));
+        assert_eq!(level_parse(KIND_VOL, "-12.3"), Some(vol_midi(-12.3)));
+        // Monotone over the whole range, and unity sits at 0 dB exactly.
+        for v in 1..127u8 {
+            assert!(vol_amp(v) < vol_amp(v + 1), "vol_amp not monotone at {v}");
+        }
+        assert!((20.0 * vol_amp(VOL_UNITY_MIDI).log10()).abs() < 0.02);
         // Pan: centre reads 0.
         let s = level_display(KIND_PAN, 64);
         assert_eq!(s, "0");

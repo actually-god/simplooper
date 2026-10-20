@@ -39,10 +39,11 @@ timeline while you play.
      mono downmix (the default behaviour).
    - **Apply Selection**. Your choice is remembered and re-applied
      automatically on every launch, including when the JACK graph rebuilds.
-4. Add audio: **+ folder** in the asset rack (left panel) points simplooper
-   at a directory of samples/backing tracks. The **first folder is the
-   primary folder** — everything you record is written there as WAV, so one
-   folder holds both your starting material and your growing take library.
+4. The **asset rack** (left panel) opens on the bundled **TR-808 pack** —
+   drag any file onto the grid to hear it. **+ folder** points simplooper at
+   more samples/backing tracks; the **first folder is the primary folder** —
+   everything you record is written there as WAV, so one folder holds both
+   your starting material and your growing take library.
 5. Live input **monitoring** rides the *selected* track's chain: its gain ×
    volume × effects × pan shape the pass-through, so you hear exactly what
    that track will do to your signal. Takes always capture the raw,
@@ -52,25 +53,35 @@ timeline while you play.
 
 | Region | Contents |
 | --- | --- |
-| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · **loop** checkbox · bar.beat position · **metro** + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** · peak meter · master gain |
+| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **metro** + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** · peak meter · **master volume** (−∞…+6 dB) |
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
-| **Grid toolbar** | auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
-| **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs, playhead visible while stopped) + one block per track: header row, always-visible mixer, and one lane strip per lane — all sharing one horizontal scroll, so ruler and lane grids stay aligned |
+| **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
+| **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles |
+| **Mixer** (right dock) | one strip per track, vertically aligned with its timeline block: **name · REC · PLAYED/muted · +child/−child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout) and **FX…**; strips scroll in lockstep with the timeline |
 | **Bottom** | MIDI monitor (every event on `simplooper:midi_in`) |
 
-Each **track header** holds: the track name (click the row to select the
-track), **REC** (turns **STOP REC** while rolling), the play gate
-(**PLAYED** ⇄ **muted** — a muted track contributes nothing while its clips
-stay put), **+ child** / **- child** (add/remove child lanes), and a
-`N clips · M lanes` status. **Right-click the header** removes the track's
-clips (assets stay in the rack; same as `C`).
+Each **mixer strip** holds the track's whole control surface: the name row
+(click it to select the track — the strip tints), **REC** (turns **STOP REC**
+while rolling), the play gate (**PLAYED** ⇄ **MUTED** — a muted track
+contributes nothing while its clips stay put), **+ child** / **− child**
+(add/remove child lanes), `N clips · M lanes` status, the **vol / gain /
+pan** sliders with editable dB / −100…+100 text boxes (+ raw MIDI readout),
+and **FX…** opening that track's chain. **vol** and **master volume** both
+run −∞…+6 dB (0 dB = unity at three-quarters of the slider).
 
-Every track shows its **vol / gain / pan** sliders (editable dB /
-−100…+100 text boxes + raw MIDI readout) and an **fx** button directly to
-their right — no selection needed; the button opens that track's FX chain.
-Tracks with effects show their chain inline below the sliders.
+Tracks sit flush against each other in the timeline — just a hairline
+separator between blocks, one unbroken playhead line, and tall lanes meant
+for stacking lots of clips. **Right-click a track's lane area** removes that
+track's clips (assets stay in the rack; same as `C`), whether you press on
+empty grid or on a clip.
 
 ## The asset rack
+
+A fresh install ships a **bundled TR-808 pack** — fourteen one-shots sampled
+from a real Roland TR-808 (kick, sub, snares, clap, hats, crash, cowbell,
+three toms, rimshot, clave; provenance in `samples/808/CREDITS.md`). It's
+seeded into `~/.local/share/simplooper/samples/808` on startup and is the
+default rack folder until you add your own.
 
 Folders at the top, audio under each. Drag any file row onto any lane to
 place it; click a row to **select the asset** — three buttons then act on
@@ -105,9 +116,14 @@ it:
   the last one (its clips go with it — base lane only ever survives).
   Recording or dropping onto an occupied base lane **opens a child lane
   automatically** instead of touching existing clips.
-- **Clear**: **right-click the track header** (or press `C` on the selected
-  track) removes the track's clips (all lanes except the base, which empties
-  too); your rack assets stay untouched.
+- **Copy & paste**: click a clip, `Ctrl+C` (or right-click → **Copy clip**),
+  then `Ctrl+V` — the copy lands on the **nearest track to your last click**
+  at the playhead, snapped, in an auto child lane if that spot is occupied.
+  `Ctrl+D` duplicates a selected clip in place.
+- **Clear**: **right-click the track's lane area** (or press `C` on the selected
+  track) removes that track's clips (all lanes except the base, which empties
+  too); your rack assets stay untouched. Right-clicking directly **on a clip**
+  copies that clip instead.
 
 ## Recording takes
 
@@ -139,8 +155,20 @@ is **never** captured into a take.
   follows. The red line + position readout
   (`bar.beat` in project time signature) always show where you are, running
   or not.
-- **loop** (default on) wraps the playhead at the project end forever;
-  off, it parks at the end and the transport stops.
+- **Looping** (grid toolbar): the **loop** toggle plus a mode dropdown,
+  greyed while looping is off:
+
+  | Mode | Behaviour |
+  | --- | --- |
+  | **current longest** (default) | wraps at the end of the longest playing clip — the classic looper feel |
+  | **whole song** | wraps at the project end |
+  | **area** | wraps between a **start and end handle** shown on the ruler (default bar 1 → bar 2); drag either handle anywhere, snap subdivision respected; **Reset** snaps them back |
+
+  With looping off the playhead parks at the region end and the transport
+  stops.
+- **Zoom & scroll**: the grid-toolbar zoom slider, or **Ctrl + mouse wheel**
+  anywhere over the grid; **Shift + mouse wheel** scrolls horizontally, plain
+  wheel scrolls the track stack vertically.
 - **Play all / Stop all** are also separate MIDI/keyboard actions
   (`MidiAction::PlayAll` / `StopAll`) — `Space` toggles, `StopAll` always
   parks. Per-track **play gates** (PLAYED/muted) and per-track
@@ -232,6 +260,9 @@ in **any** text box, and auto-repeat never re-fires):
 | `Ctrl+S` | save project (name prompt on first save) |
 | `Ctrl+Shift+S` | save under a new name |
 | `Delete` | remove the selected clip (when a clip is selected) |
+| `Ctrl+C` | copy the selected clip (or the last one clicked) |
+| `Ctrl+V` | paste at the playhead, on the track nearest your last click |
+| `Ctrl+D` | duplicate the selected clip |
 
 ## MIDI control
 
@@ -304,7 +335,7 @@ output mix are never delayed, so nothing drifts.
 | --- | --- |
 | "no JACK server" / connection error on launch | Start PipeWire or `jackd` first — simplooper never starts a server itself (`NO_START` by design). |
 | No sound although the engine shows ready | ☰ settings → tick output (and input) ports → **Apply Selection**. Selections persist, but if your hardware changed, re-apply. |
-| Record button does nothing | The rack needs a **primary folder** — takes are saved there before they can become clips. Press **+ folder** in the asset rack; the status line names the reason. |
+| Record button does nothing | Takes write into the **primary (first) rack folder** before they can become clips — the bundled 808 pack covers you by default, but if you removed every folder, press **+ folder**; the status line names the reason. |
 | Recorded clip starts early/late | Settings → latency (ms); and check **auto-quantize**/**snap** for grid drift you can *hear*. |
 | Clips skip at the loop wrap | Lengths that don't divide the bar grid: select the asset → **Quantize**, or enable **auto-quantize**. |
 | MIDI not seen | Check the bottom MIDI monitor panel; make sure a source is connected to `simplooper:midi_in`. |

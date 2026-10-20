@@ -74,13 +74,6 @@ const GAIN_MAX_LIN: f32 = 1.584_893_2;
 /// Seek sentinel in the engine's seek slot: "no seek pending".
 pub const NO_SEEK: u64 = u64::MAX;
 
-/// Per-track volume fader: MIDI 0..=127 → linear amplitude 0..=1
-/// (0 = silence / -inf dB, 127 = 0 dB).
-#[inline]
-pub fn vol_amp(v: u8) -> f32 {
-    v as f32 / 127.0
-}
-
 /// Per-track gain trim: MIDI 0..=127 → linear amplitude (0 = silence / -inf,
 /// [`GAIN_UNITY_MIDI`] = unity / 0 dB, 127 = +12 dB).
 #[inline]
@@ -167,8 +160,15 @@ pub enum Cmd {
     StopAll,
     /// Move the playhead (samples). Scrubbing sends these continuously.
     Seek { pos: u64 },
-    /// Timeline loop toggle: wrap at the end of the project vs. park there.
+    /// Timeline loop toggle: wrap the playhead at the loop region's end vs.
+    /// park at the project end.
     SetLoop(bool),
+    /// The active loop region in samples: wrap from `start` to `end`. The
+    /// GUI computes `end` from the loop mode (area handles, current-longest
+    /// track content, or whole-song end) on every edit; `end = 0` means
+    /// "wrap at the project end". Only consulted while [`Cmd::SetLoop`] is
+    /// on — with the loop off the transport still parks at the project end.
+    SetLoopRegion { start: u64, end: u64 },
     /// Replace the engine's project snapshot (assets + arrangement + total
     /// length). The RT handler picks the new Arcs up on the next cycle.
     SetProject { assets: Arc<AssetTable>, arr: Arc<Arrangement>, len: u64 },
@@ -347,6 +347,11 @@ pub struct Engine {
     transport_on: AtomicU8,
     /// 1 = wrap the playhead at the project end, 0 = park at the end.
     loop_tl: AtomicU8,
+    /// Loop region (samples): wrap from `loop_start` back to it at
+    /// `loop_end`; `loop_end = 0` means "the project end". Set by the GUI
+    /// from the loop mode (`Cmd::SetLoopRegion`).
+    loop_start: AtomicU64,
+    loop_end: AtomicU64,
     /// Playhead position in timeline samples (published by RT, seeks written
     /// by the manager through `seek`).
     pos: AtomicU64,
@@ -411,6 +416,8 @@ impl Engine {
             take_pending: AtomicU64::new(0),
             transport_on: AtomicU8::new(0),
             loop_tl: AtomicU8::new(1),
+            loop_start: AtomicU64::new(0),
+            loop_end: AtomicU64::new(0),
             pos: AtomicU64::new(0),
             seek: AtomicU64::new(NO_SEEK),
             // Empty project: an idle timeline as long as a take buffer, so
@@ -536,6 +543,13 @@ impl Engine {
 
     pub fn loop_tl(&self) -> bool {
         self.loop_tl.load(Ordering::Relaxed) != 0
+    }
+    pub fn set_loop_region(&self, start: u64, end: u64) {
+        self.loop_start.store(start, Ordering::Relaxed);
+        self.loop_end.store(end, Ordering::Relaxed);
+    }
+    pub fn loop_region(&self) -> (u64, u64) {
+        (self.loop_start.load(Ordering::Relaxed), self.loop_end.load(Ordering::Relaxed))
     }
 
     pub fn set_loop_tl(&self, on: bool) {
@@ -969,6 +983,7 @@ fn run(
             }
             Ok(Cmd::Seek { pos }) => engine.seek_to(pos),
             Ok(Cmd::SetLoop(on)) => engine.set_loop_tl(on),
+            Ok(Cmd::SetLoopRegion { start, end }) => engine.set_loop_region(start, end),
             Ok(Cmd::SetProject { assets, arr, len }) => {
                 engine.set_project(assets, arr, len);
             }
@@ -1339,6 +1354,21 @@ fn port_info(full_name: &str) -> PortInfo {
     PortInfo { name: full_name.to_string(), client }
 }
 
+/// Clamp a loop-region request to the live project: `ls` never past the
+/// end, and a degenerate `le` (at/behind `ls`, past the end, or 0 = "whole
+/// song") falls back to the project end. Pure so it is unit-testable.
+fn clamp_loop_region(ls: u64, le: u64, proj_len: u64) -> (u64, u64) {
+    let ls = ls.min(proj_len.saturating_sub(1));
+    let le = if le <= ls || le > proj_len { proj_len } else { le };
+    (ls, le)
+}
+
+/// Region wrap: `Some(ls)` when `pos` reached the region end (bounce back
+/// to the start), `None` to keep rolling. Pure so it is unit-testable.
+fn wrap_pos(pos: u64, ls: u64, le: u64) -> Option<u64> {
+    (pos >= le).then_some(ls)
+}
+
 /// Notification handler: keeps the GUI port list live and counts xruns.
 struct Notif {
     tx: SyncSender<Evt>,
@@ -1638,17 +1668,36 @@ impl ProcessHandler for Proc {
         if let Some(p) = seek {
             self.pos = p.min(proj_len);
         }
-        let p0 = self.pos;
+        let mut p0 = self.pos;
         // Does the clock advance this block? Transport on = full playback;
         // a bare metronome keeps the (always-visible) playhead rolling on
         // the grid without sounding clips. Transport stopped AND metro off:
         // the playhead holds — stop means stop.
         let advance = transport || metro_on;
-        // End handling for a non-looping transport: clip the block at the
-        // project end and park there (auto-stop).
+        // The active loop region (samples): a looping transport wraps from
+        // `ls` back at `le`. Degenerate requests fall back to the whole
+        // project (`le = 0` means "the project end").
+        let (ls, le) = clamp_loop_region(
+            self.engine.loop_region().0,
+            self.engine.loop_region().1,
+            proj_len,
+        );
+        // End handling: looping clips the block at the region end (wrapped
+        // after the sample loop); non-looping clips at the project end and
+        // parks there (auto-stop).
         let mut block_n = n;
         let mut auto_stop = false;
-        if advance && !looping && p0.saturating_add(n as u64) > proj_len {
+        if advance && looping {
+            // Playhead outside the region (a handle dragged under it, or a
+            // seek beyond it): re-enter at the region start.
+            if p0 < ls || p0 >= le {
+                p0 = ls;
+                self.pos = ls;
+            }
+            if p0.saturating_add(n as u64) > le {
+                block_n = (le - p0) as usize;
+            }
+        } else if advance && p0.saturating_add(n as u64) > proj_len {
             block_n = (proj_len - p0.min(proj_len)) as usize;
             auto_stop = true;
         }
@@ -1897,16 +1946,21 @@ impl ProcessHandler for Proc {
         // Give the clip window list back for the next block.
         self.clip_buf = entries;
 
-        // Continuous loop: at the project end the playhead wraps; a
-        // non-looping transport parks at the end and auto-stops (an event
-        // wakes the GUI so its button mirrors reality).
+        // Continuous loop: at the loop region end the playhead wraps back to
+        // the region start; a non-looping transport parks at the project end
+        // and auto-stops (an event wakes the GUI so its button mirrors
+        // reality). The block was clipped at `le`, so one wrap per block.
         if advance {
-            if looping && pos_now >= proj_len {
-                pos_now -= proj_len;
-                // Wrap re-anchors the metronome grid without a burst.
-                self.metro_idx = (pos_now as f64 / sub_len).ceil() as i64 - 1;
+            if looping {
+                if let Some(wrapped) = wrap_pos(pos_now, ls, le) {
+                    pos_now = wrapped;
+                    // Wrap re-anchors the metronome grid without a burst.
+                    self.metro_idx = (pos_now as f64 / sub_len).ceil() as i64 - 1;
+                }
+                self.pos = pos_now;
+            } else {
+                self.pos = pos_now.min(proj_len);
             }
-            self.pos = pos_now.min(proj_len);
         }
         if auto_stop && transport {
             self.engine.set_transport(false);

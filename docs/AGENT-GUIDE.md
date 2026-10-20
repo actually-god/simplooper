@@ -65,9 +65,14 @@ src/            application source (Rust 2021 edition)
   ports.rs        JACK port enumeration helpers
   quantize.rs     metronome grid math, content quantize, silence trim,
                   zero-crossing refinement + seam crossfade
+  samples808.rs   bundled TR-808 pack: WAVs embedded via include_bytes!,
+                  seeded to $XDG_DATA_HOME/simplooper/samples/808 on startup
+                  (size-compare, so deletions self-heal); default rack folder
   ui.rs           the whole egui app (top bar transport, asset rack, grid
-                  toolbar, timeline lanes + playhead scrub, settings,
-                  project prompt/browser, export, MIDI monitor)
+                  toolbar with loop controls, seamless per-track lane blocks
+                  + ruler + loop handles + playhead scrub, Mixer dock aligned
+                  per track, copy/paste buffer, settings, project
+                  prompt/browser, export, MIDI monitor)
 effects/        effect-script authoring kit: template.rs (start here),
                 effect_api.rs (ABI), parametric_eq.rs, space_echo.rs examples
 examples/       small dev utilities run via `cargo run --example <name>`
@@ -82,8 +87,8 @@ docs/           INSTALL.md, USAGE.md (human docs)
 
 | Command | Notes |
 | --- | --- |
-| `cargo build --release` | release profile: LTO + panic=abort; ~13 MB binary |
-| `cargo test -- --test-threads=1` | full suite (78 lib + 7 e2e); e2e tests **self-skip** without a live JACK server |
+| `cargo build --release` | release profile: LTO + panic=abort; ~15 MB binary |
+| `cargo test -- --test-threads=1` | full suite (85 lib + 7 e2e); e2e tests **self-skip** without a live JACK server |
 | `cargo clippy --all-targets` | repo standard: zero warnings |
 | `PKGBUILD_PATH=/path/to/aur/checkout/PKGBUILD ./tests/packaging.sh` | packaging checks (the PKGBUILD now lives in the AUR package repo) |
 
@@ -121,9 +126,16 @@ concurrent e2e runs starve each other's JACK clients ("ensemble stalled").
    output-only, never recorded; a take always becomes a rack asset **and**
    an auto-placed clip, and overlaps open child lanes instead of touching
    existing clips; quantize is always metronome-based; the primary rack
-   folder is a hard prerequisite for recording; loop wrap is a user
-   toggle, default on. Code aligns to them; changing behavior means
-   deliberately updating tests + docs.
+   folder is a hard prerequisite for recording (the seeded 808 pack supplies
+   one by default); looping is a user toggle (default on, mode
+   *current longest*) with area / longest / whole-song modes — area handles
+   drag with snap; paste targets
+   the track nearest the last click at the playhead. Code aligns to them;
+   changing behavior means deliberately updating tests + docs.
+   **Track geometry is shared state**: the timeline and the Mixer dock draw
+   from one `row_h` cursor map rebuilt every frame (`App::track_rows`,
+   `track_seq`) — if you touch track layout, both consumers must agree on
+   block heights (header 22 + 58px lanes + 2px separators, no gaps).
 4. **Audio server**: keep `NO_START`; never auto-spawn jackd or bypass JACK.
 5. **Packaging**: the AUR `PKGBUILD` (separate repo) fetches the GitHub
    **tag tarball**; `pkgver` must equal the `Cargo.toml` version, and
@@ -140,6 +152,8 @@ concurrent e2e runs starve each other's JACK clients ("ensemble stalled").
 - Commands/events: `Cmd::` / `Evt::` in `src/audio.rs` (take placement
   lands in the manager thread's `Evt::Take` handler)
 - Clip/lane rules: `src/arrange.rs` (`insert`, `place_auto`, `remove_lane`)
+- Loop region math: `loop_wrap`/`region_end` (`src/audio.rs`); handles +
+  modes in the grid toolbar (`src/ui.rs`, `LoopMode`)
 - Project format + migration: `src/project.rs`, `midi::migrate_shortcuts`
 - All bindable actions + key defaults: `MidiAction::ALL`, `SHORTCUT_DEFAULTS` (`src/ui.rs`)
 - Effect ABI (audio v1 + GUI v1): `src/effect_api.rs`
