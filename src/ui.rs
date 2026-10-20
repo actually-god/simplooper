@@ -331,8 +331,12 @@ const COL_BEAT_LINE: Color32 = Color32::from_gray(68);
 /// aligned strip-to-track.
 const LANE_H: f32 = 48.0;
 const TRACK_MIN_H: f32 = 96.0;
+/// Smallest height a lane may be squeezed to when the user resizes a track.
+const LANE_MIN_H: f32 = 36.0;
 /// Separation bar painted between adjacent tracks (the only gap left).
 const TRACK_SEP: f32 = 3.0;
+/// Hit height around the separation bar — it doubles as the resize handle.
+const TRACK_SEP_HIT: f32 = 7.0;
 /// Loop region modes (see [`App::loop_mode`]); index = config value.
 const LOOP_MODES: [&str; 3] = ["area", "current longest", "whole song"];
 
@@ -418,6 +422,17 @@ pub struct App {
     /// Vertical scroll offset of the track stack, shared with the mixer
     /// panel so each mixer strip stays aligned with its track.
     vscroll: f32,
+    /// Per-track grid-block height in points (0 = automatic:
+    /// `lanes × LANE_H`). The user drags the separation bar under a track
+    /// to resize it; the mixer strip mirrors the same height.
+    trk_height: Vec<f32>,
+    /// Active separation-bar drag: (track, height at drag start, pointer y
+    /// at drag start). Growing a track never resizes its neighbours.
+    sep_drag: Option<(usize, f32, f32)>,
+    /// Absolute y of the timeline track stack's top edge, measured each
+    /// frame by the central panel; the mixer aligns its strips to it (one
+    /// frame late at most) so strip ↔ track can never drift apart.
+    grid_anchor: f32,
     /// Selected clip (track, lane, clip index).
     sel_clip: Option<(usize, usize, usize)>,
     /// Track owning the last primary press inside the grid — clipboard
@@ -614,6 +629,11 @@ impl App {
             scrub_drag: false,
             hscroll: 0.0,
             vscroll: 0.0,
+            trk_height: (0..MAX_LOOPS)
+                .map(|i| cfg.trk_h.get(i).copied().unwrap_or(0.0))
+                .collect(),
+            sep_drag: None,
+            grid_anchor: 0.0,
             sel_clip: None,
             last_click_track: None,
             copied_asset: None,
@@ -847,7 +867,9 @@ impl App {
                     let t = self.last_click_track.unwrap_or(self.selected);
                     let len = self.asset_len(a);
                     let pos = self.backend.engine.pos();
+                    let nl0 = self.arr.tracks[t].lanes.len();
                     let lane = self.arr.place_auto(t, a, len, pos);
+                    self.grow_for_lanes(t, nl0);
                     let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
                     self.sel_clip = Some((t, lane, li));
                     self.push_project();
@@ -1224,10 +1246,38 @@ impl App {
     }
 
     /// Height of one track's grid block — and of the mixer strip aligned
-    /// with it (both read this, so they can never drift apart).
+    /// with it (both read this, so they can never drift apart). User-resized
+    /// via the separation bar under each track; lanes inside share it equally.
     fn track_h(&self, t: usize) -> f32 {
         let lanes = self.arr.tracks[t].lanes.len().max(1) as f32;
-        (lanes * LANE_H).max(TRACK_MIN_H)
+        let auto = (lanes * LANE_H).max(TRACK_MIN_H);
+        let floor = (lanes * LANE_MIN_H).max(TRACK_MIN_H);
+        match self.trk_height.get(t).copied().unwrap_or(0.0) {
+            0.0 => auto,
+            h => h.max(floor),
+        }
+    }
+
+    /// User height for track `t` (clamped to the lane floor and a sane max).
+    fn set_track_h(&mut self, t: usize, h: f32) {
+        let floor = (self.arr.tracks[t].lanes.len().max(1) as f32 * LANE_MIN_H)
+            .max(TRACK_MIN_H);
+        if let Some(s) = self.trk_height.get_mut(t) {
+            *s = h.clamp(floor, 1600.0);
+        }
+    }
+
+    /// A new child lane must NOT shrink the lanes above it: grow the track
+    /// by one old-lane height so every lane keeps the height it had.
+    fn grow_for_lanes(&mut self, t: usize, old_lanes: usize) {
+        let old_lanes = old_lanes.max(1);
+        let new = self.arr.tracks[t].lanes.len().max(1);
+        if new > old_lanes {
+            let per = self.track_h(t) / old_lanes as f32;
+            let want = new as f32 * per;
+            let cur = self.trk_height.get(t).copied().unwrap_or(0.0);
+            self.set_track_h(t, cur.max(want));
+        }
     }
 
     fn push_project(&mut self) {
@@ -1285,6 +1335,7 @@ impl App {
             trk_vol: self.trk_vol.to_vec(),
             trk_gain: self.trk_gain.to_vec(),
             trk_pan: self.trk_pan.to_vec(),
+            trk_h: self.trk_height.clone(),
             metro_bpm: self.bpm(),
             metro_sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
             metro_num: self.beats(),
@@ -1376,7 +1427,9 @@ impl App {
         self.assets.push(Asset { id, name, path, data, dirty });
         self.sel_asset = Some(id as usize);
         let pos = snap_start(at, self.snap_unit());
+        let nl0 = self.arr.tracks[track].lanes.len();
         let lane = self.arr.place_auto(track, id, len, pos);
+        self.grow_for_lanes(track, nl0);
         self.push_project();
         self.status = format!("track {}: recorded → clip in lane {}", track + 1, lane + 1);
     }
@@ -1674,6 +1727,10 @@ impl App {
         }
         self.assets = assets;
         self.arr = arr;
+        // Heights are a per-session view; the new arrangement starts fresh.
+        for h in self.trk_height.iter_mut() {
+            *h = 0.0;
+        }
         self.wave.clear();
         self.sel_asset = None;
         self.sel_clip = None;
@@ -1990,6 +2047,42 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // ---- global wheel routing (must run first thing in the frame) ----
+        // Ctrl/Cmd+wheel zooms the timeline (same state as the zoom slider);
+        // Shift+wheel pans it horizontally. egui turns MouseWheel into
+        // smooth_scroll_delta (and its own interface zoom) while processing
+        // input — BEFORE any panel code runs — so the only reliable place to
+        // claim those gestures is here: remove the raw events and zero the
+        // deltas, then apply them ourselves. Plain wheel is left alone so
+        // ScrollAreas (rack, mixer, track stack) keep scrolling normally.
+        let mut zoom = 0.0f32;
+        let mut pan = 0.0f32;
+        ui.ctx().input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::MouseWheel { delta, modifiers, .. } => {
+                    if modifiers.command || modifiers.ctrl {
+                        zoom += delta.y;
+                        false
+                    } else if modifiers.shift {
+                        pan += delta.x + delta.y;
+                        false
+                    } else {
+                        true
+                    }
+                }
+                _ => true,
+            });
+            if zoom != 0.0 || pan != 0.0 {
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+            }
+        });
+        if zoom != 0.0 {
+            self.px_per_sec = (self.px_per_sec * (1.0 + zoom * 0.006)).clamp(24.0, 1200.0);
+        }
+        if pan != 0.0 {
+            self.hscroll = (self.hscroll - pan * 2.0).max(0.0);
+        }
+
         // Master volume: same -inf..=+6 dB MIDI mapping as every track.
         let mamp = vol_amp(self.master_midi);
         self.backend.gain.store(mamp.to_bits(), Ordering::Relaxed);
@@ -2027,6 +2120,9 @@ impl App {
         if !ui.ctx().input(|i| i.pointer.any_down()) {
             self.scrub_drag = false;
             self.drag_loop_handle = None;
+            if self.sep_drag.take().is_some() {
+                self.save_config();
+            }
         }
 
         if self.show_export {
@@ -2413,9 +2509,18 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
             let base = ui.available_rect_before_wrap();
             // Clip to the visible column, then lay strips out on absolute
             // rects shifted by the grid's vertical scroll (shared offset —
-            // the alignment is the whole point of this panel).
+            // the alignment is the whole point of this panel). The column
+            // starts at the timeline track stack's top edge (measured last
+            // frame by `central_panels`), so strips sit level with tracks
+            // even though the two panels' headers differ in height; any
+            // leftover room between panels is intentionally left empty.
             ui.shrink_clip_rect(base);
-            let mut y = base.min.y - app.vscroll;
+            let top = if app.grid_anchor > 0.0 {
+                app.grid_anchor.min(base.max.y)
+            } else {
+                base.min.y
+            };
+            let mut y = top - app.vscroll;
             for t in 0..MAX_LOOPS {
                 let th = app.track_h(t);
                 if y + th >= base.min.y && y <= base.max.y {
@@ -2431,7 +2536,7 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
                         |ui| mixer_strip(ui, app, t),
                     );
                 }
-                y += th + TRACK_SEP;
+                y += th + TRACK_SEP_HIT;
             }
             let _ = ui.allocate_exact_size(base.size(), Sense::hover());
         });
@@ -2483,6 +2588,7 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             .clicked()
         {
             app.arr.add_lane(t);
+            app.grow_for_lanes(t, nl);
             app.push_project();
         }
         if nl > 1
@@ -2491,7 +2597,9 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 .on_hover_text("Remove the last child lane")
                 .clicked()
         {
+            let per = app.track_h(t) / nl.max(1) as f32;
             app.arr.remove_lane(t, nl - 1);
+            app.set_track_h(t, per * (nl - 1).max(1) as f32);
             app.push_project();
         }
         ui.label(RichText::new(format!("{clips}c/{nl}L")).weak().small());
@@ -2599,23 +2707,13 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         if ui.input(|i| !i.pointer.any_down()) {
             app.scrub_drag = false;
         }
-        // Wheel routing over the grid: Ctrl/Cmd+wheel zooms the timeline
-        // (same state as the zoom slider), Shift+wheel pans horizontally,
-        // the plain wheel scrolls the track stack. Handled before the
-        // ScrollArea can claim the delta.
+        // Plain horizontal wheel (no modifiers) pans the timeline; the
+        // modifier combos (Ctrl = zoom, Shift = pan) are intercepted at the
+        // top of `ui_root` before egui converts them to scroll deltas.
         let area = ui.available_rect_before_wrap();
         if ui.rect_contains_pointer(area) {
-            let (ctrl, shift) =
-                ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
-            let dy = ui.input(|i| i.smooth_scroll_delta.y);
             let dx = ui.input(|i| i.smooth_scroll_delta.x);
-            if ctrl && dy != 0.0 {
-                app.px_per_sec = (app.px_per_sec * (1.0 + dy * 0.004)).clamp(24.0, 1200.0);
-                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
-            } else if shift && (dx != 0.0 || dy != 0.0) {
-                app.hscroll -= dx + dy;
-                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
-            } else if dx != 0.0 {
+            if dx != 0.0 && !ui.input(|i| i.modifiers.shift) {
                 app.hscroll -= dx;
             }
         }
@@ -2625,6 +2723,7 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         // scroll away with the content), same width + x origin as the lanes.
         ruler_row(ui, app, avail, px, sr);
         let grid_top = ui.cursor().min;
+        app.grid_anchor = grid_top.y;
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2733,15 +2832,23 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
             );
         }
         if app.loop_mode == 0 {
-            for hx in [hx0, hx1] {
+            // Grab bars in loud yellow: this is where the user drags the
+            // loop's start/end. They brighten while one is being dragged.
+            let dragging = app.drag_loop_handle.is_some();
+            for (n, hx) in [hx0, hx1].into_iter().enumerate() {
                 if hx > rect.min.x - 4.0 && hx < rect.max.x + 4.0 {
+                    let held = dragging && app.drag_loop_handle == Some(n as u8);
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(
                             egui::pos2(hx - 3.0, rect.min.y),
                             egui::vec2(6.0, rect.height()),
                         ),
                         1.0,
-                        Color32::from_rgb(130, 185, 255),
+                        if held {
+                            Color32::from_rgb(255, 235, 120)
+                        } else {
+                            Color32::from_rgb(250, 200, 50)
+                        },
                     );
                 }
             }
@@ -2797,8 +2904,39 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
     for k in 0..nl {
         lane_row(ui, app, t, k, w, px, sr, lane_h);
     }
-    let (r, _) = ui.allocate_exact_size(egui::vec2(w, TRACK_SEP), Sense::hover());
-    ui.painter().rect_filled(r, 0.0, Color32::from_rgb(56, 56, 64));
+    // The separation bar doubles as the resize handle: dragging it changes
+    // ONLY the track above (children inside share the new height equally).
+    let (r, sep) = ui.allocate_exact_size(egui::vec2(w, TRACK_SEP_HIT), Sense::drag());
+    let hot = sep.hovered() || app.sep_drag.is_some_and(|(d, _, _)| d == t);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(r.min.x, r.center().y - TRACK_SEP / 2.0),
+            egui::vec2(r.width(), TRACK_SEP),
+        ),
+        0.0,
+        if hot { Color32::from_rgb(96, 96, 116) } else { Color32::from_rgb(56, 56, 64) },
+    );
+    if sep.drag_started_by(egui::PointerButton::Primary) {
+        if let Some(pt) = sep.interact_pointer_pos() {
+            app.sep_drag = Some((t, app.track_h(t), pt.y));
+        }
+    }
+    if sep.dragged() {
+        if let Some((tt, h0, y0)) = app.sep_drag {
+            if tt == t {
+                if let Some(pt) = sep.interact_pointer_pos() {
+                    app.set_track_h(t, h0 + (pt.y - y0));
+                }
+            }
+        }
+    }
+    if sep.drag_stopped() && app.sep_drag.is_some() {
+        app.sep_drag = None;
+        app.save_config();
+    }
+    if sep.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
 }
 
 /// One lane strip: grid + clips + interactions, clipped to its own rect and
@@ -3053,7 +3191,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         _ => app.trk_pan[i],
     };
     let hover = match kind {
-        KIND_VOL => "Track playback volume: 0 = silence (-inf dB), 127 = 0 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
+        KIND_VOL => "Track playback volume: -inf…+6 dB (0 dB = three-quarters). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
         KIND_GAIN => "Track gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
         _ => "Track pan: -100 = hard left, 0 = centre, +100 = hard right (equal power across the L/R outputs). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
     };
@@ -3103,9 +3241,12 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // Slider: raw MIDI range, no value bubble (the box shows the value).
         // Sized to the text box's height so the slider track sits exactly at
         // the text's vertical centre — the rows were misaligned when the
-        // slider kept its own taller default height.
+        // slider kept its own taller default height. Leave room for the
+        // raw-value readout and the reset button.
         let mut v = midi;
-        let sw = (ui.available_width() - if kind == KIND_PAN { 30.0 } else { 50.0 }).max(30.0);
+        let sw = (ui.available_width()
+            - if kind == KIND_PAN { 56.0 } else { 76.0 })
+            .max(30.0);
         let bh = rt.rect.height();
         let r = ui
             .add_sized(egui::vec2(sw, bh), Slider::new(&mut v, 0..=127).show_value(false))
@@ -3123,6 +3264,20 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                 .selectable(false),
         )
         .on_hover_text("Raw MIDI value (0..=127) sent by a bound knob.");
+        // Reset this strip straight to its "0" position.
+        if ui
+            .small_button(RichText::new("0").monospace())
+            .on_hover_text(["Reset volume to 0 dB", "Reset gain to 0 dB", "Center the pan"]
+                [kind as usize])
+            .clicked()
+        {
+            match kind {
+                KIND_VOL => app.set_trk_vol(i, VOL_UNITY_MIDI),
+                KIND_GAIN => app.set_trk_gain(i, GAIN_UNITY_MIDI),
+                _ => app.set_trk_pan(i, 64),
+            }
+            app.levels_dirty = true;
+        }
     });
 }
 
@@ -4314,9 +4469,10 @@ mod tests {
         let y_row = y_row.expect("a rack row was clickable (kick.wav)");
 
         // Drag: press, move past the drag threshold, hover the lane strip of
-        // track 1, release there.
+        // track 1, release there (well inside the lane: the separation bar
+        // under track 0 owns a few pixels above it now).
         let start = egui::pos2(40.0, y_row);
-        let lane = egui::pos2(500.0, 210.0);
+        let lane = egui::pos2(500.0, 240.0);
         frame(&mut app, &ctx, vec![moved(start), btn(start, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, y_row + 6.0))]);
         frame(&mut app, &ctx, vec![moved(egui::pos2(320.0, 170.0))]);
@@ -4336,7 +4492,7 @@ mod tests {
         let mut cleared = false;
         // Right-click now lives on the track's grid strip (headers moved to
         // the mixer): sweep the drop lane's vertical neighbourhood.
-        for y in (198..=236).step_by(3) {
+        for y in (214..=300).step_by(3) {
             let p = egui::pos2(500.0, y as f32);
             frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
             frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
@@ -4421,6 +4577,66 @@ mod tests {
     fn projects_dir_defaults_to_home() {
         let cfg = Config::default();
         assert!(cfg.projects_dir().ends_with("simplooper-projects"));
+    }
+
+    // ---- track resizing, lane growth, wheel routing ----
+
+    #[test]
+    fn separator_resize_is_per_track_and_clamped() {
+        let mut app = headless_app("resize");
+        assert_eq!(app.track_h(0), TRACK_MIN_H, "automatic height");
+        app.set_track_h(0, 200.0);
+        assert_eq!(app.track_h(0), 200.0);
+        assert_eq!(app.track_h(1), TRACK_MIN_H, "a sibling keeps its own height");
+        app.set_track_h(0, 10.0);
+        assert_eq!(app.track_h(0), TRACK_MIN_H, "clamped to the lane floor");
+    }
+
+    #[test]
+    fn new_lane_duplicates_a_lanes_height() {
+        // The child lane must not steal room from the parent: the track
+        // grows by one old-lane height so every lane keeps its size.
+        let mut app = headless_app("grow");
+        app.set_track_h(0, 200.0);
+        app.arr.tracks[0].add_lane();
+        app.grow_for_lanes(0, 1);
+        assert_eq!(app.track_h(0), 400.0, "two lanes at the old lane height");
+        // One number for the family: the lanes share whatever the user sets.
+        app.set_track_h(0, 120.0);
+        assert_eq!(app.track_h(0), 120.0);
+        // ... but never below the track floor (two squeeze-able lanes
+        // still can't shrink the block under TRACK_MIN_H).
+        app.set_track_h(0, 40.0);
+        assert_eq!(app.track_h(0), TRACK_MIN_H);
+    }
+
+    #[test]
+    fn wheel_modifiers_zoom_and_pan() {
+        // Ctrl+wheel zooms the timeline, Shift+wheel pans it horizontally —
+        // the regression test for "ctrl/shift + scrollwheel does nothing".
+        let mut app = headless_app("wheel");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let z0 = app.px_per_sec;
+        let wheel = |dy: f32, m: egui::Modifiers| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            modifiers: m,
+        };
+        frame(&mut app, &ctx, vec![wheel(3.0, egui::Modifiers::COMMAND)]);
+        assert!(app.px_per_sec > z0, "ctrl+wheel zooms in");
+        frame(&mut app, &ctx, vec![wheel(-3.0, egui::Modifiers::COMMAND)]);
+        assert!((app.px_per_sec - z0).abs() < 1.0, "and back out again");
+        // Zoom far in first: horizontal scroll is clamped to the content
+        // width, and an empty timeline is narrower than the viewport.
+        app.px_per_sec = 1200.0;
+        frame(&mut app, &ctx, vec![wheel(-2.0, egui::Modifiers::SHIFT)]);
+        assert!(app.hscroll > 0.0, "shift+wheel pans the timeline");
+        // A plain wheel must NOT zoom (ScrollAreas keep vertical scrolling).
+        let z1 = app.px_per_sec;
+        frame(&mut app, &ctx, vec![wheel(5.0, egui::Modifiers::NONE)]);
+        assert_eq!(app.px_per_sec, z1, "plain wheel leaves zoom alone");
     }
 }
 

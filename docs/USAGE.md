@@ -57,7 +57,7 @@ timeline while you play.
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
 | **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles |
-| **Mixer** (right dock) | one strip per track, vertically aligned with its timeline block: **name · REC · PLAYED/muted · +child/−child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout) and **FX…**; strips scroll in lockstep with the timeline |
+| **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll; any header-height difference shows as empty room at the top of the strip column): **name · REC · PLAYED/muted · +child/−child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button) and **FX…**; strips scroll in lockstep with the timeline |
 | **Bottom** | MIDI monitor (every event on `simplooper:midi_in`) |
 
 Each **mixer strip** holds the track's whole control surface: the name row
@@ -70,8 +70,8 @@ and **FX…** opening that track's chain. **vol** and **master volume** both
 run −∞…+6 dB (0 dB = unity at three-quarters of the slider).
 
 Tracks sit flush against each other in the timeline — just a hairline
-separator between blocks, one unbroken playhead line, and tall lanes meant
-for stacking lots of clips. **Right-click a track's lane area** removes that
+separator between blocks (drag it to resize that track), one unbroken
+playhead line, and tall lanes meant for stacking lots of clips. **Right-click a track's lane area** removes that
 track's clips (assets stay in the rack; same as `C`), whether you press on
 empty grid or on a clip.
 
@@ -162,13 +162,19 @@ is **never** captured into a take.
   | --- | --- |
   | **current longest** (default) | wraps at the end of the longest playing clip — the classic looper feel |
   | **whole song** | wraps at the project end |
-  | **area** | wraps between a **start and end handle** shown on the ruler (default bar 1 → bar 2); drag either handle anywhere, snap subdivision respected; **Reset** snaps them back |
+  | **area** | wraps between a **start and end handle** shown on the ruler as **bright yellow bars** (default bar 1 → bar 2) — grab either one anywhere on the ruler, snap subdivision respected; **Reset** snaps them back |
 
   With looping off the playhead parks at the region end and the transport
   stops.
-- **Zoom & scroll**: the grid-toolbar zoom slider, or **Ctrl + mouse wheel**
-  anywhere over the grid; **Shift + mouse wheel** scrolls horizontally, plain
-  wheel scrolls the track stack vertically.
+- **Zoom & scroll**: **Ctrl + mouse wheel** zooms the timeline (same state as
+  the grid-toolbar zoom slider), **Shift + mouse wheel** pans horizontally,
+  plain wheel scrolls the track stack vertically. (These gestures are
+  intercepted at the top of the frame — egui's own Ctrl+wheel interface zoom
+  is pinned back to the GUI-scale setting every frame.)
+- **Resize a track**: drag the **separation bar** under it. Only that track
+  changes; its lanes (parent + children) always share the height equally.
+  A new child lane never shrinks the others — the track grows by one lane's
+  worth of height instead. Heights persist in the config.
 - **Play all / Stop all** are also separate MIDI/keyboard actions
   (`MidiAction::PlayAll` / `StopAll`) — `Space` toggles, `StopAll` always
   parks. Per-track **play gates** (PLAYED/muted) and per-track

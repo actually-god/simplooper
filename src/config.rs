@@ -78,6 +78,11 @@ pub struct Config {
     /// 0 dB). Missing entries fall back to 127.
     #[serde(default)]
     pub trk_vol: Vec<u8>,
+    /// Per-track grid block height in points, written when the user drags a
+    /// separation bar (0 = automatic: lanes × lane height). Missing entries
+    /// fall back to automatic.
+    #[serde(default)]
+    pub trk_h: Vec<f32>,
     /// Per-track gain trim, MIDI-knob style (0..=127; 0 = -inf, 80 = 0 dB,
     /// 127 = +10 dB). Missing entries fall back to 80 (unity).
     #[serde(default)]
@@ -158,6 +163,7 @@ impl Default for Config {
             gui_scale: default_gui_scale(),
             latency_ms: 0.0,
             trk_vol: Vec::new(),
+            trk_h: Vec::new(),
             trk_gain: Vec::new(),
             trk_pan: Vec::new(),
             metro_bpm: default_metro_bpm(),
@@ -348,6 +354,7 @@ mod tests {
             fx_dir: "/tmp/effects".into(),
             track_fx: vec![vec![TrackFxSave { stem: "template".into(), params: vec![0.5, 4.0] }]],
             trk_vol: vec![127, 100],
+            trk_h: vec![120.0],
             trk_gain: vec![80, 60],
             trk_pan: vec![64, 20],
         };

@@ -133,9 +133,11 @@ concurrent e2e runs starve each other's JACK clients ("ensemble stalled").
    the track nearest the last click at the playhead. Code aligns to them;
    changing behavior means deliberately updating tests + docs.
    **Track geometry is shared state**: the timeline and the Mixer dock draw
-   from one `row_h` cursor map rebuilt every frame (`App::track_rows`,
-   `track_seq`) — if you touch track layout, both consumers must agree on
-   block heights (header 22 + 58px lanes + 2px separators, no gaps).
+   from `App::track_h(t)` (user height from `trk_height`, else auto =
+   `lanes × LANE_H`, floor `lanes × LANE_MIN_H`/`TRACK_MIN_H`) plus the
+   per-frame `grid_anchor` (top of the track stack) and shared `vscroll` —
+   if you touch track layout, both consumers must agree. The separation bar
+   under each track is also its resize handle (`TRACK_SEP_HIT`).
 4. **Audio server**: keep `NO_START`; never auto-spawn jackd or bypass JACK.
 5. **Packaging**: the AUR `PKGBUILD` (separate repo) fetches the GitHub
    **tag tarball**; `pkgver` must equal the `Cargo.toml` version, and

@@ -14,6 +14,10 @@ shortcuts, per-track effects, and clean export.
 
 ## Features
 
+- **Resizable tracks** — drag the separation bar under any track; only that
+  track changes, its lanes always share the height equally, and a new child
+  lane grows the track instead of shrinking its siblings. **Ctrl + wheel**
+  zooms the timeline, **Shift + wheel** pans horizontally.
 - **16-track timeline DAW model** — no per-track clocks or loop modes: one
   global transport and one **always-on playhead** over a bar/beat grid derived
   from the metronome. Press play or stop **anywhere** — the position is kept;
@@ -62,18 +66,20 @@ shortcuts, per-track effects, and clean export.
   itself is a setting. Audio is never embedded — derived assets are written
   next to the project and missing files are re-found by name.
 - **Mixer dock & effects** — a **Mixer** panel docked right of the timeline
-  holds every track's full strip, each one aligned to its track block: name,
-  REC, play gate, child-lane buttons, **vol** (−∞…+6 dB), **gain**, **pan**
-  (−100…+100, equal power; editable dB / position text boxes + raw MIDI
-  readout) and **FX…**, all scrolling in lockstep with the timeline. The
+  holds every track's full strip, each one pixel-aligned to its track block:
+  name, REC, play gate, child-lane buttons, **vol** (−∞…+6 dB), **gain**,
+  **pan** (−100…+100, equal power; editable dB / position text boxes, raw
+  MIDI readout and a **0** reset button) and **FX…**, all scrolling in
+  lockstep with the timeline. The
   **master volume** (top bar) spans the same −∞…+6 dB range. Effects are
   per-track runtime-compiled chains (Rust scripts hot-compiled with rustc,
   per-effect sliders, scripted custom GUIs, user presets) running after
   vol × gain, live and in export renders.
 - **Global loop region** — a **loop** toggle plus mode dropdown on the grid
   toolbar: **current longest** (default — wraps at the end of the longest
-  playing clip), **whole song**, or **area** with draggable start/end
-  handles on the ruler (default bar 1 → bar 2, snap-aware). The playhead
+  playing clip), **whole song**, or **area**, whose start and end show up as
+  bright yellow grab bars on the ruler (default bar 1 → bar 2, snap-aware,
+  drag anywhere). The playhead
   draws as one unbroken line across all tracks, and with looping off it
   parks at the region end.
 - **Bundled TR-808 pack** — fourteen one-shots sampled from a real Roland
