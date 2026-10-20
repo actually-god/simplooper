@@ -130,6 +130,13 @@ pub struct Config {
     /// — the same `vol_amp` mapping every track volume uses).
     #[serde(default = "default_master_vol")]
     pub master_vol: u8,
+    /// Audition rack entries on click (asset preview). Default on.
+    #[serde(default = "default_true")]
+    pub preview_on: bool,
+    /// Preview length in seconds: entries shorter than this play in full,
+    /// longer ones are auditioned from the start for exactly this long.
+    #[serde(default = "default_preview_secs")]
+    pub preview_secs: f32,
     /// False only in configs written before 0.3.0, where volume was
     /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
     #[serde(default)]
@@ -177,6 +184,8 @@ impl Default for Config {
             loop_area_start: 0,
             loop_area_end: 0,
             master_vol: default_master_vol(),
+            preview_on: true,
+            preview_secs: default_preview_secs(),
             vol_scale_v2: true,
             project_dir: String::new(),
             rack_folders: Vec::new(),
@@ -199,6 +208,11 @@ fn default_loop_mode() -> usize {
 /// Master volume default = 0 dB on the `vol_amp` MIDI mapping.
 fn default_master_vol() -> u8 {
     115
+}
+
+/// Asset-preview length default: 5 seconds.
+fn default_preview_secs() -> f32 {
+    5.0
 }
 
 /// Convert a pre-0.3 MIDI-linear fader (0 = silence, 127 = 0 dB, plain
@@ -253,7 +267,9 @@ impl Config {
                     // A torn/invalid write must never be silently replaced:
                     // keep it next to the config for recovery, start fresh.
                     let _ = std::fs::rename(Self::path(), Self::path().with_extension("corrupt"));
-                    eprintln!("[slooper] config invalid ({e}) — saved as config.corrupt, using defaults");
+                    eprintln!(
+                        "[slooper] config invalid ({e}) — saved as config.corrupt, using defaults"
+                    );
                     return Self::default();
                 }
             },
@@ -293,7 +309,10 @@ impl Config {
 
     /// MIDI binding for `action`, if any.
     pub fn midi_bind(&self, a: MidiAction) -> Option<MidiBind> {
-        self.midi.iter().find(|b| b.action == a).and_then(|b| b.bind)
+        self.midi
+            .iter()
+            .find(|b| b.action == a)
+            .and_then(|b| b.bind)
     }
 }
 
@@ -314,7 +333,7 @@ mod tests {
         assert_eq!(vol_midi_from_legacy(127), VOL_UNITY_MIDI);
         assert_eq!(vol_midi_from_legacy(0), 0);
         assert_eq!(vol_midi_from_legacy(64), 104); // -5.94 dB
-        // Monotone and never exceeds unity below 127.
+                                                   // Monotone and never exceeds unity below 127.
         let mut prev = 0u8;
         for v in 0..=127u8 {
             let m = vol_midi_from_legacy(v);
@@ -329,7 +348,11 @@ mod tests {
             shortcuts: vec![Some("R".into()), None, Some("Space".into())],
             midi: vec![MidiBinding {
                 action: MidiAction::RecLoop(0),
-                bind: Some(MidiBind { ty: 0, ch: 1, d1: 60 }),
+                bind: Some(MidiBind {
+                    ty: 0,
+                    ch: 1,
+                    d1: 60,
+                }),
             }],
             midi_axis: Vec::new(),
             ports_in: vec!["remote:out_1".into()],
@@ -348,11 +371,16 @@ mod tests {
             loop_area_start: 24,
             loop_area_end: 192_000,
             master_vol: 100,
+            preview_on: false,
+            preview_secs: 2.5,
             vol_scale_v2: true,
             project_dir: "/tmp/projects".into(),
             rack_folders: vec!["/tmp/samples".into(), "/tmp/takes".into()],
             fx_dir: "/tmp/effects".into(),
-            track_fx: vec![vec![TrackFxSave { stem: "template".into(), params: vec![0.5, 4.0] }]],
+            track_fx: vec![vec![TrackFxSave {
+                stem: "template".into(),
+                params: vec![0.5, 4.0],
+            }]],
             trk_vol: vec![127, 100],
             trk_h: vec![120.0],
             trk_gain: vec![80, 60],
@@ -378,6 +406,8 @@ mod tests {
         assert_eq!(back.trk_vol, cfg.trk_vol);
         assert_eq!(back.trk_gain, cfg.trk_gain);
         assert_eq!(back.trk_pan, cfg.trk_pan);
+        assert!(!back.preview_on, "preview toggle round-trips");
+        assert!((back.preview_secs - 2.5).abs() < f32::EPSILON);
         assert_eq!(back.fx_dir, "/tmp/effects");
         assert_eq!(back.track_fx[0][0].stem, "template");
         assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);
@@ -398,8 +428,13 @@ mod tests {
             serde_json::from_str(r#"{"root_loops": 3, "q_metro": true, "unknown": 1}"#).unwrap();
         assert_eq!(back.q_sub, 4);
         assert_eq!(back.snap_sub, 4);
-        assert!(back.auto_quantize, "recordings snap to the grid unless unticked");
+        assert!(
+            back.auto_quantize,
+            "recordings snap to the grid unless unticked"
+        );
         assert!(back.loop_tl, "the timeline loops by default");
+        assert!(back.preview_on, "asset preview is on by default");
+        assert_eq!(back.preview_secs, 5.0, "default preview length is 5 s");
         assert!(back.midi.is_empty());
         // Per-track levels are #[serde(default)] — old configs load as empty
         // and App::new falls them back to 127 (vol) / 80 (gain) / 64 (pan).

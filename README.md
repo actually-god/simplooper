@@ -274,9 +274,9 @@ src/
   active clips into the track bus — no locks, no allocation: the
   arrangement arrives as one `Arc<Arrangement>` swap per edit
   (`Cmd::SetProject`), track states/transport/seek ride atomics, and the
-  playhead advances every block while the transport *or* the metronome is
-  on (a bare click keeps the always-visible playhead rolling; the click
-  itself is output-only, never recorded).
+  playhead advances every block while the transport is on (a bare
+  metronome ticks on its own free-running clock, leaving the playhead
+  frozen; the click itself is output-only, never recorded).
 - **Takes**: recording writes into the shared take buffer; when a take
   finishes (REC press or capacity) the engine hands the audio to the
   manager thread (`Evt::Take`), which saves the WAV into the primary rack

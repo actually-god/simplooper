@@ -81,8 +81,7 @@ pub fn gain_amp(v: u8) -> f32 {
     if v <= GAIN_UNITY_MIDI {
         v as f32 / GAIN_UNITY_MIDI as f32
     } else {
-        1.0 + (v - GAIN_UNITY_MIDI) as f32 / (127 - GAIN_UNITY_MIDI) as f32
-            * (GAIN_MAX_LIN - 1.0)
+        1.0 + (v - GAIN_UNITY_MIDI) as f32 / (127 - GAIN_UNITY_MIDI) as f32 * (GAIN_MAX_LIN - 1.0)
     }
 }
 
@@ -144,22 +143,34 @@ pub enum Cmd {
     /// 2 = right bus, 3 = mono downmix `(L + R)/sqrt2` (the default, and the
     /// bit-exact old mono behaviour for centred mixes). A port routed to both
     /// gets the downmix, never two conflicting writes.
-    Apply { ins: Vec<String>, outs: Vec<OutSel> },
+    Apply {
+        ins: Vec<String>,
+        outs: Vec<OutSel>,
+    },
     /// Start/stop a raw input capture on track `i`. Stopping sends the take
     /// back as [`Evt::Take`] (armed at the playhead position it started in);
     /// the GUI turns it into an asset + clip. Takes never touch the engine's
     /// playback state.
-    ToggleRecord { i: usize },
+    ToggleRecord {
+        i: usize,
+    },
     /// Set / toggle a track's play/stop: while the transport runs, a *stopped*
     /// track contributes nothing (its clips stay on the timeline untouched).
-    SetTrackOn { i: usize, on: bool },
-    ToggleTrackOn { i: usize },
+    SetTrackOn {
+        i: usize,
+        on: bool,
+    },
+    ToggleTrackOn {
+        i: usize,
+    },
     /// Start the global transport from the current playhead position.
     PlayAll,
     /// Stop the global transport; the playhead holds its position.
     StopAll,
     /// Move the playhead (samples). Scrubbing sends these continuously.
-    Seek { pos: u64 },
+    Seek {
+        pos: u64,
+    },
     /// Timeline loop toggle: wrap the playhead at the loop region's end vs.
     /// park at the project end.
     SetLoop(bool),
@@ -168,10 +179,17 @@ pub enum Cmd {
     /// track content, or whole-song end) on every edit; `end = 0` means
     /// "wrap at the project end". Only consulted while [`Cmd::SetLoop`] is
     /// on — with the loop off the transport still parks at the project end.
-    SetLoopRegion { start: u64, end: u64 },
+    SetLoopRegion {
+        start: u64,
+        end: u64,
+    },
     /// Replace the engine's project snapshot (assets + arrangement + total
     /// length). The RT handler picks the new Arcs up on the next cycle.
-    SetProject { assets: Arc<AssetTable>, arr: Arc<Arrangement>, len: u64 },
+    SetProject {
+        assets: Arc<AssetTable>,
+        arr: Arc<Arrangement>,
+        len: u64,
+    },
     /// Write a track's rendered contribution (all its lanes, engine-rate
     /// mixdown of the current project) to `path` in format `fmt`. Runs on
     /// the manager thread; a Notice/Error event reports the outcome.
@@ -189,7 +207,10 @@ pub enum Cmd {
     /// The GUI replaced track `i`'s effect chain (order = audio order). The
     /// slots hold refcounted effect instances created on the GUI thread; the
     /// audio thread picks the new table up on the next cycle without locking.
-    SetTrackEffects { i: usize, chain: TrackFx },
+    SetTrackEffects {
+        i: usize,
+        chain: TrackFx,
+    },
     /// The GUI selection moved to track `i` (0-based). Input monitoring
     /// follows the selected track: its gain, volume, effect chain and pan
     /// shape the live pass-through.
@@ -198,15 +219,33 @@ pub enum Cmd {
     /// milliseconds of input, trimming the silence gap between pressing the
     /// record button and that button click reaching the mic. Monitoring and
     /// the output mix are never delayed. Clamped to 0..=1000 ms.
-    SetLatency { ms: f32 },
+    SetLatency {
+        ms: f32,
+    },
     /// Metronome: on/off, tempo in BPM, click subdivision in clicks per beat
     /// (1 = quarter, 2 = eighth, 3 = triplet, 4 = sixteenth, ...), and beats
     /// per measure (the time-signature numerator; beat 1 of every measure
     /// gets the downbeat tone). Three distinct tones: downbeat, quarter note
     /// and subdivision. Clicks land on the *project timeline grid*: while the
     /// transport runs they tick at the transport tempo, and scrubbing the
-    /// playhead ticks the grid under it. Never recorded into a take.
-    SetMetro { on: bool, bpm: u32, sub: u32, num: u32 },
+    /// playhead ticks the grid under it. With the transport stopped the
+    /// click free-runs from the playhead position — it never drives the
+    /// playhead itself. Never recorded into a take.
+    SetMetro {
+        on: bool,
+        bpm: u32,
+        sub: u32,
+        num: u32,
+    },
+    /// Audition a sample at the master output (asset-preview click). The
+    /// buffer plays once from its start through the output mix only (never
+    /// recorded, never loops); a shorter previous preview is replaced, and
+    /// the engine clears its own flag when the buffer runs out.
+    PreviewPlay {
+        samples: Arc<[f32]>,
+    },
+    /// Stop the asset preview immediately (audition is also a toggle).
+    PreviewStop,
     Quit,
 }
 
@@ -215,16 +254,31 @@ pub enum Cmd {
 pub enum Evt {
     /// No JACK/PipeWire-JACK server available.
     Unavailable(String),
-    Ready { client_name: String, sample_rate: u32 },
-    Ports { ins: Vec<PortInfo>, outs: Vec<PortInfo> },
-    Applied { ins: usize, outs: usize },
+    Ready {
+        client_name: String,
+        sample_rate: u32,
+    },
+    Ports {
+        ins: Vec<PortInfo>,
+        outs: Vec<PortInfo>,
+    },
+    Applied {
+        ins: usize,
+        outs: usize,
+    },
     /// Transport state changed (the engine auto-stops at the project end
     /// when the loop toggle is off; the GUI mirrors the flag).
-    Transport { on: bool },
+    Transport {
+        on: bool,
+    },
     /// A recording take finished: `at` is the playhead position when
     /// recording started, `data` the captured mono samples. The GUI stores
     /// it as an asset and places a clip; the engine keeps nothing.
-    Take { track: usize, at: u64, data: Arc<[f32]> },
+    Take {
+        track: usize,
+        at: u64,
+        data: Arc<[f32]>,
+    },
     /// A remote MIDI source ports currently wired into `slooper:midi_in`
     /// (auto-connected; refreshed on port/client registration events).
     Midi(RawMidiMsg),
@@ -275,11 +329,28 @@ impl Backend {
         let thread = std::thread::Builder::new()
             .name("slooper-audio".into())
             .spawn(move || {
-                run(cmd_rx, evt_tx, t_gain, t_peak, t_xruns, t_midi_drops, t_engine);
+                run(
+                    cmd_rx,
+                    evt_tx,
+                    t_gain,
+                    t_peak,
+                    t_xruns,
+                    t_midi_drops,
+                    t_engine,
+                );
             })
             .expect("failed to spawn audio thread");
 
-        Backend { cmd_tx, evt_rx, gain, peak, xruns, midi_drops, engine, thread: Some(thread) }
+        Backend {
+            cmd_tx,
+            evt_rx,
+            gain,
+            peak,
+            xruns,
+            midi_drops,
+            engine,
+            thread: Some(thread),
+        }
     }
 
     /// Send a command, ignoring send errors (thread already gone).
@@ -396,6 +467,14 @@ pub struct Engine {
     metro_bpm: AtomicU32,
     metro_sub: AtomicU32,
     metro_num: AtomicU32,
+
+    // ---- asset preview -----------------------------------------------------
+    /// Sample buffer being auditioned (swapped wholesale, RT reads an Arc
+    /// clone refreshed on `preview_gen`).
+    preview: std::sync::Mutex<Arc<[f32]>>,
+    preview_gen: AtomicU64,
+    /// 1 = a preview is playing (RT clears it when the buffer runs out).
+    preview_on: AtomicU8,
 }
 
 impl Engine {
@@ -421,9 +500,9 @@ impl Engine {
             pos: AtomicU64::new(0),
             seek: AtomicU64::new(NO_SEEK),
             // Empty project: an idle timeline as long as a take buffer, so
-            // a bare metronome run (transport stopped) never wraps/parks on
-            // a 1-sample grid. The GUI replaces this with the real length
-            // via Cmd::SetProject on every edit.
+            // a transport parked on it never wraps/parks on a 1-sample
+            // grid. The GUI replaces this with the real length via
+            // Cmd::SetProject on every edit.
             proj_len: AtomicU64::new(LOOP_CAP as u64),
             track_on: core::array::from_fn(|_| AtomicU8::new(1)),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
@@ -440,6 +519,9 @@ impl Engine {
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
             metro_num: AtomicU32::new(4),
+            preview: std::sync::Mutex::new(Arc::from(Vec::new())),
+            preview_gen: AtomicU64::new(0),
+            preview_on: AtomicU8::new(0),
         })
     }
 
@@ -549,7 +631,10 @@ impl Engine {
         self.loop_end.store(end, Ordering::Relaxed);
     }
     pub fn loop_region(&self) -> (u64, u64) {
-        (self.loop_start.load(Ordering::Relaxed), self.loop_end.load(Ordering::Relaxed))
+        (
+            self.loop_start.load(Ordering::Relaxed),
+            self.loop_end.load(Ordering::Relaxed),
+        )
     }
 
     pub fn set_loop_tl(&self, on: bool) {
@@ -690,6 +775,32 @@ impl Engine {
         )
     }
 
+    // ---- asset preview -----------------------------------------------------------
+
+    /// Start auditioning `samples` at the master output: swaps the preview
+    /// buffer, bumps the generation (the RT handler refreshes its Arc
+    /// clone), and restarts playback from sample 0.
+    pub fn play_preview(&self, samples: Arc<[f32]>) {
+        if let Ok(mut p) = self.preview.lock() {
+            *p = samples;
+        }
+        self.preview_gen.fetch_add(1, Ordering::SeqCst);
+        self.preview_on.store(1, Ordering::Relaxed);
+    }
+
+    /// Stop the asset preview (also clears a finished one).
+    pub fn stop_preview(&self) {
+        self.preview_on.store(0, Ordering::Relaxed);
+    }
+
+    pub fn preview_active(&self) -> bool {
+        self.preview_on.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn preview_gen(&self) -> u64 {
+        self.preview_gen.load(Ordering::Relaxed)
+    }
+
     // ---- offline rendering --------------------------------------------------------
 
     /// Render the current project to mono f32 samples at the project length:
@@ -789,12 +900,17 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
         engine.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
         // The GUI owns this take now; drop any capacity-stop flag so the
         // manager poll doesn't ship the same take twice.
-        engine.take_pending.fetch_and(!(1u64 << i), Ordering::SeqCst);
+        engine
+            .take_pending
+            .fetch_and(!(1u64 << i), Ordering::SeqCst);
         // Let the RT thread quiesce before cloning the take buffer.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let (at, data) = engine.copy_take(i);
         if data.is_empty() {
-            let _ = tx.try_send(Evt::Notice(format!("track {}: empty take discarded", i + 1)));
+            let _ = tx.try_send(Evt::Notice(format!(
+                "track {}: empty take discarded",
+                i + 1
+            )));
         } else {
             let _ = tx.try_send(Evt::Take { track: i, at, data });
         }
@@ -825,7 +941,10 @@ fn run(
     let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("No JACK/PipeWire-JACK server available: {}", describe_err(e));
+            let msg = format!(
+                "No JACK/PipeWire-JACK server available: {}",
+                describe_err(e)
+            );
             eprintln!("[slooper] {}", msg);
             let _ = evt_tx.send(Evt::Unavailable(msg));
             return;
@@ -878,13 +997,19 @@ fn run(
     // Output slots carry independent L / R bits (see `Cmd::Apply`).
     let mask_out_l = Arc::new(AtomicU64::new(0));
     let mask_out_r = Arc::new(AtomicU64::new(0));
-    let notif = Notif { tx: evt_tx.clone(), xruns: xruns.clone() };
+    let notif = Notif {
+        tx: evt_tx.clone(),
+        xruns: xruns.clone(),
+    };
     // Sample rate is queryable before activation; the metronome grid is
     // sized from it.
     let sr = client.sample_rate();
     let proc = Proc {
         midi_in: midi_port,
-        ports: RawPorts { ins: ins_raw, outs: outs_raw },
+        ports: RawPorts {
+            ins: ins_raw,
+            outs: outs_raw,
+        },
         mask_in: mask_in.clone(),
         mask_out_l: mask_out_l.clone(),
         mask_out_r: mask_out_r.clone(),
@@ -902,6 +1027,7 @@ fn run(
         metro_idx: 0i64,
         metro_start: -1,
         metro_tone: 0,
+        metro_clock: 0.0,
         sample_no: 0,
         fx_cache: engine.fx_table(),
         fx_cache_gen: engine.fx_gen(),
@@ -910,6 +1036,14 @@ fn run(
         arr_cache_gen: engine.arr_gen(),
         assets: engine.assets(),
         assets_cache_gen: engine.assets_gen(),
+        preview: engine
+            .preview
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| Arc::from(Vec::new())),
+        preview_cache_gen: engine.preview_gen(),
+        preview_idx: 0,
+        preview_live: false,
         clip_buf: Vec::new(),
     };
 
@@ -930,7 +1064,10 @@ fn run(
         "[slooper] JACK client '{}' active @ {} Hz",
         client_name, sample_rate
     );
-    let _ = evt_tx.send(Evt::Ready { client_name: client_name.clone(), sample_rate });
+    let _ = evt_tx.send(Evt::Ready {
+        client_name: client_name.clone(),
+        sample_rate,
+    });
     send_ports(active.as_client(), &evt_tx);
 
     // Remote MIDI sources currently wired into our midi_in port. Devices often
@@ -990,19 +1127,21 @@ fn run(
             Ok(Cmd::ExportTrack { i, path, fmt }) => {
                 let i = i.min(MAX_LOOPS - 1);
                 match engine.render_track(i) {
-                    Some(samples) => match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
-                        Ok(()) => {
-                            let _ = evt_tx.send(Evt::Notice(format!(
-                                "exported track {} ({} samples) → {}",
-                                i + 1,
-                                samples.len(),
-                                path.display()
-                            )));
+                    Some(samples) => {
+                        match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
+                            Ok(()) => {
+                                let _ = evt_tx.send(Evt::Notice(format!(
+                                    "exported track {} ({} samples) → {}",
+                                    i + 1,
+                                    samples.len(),
+                                    path.display()
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
+                            }
                         }
-                        Err(e) => {
-                            let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
-                        }
-                    },
+                    }
                     None => {
                         let _ = evt_tx.send(Evt::Error(format!(
                             "export: track {} has no placed clips",
@@ -1011,44 +1150,48 @@ fn run(
                     }
                 }
             }
-            Ok(Cmd::ExportProject { path, fmt }) => {
-                match engine.render_project() {
-                    Some(samples) => match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
-                        Ok(()) => {
-                            let _ = evt_tx.send(Evt::Notice(format!(
-                                "exported project ({} samples) → {}",
-                                samples.len(),
-                                path.display()
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
-                        }
-                    },
-                    None => {
-                        let _ = evt_tx
-                            .send(Evt::Error("export: no clips placed in any track".into()));
+            Ok(Cmd::ExportProject { path, fmt }) => match engine.render_project() {
+                Some(samples) => match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
+                    Ok(()) => {
+                        let _ = evt_tx.send(Evt::Notice(format!(
+                            "exported project ({} samples) → {}",
+                            samples.len(),
+                            path.display()
+                        )));
                     }
+                    Err(e) => {
+                        let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
+                    }
+                },
+                None => {
+                    let _ = evt_tx.send(Evt::Error("export: no clips placed in any track".into()));
                 }
-            }
+            },
             Ok(Cmd::SetTrackEffects { i, chain }) => {
                 engine.set_track_fx(i.min(MAX_LOOPS - 1), chain);
             }
             Ok(Cmd::SetSelected(i)) => {
-                engine.selected.store(i.min(MAX_LOOPS - 1) as u8, Ordering::Relaxed);
+                engine
+                    .selected
+                    .store(i.min(MAX_LOOPS - 1) as u8, Ordering::Relaxed);
             }
             Ok(Cmd::SetLatency { ms }) => {
                 let ms = ms.clamp(0.0, 1000.0);
-                engine
-                    .latency
-                    .store((ms * sample_rate as f32 / 1000.0).round() as u32, Ordering::Relaxed);
+                engine.latency.store(
+                    (ms * sample_rate as f32 / 1000.0).round() as u32,
+                    Ordering::Relaxed,
+                );
             }
             Ok(Cmd::SetMetro { on, bpm, sub, num }) => {
                 engine.metro_on.store(on as u8, Ordering::Relaxed);
-                engine.metro_bpm.store(bpm.clamp(20, 300), Ordering::Relaxed);
+                engine
+                    .metro_bpm
+                    .store(bpm.clamp(20, 300), Ordering::Relaxed);
                 engine.metro_sub.store(sub.clamp(1, 16), Ordering::Relaxed);
                 engine.metro_num.store(num.clamp(1, 16), Ordering::Relaxed);
             }
+            Ok(Cmd::PreviewPlay { samples }) => engine.play_preview(samples),
+            Ok(Cmd::PreviewStop) => engine.stop_preview(),
             Ok(Cmd::Quit) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Takes the RT handler auto-stopped at buffer capacity never
@@ -1171,7 +1314,9 @@ fn apply_layout(
     for (i, slot) in cur_out.iter_mut().enumerate() {
         // Route bits: 1 = L bus, 2 = R bus; 0 counts as both (mono downmix
         // — the historical behaviour, and the default for fresh selections).
-        let new_out = outs.get(i).map(|(n, lr)| (n.clone(), if lr & 3 == 0 { 3 } else { lr & 3 }));
+        let new_out = outs
+            .get(i)
+            .map(|(n, lr)| (n.clone(), if lr & 3 == 0 { 3 } else { lr & 3 }));
         let same_name = slot.as_ref().map(|s| &s.0) == new_out.as_ref().map(|s| &s.0);
         if same_name && slot.is_some() {
             // Still connected to the same port: only the L/R routing can
@@ -1231,7 +1376,10 @@ fn apply_layout(
     }
 
     eprintln!("[slooper] applied {applied_in} input(s), {applied_out} output(s)");
-    let _ = tx.send(Evt::Applied { ins: applied_in, outs: applied_out });
+    let _ = tx.send(Evt::Applied {
+        ins: applied_in,
+        outs: applied_out,
+    });
 }
 
 /// Enumerate remote audio ports, hiding those whose client belongs to a
@@ -1287,7 +1435,14 @@ fn rescan_midi_sources(client: &Client, tx: &SyncSender<Evt>, known: &mut Vec<St
         }
     }
     *known = found.clone();
-    eprintln!("[slooper] MIDI sources: {}", if known.is_empty() { "none".into() } else { known.join(", ") });
+    eprintln!(
+        "[slooper] MIDI sources: {}",
+        if known.is_empty() {
+            "none".into()
+        } else {
+            known.join(", ")
+        }
+    );
     let _ = tx.try_send(Evt::MidiSources(known.clone()));
     true
 }
@@ -1351,7 +1506,10 @@ fn hidden_clients_cached() -> Option<std::collections::HashSet<String>> {
 
 fn port_info(full_name: &str) -> PortInfo {
     let client = full_name.split(':').next().unwrap_or("").to_string();
-    PortInfo { name: full_name.to_string(), client }
+    PortInfo {
+        name: full_name.to_string(),
+        client,
+    }
 }
 
 /// Clamp a loop-region request to the live project: `ls` never past the
@@ -1359,7 +1517,11 @@ fn port_info(full_name: &str) -> PortInfo {
 /// song") falls back to the project end. Pure so it is unit-testable.
 fn clamp_loop_region(ls: u64, le: u64, proj_len: u64) -> (u64, u64) {
     let ls = ls.min(proj_len.saturating_sub(1));
-    let le = if le <= ls || le > proj_len { proj_len } else { le };
+    let le = if le <= ls || le > proj_len {
+        proj_len
+    } else {
+        le
+    };
     (ls, le)
 }
 
@@ -1456,6 +1618,13 @@ struct Proc {
     metro_idx: i64,
     metro_start: i64,
     metro_tone: u8,
+    /// Free-running metronome position (samples). While the transport runs
+    /// the click ticks off the transport position; with the transport
+    /// stopped the click must keep ticking WITHOUT moving the playhead, so
+    /// it counts on this clock instead. Re-anchored to the playhead on
+    /// seeks/activation, and synced to the playhead on every transport
+    /// block, so switching states never bursts or jumps the beat.
+    metro_clock: f64,
     /// Absolute sample counter (click envelope clock).
     sample_no: u64,
     /// Cached effect-chain table; refreshed from the engine when fx_gen
@@ -1470,6 +1639,12 @@ struct Proc {
     arr_cache_gen: u64,
     assets: Arc<AssetTable>,
     assets_cache_gen: u64,
+    /// Asset preview: cached audition buffer (refreshed on preview_gen),
+    /// its RT read cursor, and whether one plays this block.
+    preview: Arc<[f32]>,
+    preview_cache_gen: u64,
+    preview_idx: usize,
+    preview_live: bool,
     /// Reusable per-block clip window list (taken out of self during the
     /// block so the sample loop can call `&mut self` effect code freely).
     clip_buf: Vec<ClipEntry>,
@@ -1597,11 +1772,29 @@ impl ProcessHandler for Proc {
                     .fx_cache
                     .iter()
                     .map(|tf| {
-                        tf.slots().iter().map(|_| FxRt { gen: 0, p: [0.0; crate::fx::MAX_PARAMS] }).collect()
+                        tf.slots()
+                            .iter()
+                            .map(|_| FxRt {
+                                gen: 0,
+                                p: [0.0; crate::fx::MAX_PARAMS],
+                            })
+                            .collect()
                     })
                     .collect();
             }
         }
+        // Asset preview: refresh the audition buffer on a generation change
+        // (restarts its read cursor) and mirror the play flag every block —
+        // the RT side clears the flag itself when a buffer runs out.
+        let pvg = self.engine.preview_gen();
+        if pvg != self.preview_cache_gen {
+            if let Ok(p) = self.engine.preview.try_lock() {
+                self.preview = p.clone();
+                self.preview_cache_gen = pvg;
+                self.preview_idx = 0;
+            }
+        }
+        self.preview_live = self.engine.preview_on.load(Ordering::Relaxed) != 0;
 
         // Per-track output trim (volume x gain, linear) snapshotted once per
         // cycle; applied to each clip's PLAYBACK contribution only, so the
@@ -1647,18 +1840,16 @@ impl ProcessHandler for Proc {
         let any_rec = nrec > 0;
 
         let clip_sound = transport
-            && self
-                .arr
-                .tracks
-                .iter()
-                .enumerate()
-                .any(|(t, tr)| self.engine.track_on(t) && tr.lanes.iter().any(|l| !l.clips.is_empty()));
+            && self.arr.tracks.iter().enumerate().any(|(t, tr)| {
+                self.engine.track_on(t) && tr.lanes.iter().any(|l| !l.clips.is_empty())
+            });
         let metro_on = self.engine.metro().0;
         if in_mask == 0
             && (out_mask_l | out_mask_r) == 0
             && !any_rec
             && !clip_sound
             && !metro_on
+            && !self.preview_live
         {
             return Control::Continue; // nothing connected, nothing playing: idle
         }
@@ -1669,11 +1860,11 @@ impl ProcessHandler for Proc {
             self.pos = p.min(proj_len);
         }
         let mut p0 = self.pos;
-        // Does the clock advance this block? Transport on = full playback;
-        // a bare metronome keeps the (always-visible) playhead rolling on
-        // the grid without sounding clips. Transport stopped AND metro off:
-        // the playhead holds — stop means stop.
-        let advance = transport || metro_on;
+        // Does the clock advance this block? ONLY the transport moves the
+        // playhead — a bare metronome run ticks on its own free-running
+        // clock (`metro_clock`) and must leave the (always-visible)
+        // playhead exactly where it is. Stop means stop.
+        let advance = transport;
         // The active loop region (samples): a looping transport wraps from
         // `ls` back at `le`. Degenerate requests fall back to the whole
         // project (`le = 0` means "the project end").
@@ -1720,7 +1911,8 @@ impl ProcessHandler for Proc {
             if in_mask & (1u64 << s) != 0 {
                 let p = self.ports.ins[s];
                 if !p.is_null() {
-                    in_bufs[nin] = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
+                    in_bufs[nin] =
+                        unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
                     nin += 1;
                 }
             }
@@ -1767,14 +1959,21 @@ impl ProcessHandler for Proc {
         // emitted so playhead crossings — while playing OR while scrubbing —
         // fire exactly one click each. Re-anchored on transport starts and
         // seeks (the position jump itself must not burst-fire).
-        let metro_bpm = self.engine.metro_bpm.load(Ordering::Relaxed).clamp(20, 300).max(1);
+        let metro_bpm = self
+            .engine
+            .metro_bpm
+            .load(Ordering::Relaxed)
+            .clamp(20, 300)
+            .max(1);
         let metro_sub = self.engine.metro_sub.load(Ordering::Relaxed).clamp(1, 16);
         let metro_num = self.engine.metro_num.load(Ordering::Relaxed).clamp(1, 16);
         let sub_len = (60.0 * self.sr as f64 / metro_bpm as f64) / metro_sub as f64;
         // The next click is the first grid line at or after the playhead.
         // Re-anchor on transport starts and backward seeks; a forward seek
         // keeps the old anchor so crossing grid lines while scrubbing still
-        // fires one click each.
+        // fires one click each. Any seek or start also re-anchors the
+        // free-running click clock to the (now stationary) playhead, so a
+        // bare metronome run ticks from where the playhead sits.
         if seek.is_some_and(|p| p <= prev_pos)
             || (transport && !self.prev_transport)
             || (metro_on && !self.prev_metro)
@@ -1783,10 +1982,15 @@ impl ProcessHandler for Proc {
             // drops the anchor one grid line behind the playhead, so the
             // very first block fires the click at the current line.
             self.metro_idx = (self.pos as f64 / sub_len).ceil() as i64 - 1;
+            self.metro_clock = self.pos as f64;
+        } else if seek.is_some() {
+            // Forward seek: keep the grid anchor (scrub crossings still
+            // tick), but jump the click clock to the new position.
+            self.metro_clock = self.pos as f64;
         }
         self.prev_transport = transport;
         self.prev_metro = metro_on;
-        let seeked = seek.is_some();
+        let metro_base = self.metro_clock;
         let metro_dur = (self.sr / 40).max(2); // 25 ms click
         let metro_decay = self.sr as f32 * 0.012;
 
@@ -1799,8 +2003,8 @@ impl ProcessHandler for Proc {
         let has_entries = !entries.is_empty();
         let mut mixer_live = clip_sound;
         if transport && !mixer_live {
-            mixer_live = (0..MAX_LOOPS)
-                .any(|t| self.engine.track_on(t) && !self.fx_cache[t].is_empty());
+            mixer_live =
+                (0..MAX_LOOPS).any(|t| self.engine.track_on(t) && !self.fx_cache[t].is_empty());
         }
         // Per-track sample accumulators for the clip mix.
         let mut acc = [0.0f32; MAX_LOOPS];
@@ -1865,11 +2069,18 @@ impl ProcessHandler for Proc {
             }
 
             // Metronome click (added to the output mix only — `dry` never
-            // sees it, so it can never be recorded into a take).
+            // sees it, so it can never be recorded into a take). While the
+            // transport runs the clicks tick off the transport position;
+            // with it stopped they tick off the free-running click clock,
+            // which leaves the playhead untouched.
             let mut click = 0.0f32;
-            if live && metro_on && (advance || seeked) {
-                let p = p0 + i as u64;
-                let idx = (p as f64 / sub_len) as i64;
+            if live && metro_on {
+                let p = if advance {
+                    (p0 + i as u64) as f64
+                } else {
+                    metro_base + i as f64
+                };
+                let idx = (p / sub_len) as i64;
                 if idx > self.metro_idx {
                     self.metro_idx = idx;
                     self.metro_start = self.sample_no as i64;
@@ -1910,13 +2121,27 @@ impl ProcessHandler for Proc {
             }
             self.sample_no += 1;
 
+            // Asset audition: next sample of the preview buffer, dead
+            // centre like the click, output mix only (never recorded).
+            // Auto-stops when the buffer runs out.
+            let mut pvc = 0.0f32;
+            if self.preview_live {
+                if self.preview_idx < self.preview.len() {
+                    pvc = self.preview[self.preview_idx] * F1S2;
+                    self.preview_idx += 1;
+                } else {
+                    self.preview_live = false;
+                    self.engine.preview_on.store(0, Ordering::Relaxed);
+                }
+            }
+
             // Live input rides the selected track's chain/trim/pan; the click
             // always sits dead centre. At unity trim and centre pan the L/R
             // pair still sums to the historical unity mono mix.
             let mon = self.fx_mix(sel, src_in * mon_amp);
             let clickc = click * F1S2;
-            let v_l = (mon * mon_l + clickc + play_l) * g;
-            let v_r = (mon * mon_r + clickc + play_r) * g;
+            let v_l = (mon * mon_l + clickc + play_l + pvc) * g;
+            let v_r = (mon * mon_r + clickc + play_r + pvc) * g;
             // The output mix is NEVER delayed: what the user hears stays
             // exactly on the timeline grid (latency compensation only trims
             // the start of a fresh take — see `Engine::rec_sample`).
@@ -1961,6 +2186,15 @@ impl ProcessHandler for Proc {
             } else {
                 self.pos = pos_now.min(proj_len);
             }
+        }
+        // Keep the free-running click clock glued to the playhead while the
+        // transport advances; with the transport stopped and the click on,
+        // it counts on through the live samples on its own (the playhead
+        // itself stays put).
+        if advance {
+            self.metro_clock = self.pos as f64;
+        } else if metro_on {
+            self.metro_clock = metro_base + block_n as f64;
         }
         if auto_stop && transport {
             self.engine.set_transport(false);
@@ -2076,7 +2310,11 @@ mod tests {
         e.seek_to(500);
         e.start_rec(2);
         assert_eq!(e.rec_state_of(2), TR_REC);
-        assert_eq!(e.rec_at(2), 500, "the take remembers where the playhead was");
+        assert_eq!(
+            e.rec_at(2),
+            500,
+            "the take remembers where the playhead was"
+        );
         // Simulate RT capture.
         for k in 0..100u32 {
             e.rec_write(2, k, k as f32 * 0.01);
@@ -2129,7 +2367,11 @@ mod tests {
         assert!(!e.rec_sample(0, 3.0)); // ...and captures nothing more
         assert!(!e.rec_sample(0, 4.0)); // skip exhausted: capture resumes
         let (_at, data) = e.copy_take(0);
-        assert_eq!(&data[..], &[4.0], "only the samples after the armed 3-sample skip");
+        assert_eq!(
+            &data[..],
+            &[4.0],
+            "only the samples after the armed 3-sample skip"
+        );
     }
 
     #[test]
@@ -2154,7 +2396,14 @@ mod tests {
         let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 2000]);
         let mut arr = Arrangement::new();
         arr.insert(0, 0, Clip { asset: 0, pos: 0 });
-        arr.insert(1, 0, Clip { asset: 1, pos: 1000 });
+        arr.insert(
+            1,
+            0,
+            Clip {
+                asset: 1,
+                pos: 1000,
+            },
+        );
         let e = Engine::new();
         e.set_project(Arc::new(vec![a0.clone(), a1.clone()]), Arc::new(arr), 4000);
         (e, a0, a1)
@@ -2239,16 +2488,39 @@ mod tests {
         assert!(plain.iter().take(4000).all(|&v| (v - 0.5).abs() < 1e-6));
 
         // Template at depth 0: exact pass-through, per the ABI contract.
-        let inst0 = reg.create_instance("template", 48000.0, &[0.0, 4.0, 1.0, 1.0]).unwrap();
-        e.set_track_fx(0, TrackFx { slots: std::sync::Arc::new(vec![FxSlot { inst: inst0, desc: desc.clone() }]) });
+        let inst0 = reg
+            .create_instance("template", 48000.0, &[0.0, 4.0, 1.0, 1.0])
+            .unwrap();
+        e.set_track_fx(
+            0,
+            TrackFx {
+                slots: std::sync::Arc::new(vec![FxSlot {
+                    inst: inst0,
+                    desc: desc.clone(),
+                }]),
+            },
+        );
         assert_eq!(e.fx_gen(), 1);
         let thru = e.render_project().unwrap();
-        assert!(thru.iter().take(4000).all(|&v| (v - 0.5).abs() < 1e-3), "depth 0 must pass through");
+        assert!(
+            thru.iter().take(4000).all(|&v| (v - 0.5).abs() < 1e-3),
+            "depth 0 must pass through"
+        );
 
         // depth 1 / mix 1: the tremolo must dip the render (a full LFO
         // cycle lands inside the 4000-sample window at 4 Hz).
-        let inst1 = reg.create_instance("template", 48000.0, &[1.0, 4.0, 1.0, 1.0]).unwrap();
-        e.set_track_fx(0, TrackFx { slots: std::sync::Arc::new(vec![FxSlot { inst: inst1.clone(), desc }]) });
+        let inst1 = reg
+            .create_instance("template", 48000.0, &[1.0, 4.0, 1.0, 1.0])
+            .unwrap();
+        e.set_track_fx(
+            0,
+            TrackFx {
+                slots: std::sync::Arc::new(vec![FxSlot {
+                    inst: inst1.clone(),
+                    desc,
+                }]),
+            },
+        );
         assert_eq!(e.fx_gen(), 2);
         let wet = e.render_project().unwrap();
         let lo = wet.iter().take(4000).copied().fold(f32::MAX, f32::min);

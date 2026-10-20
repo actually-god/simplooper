@@ -775,6 +775,13 @@ fn e2e_metronome() {
         );
     }
 
+    // Playhead freeze: a bare metronome (transport off) must never drag
+    // the playhead along — regression for "the metronome forces the
+    // playback bar to advance".
+    let p0 = b.engine.pos();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(b.engine.pos(), p0, "bare metronome advanced the playhead");
+
     // --- Phase 2: subdivision change applies on the next quarter note ------
     let start2 = widx.load(Ordering::Relaxed);
     b.cmd(Cmd::SetMetro { on: true, bpm: 120, sub: 4, num: 4 });

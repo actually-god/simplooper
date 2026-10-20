@@ -121,8 +121,9 @@ concurrent e2e runs starve each other's JACK clients ("ensemble stalled").
    width bump + a migration arm in `midi::migrate_shortcuts`.
 3. **Behavior specs live in tests and docs** (`README.md`, `docs/USAGE.md`,
    `IDEA.md`, `tests/e2e.rs`). Current pins: the metronome defines the grid
-   and can run the playhead with the transport stopped (metro on + transport
-   off = click track, playhead rolls, clips silent); the click is
+   and runs on its own free-running clock while the transport is stopped
+   (metro on + transport off = click track, playhead frozen, clips silent);
+   the click is
    output-only, never recorded; a take always becomes a rack asset **and**
    an auto-placed clip, and overlaps open child lanes instead of touching
    existing clips; quantize is always metronome-based; the primary rack

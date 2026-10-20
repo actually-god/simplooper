@@ -39,7 +39,7 @@ use egui::{Color32, RichText, Sense, Slider};
 use crate::arrange::{Arrangement, Clip};
 use crate::assets::{Asset, RackFolder};
 use crate::audio::{
-    Backend, Cmd, Evt, FxSlot, GAIN_UNITY_MIDI, OutSel, PortInfo, TrackFx, MAX_LOOPS, TR_REC,
+    Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS, TR_REC,
 };
 use crate::config::{Config, MidiAxisCal, MidiBinding, TrackFxSave};
 use crate::fx;
@@ -115,7 +115,6 @@ struct MidiLine {
     raw_hex: String,
 }
 
-
 fn key_debug(k: egui::Key) -> String {
     format!("{k:?}")
 }
@@ -140,7 +139,10 @@ fn key_display(k: egui::Key) -> String {
 
 /// Parse a persisted key name back into an `egui::Key` (None if unknown).
 fn key_from_name(s: &str) -> Option<egui::Key> {
-    KEY_CANDIDATES.iter().find(|k| format!("{k:?}") == s).copied()
+    KEY_CANDIDATES
+        .iter()
+        .find(|k| format!("{k:?}") == s)
+        .copied()
 }
 
 // --- per-loop level controls ---------------------------------------------
@@ -266,7 +268,6 @@ struct KnobLearn {
     locked: bool,
 }
 
-
 /// Number of bindable actions — one keyboard slot per entry of
 /// [`MidiAction::ALL`].
 pub const N_ACTIONS: usize = MidiAction::ALL.len();
@@ -325,6 +326,10 @@ const COL_CLIP_SEL: Color32 = Color32::from_rgb(128, 200, 255);
 const COL_GHOST: Color32 = Color32::from_rgb(120, 160, 120);
 const COL_BAR_LINE: Color32 = Color32::from_gray(120);
 const COL_BEAT_LINE: Color32 = Color32::from_gray(68);
+/// Sub-beat snap lines: a third, even fainter tier drawn at the snap
+/// subdivision (grid-toolbar snap combo), so clip placement has a visible
+/// target without cluttering the bar/beat grid.
+const COL_SNAP_LINE: Color32 = Color32::from_rgba_premultiplied(120, 120, 128, 22);
 /// Nominal lane-strip height in the grid. A track's block is
 /// `lanes × LANE_H`, never shorter than `TRACK_MIN_H` (the height its
 /// mixer strip needs), so clips get tall waveforms and the mixer stays
@@ -340,9 +345,25 @@ const TRACK_SEP_HIT: f32 = 7.0;
 /// Loop region modes (see [`App::loop_mode`]); index = config value.
 const LOOP_MODES: [&str; 3] = ["area", "current longest", "whole song"];
 
+/// Timeline zoom range in px/second. The floor is tuned so max zoom-out
+/// shows ~100 measures in the ~940 pt viewport of the default 1440×853
+/// window at 80 BPM 4/4 (3 s per bar → 300 s → 940/300 ≈ 3.1 px/s), and
+/// the ceiling gives deep zoom-in for sample-level editing. The default
+/// stays at 160 px/s; the toolbar slider maps this range logarithmically,
+/// which puts the default near the slider's centre (≈60 %).
+const ZOOM_MIN: f32 = 3.0;
+const ZOOM_MAX: f32 = 2400.0;
+const ZOOM_DEFAULT: f32 = 160.0;
+/// Ctrl+wheel zoom sensitivity: 12 % per wheel line (trackpad pixel deltas
+/// use 1 % per px so a fast flick doesn't warp the timeline).
+const ZOOM_WHEEL_LINE: f32 = 0.12;
+const ZOOM_WHEEL_PX: f32 = 0.01;
+
 /// The user's home folder (projects default to `~/slooper-projects`).
 fn home_dir() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// The whole application: engine backend handle, persistent UI state, and
@@ -445,6 +466,12 @@ pub struct App {
     // --- asset rack ---
     rack: Vec<RackFolder>,
     sel_asset: Option<usize>,
+    /// Audition rack entries on click (Settings → ASSET PREVIEW).
+    preview_enabled: bool,
+    /// Text box value for the preview length in seconds.
+    preview_secs: String,
+    /// Asset name currently auditioning (clicking it again toggles stop).
+    preview_playing: Option<String>,
 
     // --- project file ---
     proj_name: String,
@@ -486,8 +513,6 @@ pub struct App {
     peak_disp: f32,
 }
 
-
-
 impl App {
     pub fn new(backend: Backend) -> Self {
         let cfg = Config::load();
@@ -507,7 +532,11 @@ impl App {
                 let saved: Vec<(String, Vec<f32>)> = cfg
                     .track_fx
                     .get(i)
-                    .map(|v| v.iter().map(|s| (s.stem.clone(), s.params.clone())).collect())
+                    .map(|v| {
+                        v.iter()
+                            .map(|s| (s.stem.clone(), s.params.clone()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 fx::merge_entries(&[], &fx_stems, &saved)
             })
@@ -515,7 +544,10 @@ impl App {
         // Keyboard table: this layout is trusted verbatim; older persisted
         // layouts are remapped, then defaults fill the gaps.
         let migrated = crate::midi::migrate_shortcuts(
-            &cfg.shortcuts.iter().map(|s| s.as_deref().and_then(key_from_name)).collect::<Vec<_>>(),
+            &cfg.shortcuts
+                .iter()
+                .map(|s| s.as_deref().and_then(key_from_name))
+                .collect::<Vec<_>>(),
         );
         let trusted = cfg.shortcuts.len() == N_ACTIONS;
         let short_keys = core::array::from_fn(|i| match migrated.get(i).copied().flatten() {
@@ -620,11 +652,15 @@ impl App {
             q_sub: sub_idx(cfg.q_sub),
             snap_sub: sub_idx(cfg.snap_sub),
             auto_quantize: cfg.auto_quantize,
-            latency_ms: if cfg.latency_ms == 0.0 { "0".into() } else { format!("{}", cfg.latency_ms) },
+            latency_ms: if cfg.latency_ms == 0.0 {
+                "0".into()
+            } else {
+                format!("{}", cfg.latency_ms)
+            },
             arr: Arrangement::new(),
             assets: Vec::new(),
             wave: HashMap::new(),
-            px_per_sec: 160.0,
+            px_per_sec: ZOOM_DEFAULT,
             drag_clip: None,
             scrub_drag: false,
             hscroll: 0.0,
@@ -639,6 +675,9 @@ impl App {
             copied_asset: None,
             rack,
             sel_asset: None,
+            preview_enabled: cfg.preview_on,
+            preview_secs: cfg.preview_secs.max(0.0).to_string(),
+            preview_playing: None,
             proj_name: String::new(),
             project_dir: cfg.project_dir.clone(),
             show_save_prompt: false,
@@ -675,15 +714,21 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() % 86_400)
             .unwrap_or(0);
-        format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+        format!(
+            "{:02}:{:02}:{:02}",
+            secs / 3600,
+            (secs / 60) % 60,
+            secs % 60
+        )
     }
 
     /// File-name suffix that keeps fresh recordings unique.
     fn fstamp() -> String {
-        let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         format!("{}{:03}", d.as_secs() % 100_000, d.subsec_millis())
     }
-
 
     /// Process all pending backend events right now (UI loop + tests).
     pub fn drain_events(&mut self) {
@@ -691,7 +736,6 @@ impl App {
             self.handle_evt(evt);
         }
     }
-
 
     /// Arm the MIDI "listening" slot for `idx` — what clicking a binding cell
     /// does; the next bindable MIDI message becomes that slot's binding.
@@ -711,7 +755,11 @@ impl App {
         self.learning_slot = None;
         self.knob_learn = Some(KnobLearn {
             slot: idx,
-            bind: MidiBind { ty: 0xff, ch: 0, d1: 0 },
+            bind: MidiBind {
+                ty: 0xff,
+                ch: 0,
+                d1: 0,
+            },
             has_axis: false,
             axis_locked: false,
             last_val: None,
@@ -759,7 +807,9 @@ impl App {
     /// inverted control) is stored exactly as captured — `scale_axis` flips
     /// it so the knob still reads low→high continuously.
     pub fn knob_finish(&mut self) {
-        let Some(kl) = self.knob_learn.take() else { return };
+        let Some(kl) = self.knob_learn.take() else {
+            return;
+        };
         if kl.hi == kl.lo {
             // Same raw value at both ends: there is nothing to scale against.
             self.knob_learn = Some(kl);
@@ -772,7 +822,11 @@ impl App {
         self.knob_cal[slot] = if lo == 0 && hi == 127 {
             None
         } else {
-            Some(MidiAxisCal { slot: slot as u16, lo, hi })
+            Some(MidiAxisCal {
+                slot: slot as u16,
+                lo,
+                hi,
+            })
         };
         self.save_config();
         self.status = format!(
@@ -828,7 +882,10 @@ impl App {
         // name). Checked before the text-focus guard: saving while a field
         // has focus is always meant as save.
         let (save, shift) = ctx.input(|i| {
-            (i.modifiers.command && i.key_pressed(egui::Key::S), i.modifiers.shift)
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::S),
+                i.modifiers.shift,
+            )
         });
         if save {
             self.request_save(shift);
@@ -858,7 +915,9 @@ impl App {
                             .get(c.asset as usize)
                             .map(|a| a.name.clone())
                             .unwrap_or_default();
-                        self.status = format!("copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead");
+                        self.status = format!(
+                            "copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead"
+                        );
                     }
                 }
             }
@@ -873,8 +932,11 @@ impl App {
                     let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
                     self.sel_clip = Some((t, lane, li));
                     self.push_project();
-                    self.status =
-                        format!("pasted at the playhead \u{b7} track {} {}", t + 1, if lane == 0 { "track" } else { "child lane" });
+                    self.status = format!(
+                        "pasted at the playhead \u{b7} track {} {}",
+                        t + 1,
+                        if lane == 0 { "track" } else { "child lane" }
+                    );
                 }
             }
             return; // swallow the key
@@ -888,7 +950,12 @@ impl App {
         if self.knob_learn.is_some() {
             let key = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(*key),
                     _ => None,
                 })
             });
@@ -907,8 +974,7 @@ impl App {
                             }
                             self.save_config();
                         }
-                        self.status =
-                            format!("{verb}: {}", MidiAction::ALL[kl.slot].label());
+                        self.status = format!("{verb}: {}", MidiAction::ALL[kl.slot].label());
                     }
                 }
             }
@@ -919,7 +985,12 @@ impl App {
         if let Some(slot) = self.learning_slot {
             let key = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(*key),
                     _ => None,
                 })
             });
@@ -934,8 +1005,7 @@ impl App {
                     self.short_keys[slot] = None;
                     self.learning_slot = None;
                     self.save_config();
-                    self.status =
-                        format!("cleared binding: {}", MidiAction::ALL[slot].label());
+                    self.status = format!("cleared binding: {}", MidiAction::ALL[slot].label());
                 } else {
                     match self.short_keys.iter().position(|s| *s == Some(k)) {
                         Some(s) if s != slot => {
@@ -959,7 +1029,12 @@ impl App {
         if let Some(slot) = self.midi_learning_slot {
             let key = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(*key),
                     _ => None,
                 })
             });
@@ -987,7 +1062,12 @@ impl App {
             i.events
                 .iter()
                 .filter_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => Some(*key),
                     _ => None,
                 })
                 .collect()
@@ -998,7 +1078,9 @@ impl App {
         // if they were open, and typing focus returned earlier). The asset
         // itself stays in the rack; only this placement disappears.
         if self.sel_clip.is_some()
-            && pressed_keys.iter().any(|k| matches!(k, egui::Key::Delete | egui::Key::Backspace))
+            && pressed_keys
+                .iter()
+                .any(|k| matches!(k, egui::Key::Delete | egui::Key::Backspace))
         {
             if let Some((t, k, ci)) = self.sel_clip.take() {
                 self.arr.remove_clip(t, k, ci);
@@ -1021,7 +1103,6 @@ impl App {
         }
     }
 
-
     /// Set loop `i`'s playback volume from a MIDI-range value (0..=127).
     fn set_trk_vol(&mut self, i: usize, v: u8) {
         self.trk_vol[i] = v;
@@ -1041,7 +1122,6 @@ impl App {
         self.backend.engine.set_loop_pan(i, pan01(v));
     }
 
-
     /// Rebuild loop `i`'s live effect chain from its window rows and hand it
     /// to the audio engine. Also seeds each row's slider values from the
     /// descriptors (stored values win, clamped to range).
@@ -1060,18 +1140,29 @@ impl App {
             if slots.len() >= fx::MAX_FX_PER_TRACK {
                 break;
             }
-            let Some(desc) = self.fx_registry.desc(&e.stem).cloned() else { continue };
+            let Some(desc) = self.fx_registry.desc(&e.stem).cloned() else {
+                continue;
+            };
             let vals = fx::seed_values(&e.params, &desc);
             e.params = vals.clone();
             if let Some(inst) =
-                self.fx_registry.create_instance(&e.stem, self.sample_rate as f64, &vals)
+                self.fx_registry
+                    .create_instance(&e.stem, self.sample_rate as f64, &vals)
             {
-                slots.push(FxSlot { inst: inst.clone(), desc });
+                slots.push(FxSlot {
+                    inst: inst.clone(),
+                    desc,
+                });
                 live.push(inst);
             }
         }
         self.fx_live[i] = live;
-        self.backend.cmd(Cmd::SetTrackEffects { i, chain: TrackFx { slots: std::sync::Arc::new(slots) } });
+        self.backend.cmd(Cmd::SetTrackEffects {
+            i,
+            chain: TrackFx {
+                slots: std::sync::Arc::new(slots),
+            },
+        });
     }
 
     /// Open (or reopen) the child editor window for loop `i`'s chain slot
@@ -1090,7 +1181,9 @@ impl App {
         };
         let inst = self.fx_live[i].get(slot).cloned();
         let desc = self.fx_registry.desc(&stem).cloned();
-        let (Some(inst), Some(desc)) = (inst, desc) else { return };
+        let (Some(inst), Some(desc)) = (inst, desc) else {
+            return;
+        };
         let gui = self.fx_registry.gui(&stem);
         self.fx_editor = Some(Box::new(crate::fxgui::FxEditor::new(
             i,
@@ -1114,8 +1207,10 @@ impl App {
             closed = !crate::fxgui::window(ui, ed);
             let pend = std::mem::take(&mut ed.pending);
             if !pend.is_empty() {
-                if let Some(e) =
-                    self.fx_entries[ed.loop_i].iter_mut().filter(|e| e.enabled).nth(ed.slot)
+                if let Some(e) = self.fx_entries[ed.loop_i]
+                    .iter_mut()
+                    .filter(|e| e.enabled)
+                    .nth(ed.slot)
                 {
                     for (k, v) in pend {
                         if let Some(p) = e.params.get_mut(k) {
@@ -1157,19 +1252,30 @@ impl App {
             self.rebuild_fx(i);
         }
         let ok = self.fx_registry.stems().len();
-        let bad = self.fx_registry.items().iter().filter(|e| e.error.is_some()).count();
+        let bad = self
+            .fx_registry
+            .items()
+            .iter()
+            .filter(|e| e.error.is_some())
+            .count();
         self.fx_note = format!("{ok} valid effect(s), {bad} rejected");
     }
 
-
-
     // ---- grid maths ------------------------------------------------------
     fn bpm(&self) -> u32 {
-        self.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300)
+        self.metro_bpm
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(120)
+            .clamp(20, 300)
     }
 
     fn beats(&self) -> u32 {
-        self.metro_num.trim().parse::<u32>().unwrap_or(4).clamp(1, 16)
+        self.metro_num
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(4)
+            .clamp(1, 16)
     }
 
     /// One measure of the metronome grid, in engine samples: the timeline's
@@ -1189,7 +1295,57 @@ impl App {
     }
 
     fn asset_len(&self, id: u32) -> u64 {
-        self.assets.get(id as usize).map(|a| a.data.len() as u64).unwrap_or(0)
+        self.assets
+            .get(id as usize)
+            .map(|a| a.data.len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Preview length in seconds (Settings text box, clamped 0.25…600 s;
+    /// unparsable input falls back to the 5 s default).
+    fn preview_secs_f(&self) -> f32 {
+        self.preview_secs
+            .trim()
+            .parse::<f32>()
+            .unwrap_or(5.0)
+            .clamp(0.25, 600.0)
+    }
+
+    /// Audition asset `k` at the master output (asset-rack preview): an
+    /// asset no longer than the preview length plays in full, a longer one
+    /// plays its first `preview_secs` seconds. Clicking the asset that is
+    /// already auditioning stops it. Engine-side the buffer auto-stops at
+    /// its end, so `preview_playing` is only ever a hair stale.
+    fn preview_asset(&mut self, k: usize) {
+        if !self.preview_enabled {
+            return;
+        }
+        let Some(a) = self.assets.get(k) else { return };
+        let key = a.path.to_string_lossy().into_owned();
+        // Toggle: clicking the entry that is auditioning stops the click.
+        if self.preview_playing.as_deref() == Some(key.as_str()) {
+            self.preview_playing = None;
+            self.backend.cmd(Cmd::PreviewStop);
+            self.status = "preview stopped".into();
+            return;
+        }
+        if self.sample_rate == 0 {
+            self.status = "preview: wait for the audio engine".into();
+            return;
+        }
+        let cap = (self.preview_secs_f() as f64 * self.sample_rate as f64) as usize;
+        let full = a.data.len();
+        let end = full.min(cap.max(1));
+        let samples: Arc<[f32]> = if end >= full {
+            a.data.clone()
+        } else {
+            Arc::from(&a.data[..end])
+        };
+        let secs = end as f64 / self.sample_rate as f64;
+        let nm = a.name.clone();
+        self.preview_playing = Some(key);
+        self.backend.cmd(Cmd::PreviewPlay { samples });
+        self.status = format!("previewing {nm} ({secs:.1} s)");
     }
 
     /// Total timeline length: last clip end, rounded up to whole bars.
@@ -1260,8 +1416,7 @@ impl App {
 
     /// User height for track `t` (clamped to the lane floor and a sane max).
     fn set_track_h(&mut self, t: usize, h: f32) {
-        let floor = (self.arr.tracks[t].lanes.len().max(1) as f32 * LANE_MIN_H)
-            .max(TRACK_MIN_H);
+        let floor = (self.arr.tracks[t].lanes.len().max(1) as f32 * LANE_MIN_H).max(TRACK_MIN_H);
         if let Some(s) = self.trk_height.get_mut(t) {
             *s = h.clamp(floor, 1600.0);
         }
@@ -1285,41 +1440,69 @@ impl App {
             Arc::new(self.assets.iter().map(|a| a.data.clone()).collect());
         let arr = Arc::new(self.arr.clone());
         let len = self.total_len();
-        self.backend.cmd(Cmd::SetProject { assets: table, arr, len });
+        self.backend.cmd(Cmd::SetProject {
+            assets: table,
+            arr,
+            len,
+        });
         // "current longest" / "whole song" regions follow the arrangement.
         self.send_loop_region();
     }
 
     fn send_metro(&mut self) {
-        let bpm = self.metro_bpm.trim().parse::<u32>().unwrap_or(120).clamp(20, 300);
+        let bpm = self
+            .metro_bpm
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(120)
+            .clamp(20, 300);
         self.backend.cmd(Cmd::SetMetro {
             on: self.metro_on,
             bpm,
             sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
-            num: self.metro_num.trim().parse::<u32>().unwrap_or(4).clamp(1, 16),
+            num: self
+                .metro_num
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(4)
+                .clamp(1, 16),
         });
         self.save_config();
     }
-
-
 
     /// Persist every user-facing setting (bindings, mixer, grid, rack,
     /// ports, effects chains) to disk.
     fn save_config(&self) {
         let cfg = Config {
-            shortcuts: (0..N_ACTIONS).map(|i| self.short_keys[i].map(key_debug)).collect(),
+            shortcuts: (0..N_ACTIONS)
+                .map(|i| self.short_keys[i].map(key_debug))
+                .collect(),
             midi: MidiAction::ALL
                 .iter()
                 .zip(self.midi_binds.iter())
-                .filter_map(|(a, b)| b.map(|bind| MidiBinding { action: *a, bind: Some(bind) }))
+                .filter_map(|(a, b)| {
+                    b.map(|bind| MidiBinding {
+                        action: *a,
+                        bind: Some(bind),
+                    })
+                })
                 .collect(),
             midi_axis: self
                 .knob_cal
                 .iter()
                 .enumerate()
-                .filter_map(|(i, c)| c.map(|mut m| { m.slot = i as u16; m }))
+                .filter_map(|(i, c)| {
+                    c.map(|mut m| {
+                        m.slot = i as u16;
+                        m
+                    })
+                })
                 .collect(),
-            ports_in: self.applied_ports.as_ref().map(|p| p.0.clone()).unwrap_or_default(),
+            ports_in: self
+                .applied_ports
+                .as_ref()
+                .map(|p| p.0.clone())
+                .unwrap_or_default(),
             ports_out: self
                 .applied_ports
                 .as_ref()
@@ -1331,7 +1514,12 @@ impl App {
                 .map(|p| p.1.iter().map(|(_, lr)| *lr).collect())
                 .unwrap_or_default(),
             gui_scale: self.gui_scale,
-            latency_ms: self.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0),
+            latency_ms: self
+                .latency_ms
+                .trim()
+                .parse::<f32>()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1000.0),
             trk_vol: self.trk_vol.to_vec(),
             trk_gain: self.trk_gain.to_vec(),
             trk_pan: self.trk_pan.to_vec(),
@@ -1347,6 +1535,8 @@ impl App {
             loop_area_start: self.loop_area.0,
             loop_area_end: self.loop_area.1,
             master_vol: self.master_midi,
+            preview_on: self.preview_enabled,
+            preview_secs: self.preview_secs_f(),
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
@@ -1356,7 +1546,10 @@ impl App {
                     self.fx_entries[i]
                         .iter()
                         .filter(|e| e.enabled)
-                        .map(|e| TrackFxSave { stem: e.stem.clone(), params: e.params.clone() })
+                        .map(|e| TrackFxSave {
+                            stem: e.stem.clone(),
+                            params: e.params.clone(),
+                        })
                         .collect()
                 })
                 .collect(),
@@ -1365,8 +1558,6 @@ impl App {
             eprintln!("[slooper] could not save config: {e}");
         }
     }
-
-
 
     // ---- DAW actions -----------------------------------------------------
     fn toggle_record(&mut self, i: usize) {
@@ -1424,7 +1615,13 @@ impl App {
         }
         let id = self.assets.len() as u32;
         let len = data.len() as u64;
-        self.assets.push(Asset { id, name, path, data, dirty });
+        self.assets.push(Asset {
+            id,
+            name,
+            path,
+            data,
+            dirty,
+        });
         self.sel_asset = Some(id as usize);
         let pos = snap_start(at, self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
@@ -1556,13 +1753,22 @@ impl App {
                 fx: self.fx_entries[t]
                     .iter()
                     .filter(|e| e.enabled)
-                    .map(|e| TrackFxSave { stem: e.stem.clone(), params: e.params.clone() })
+                    .map(|e| TrackFxSave {
+                        stem: e.stem.clone(),
+                        params: e.params.clone(),
+                    })
                     .collect(),
                 lanes: self.arr.tracks[t]
                     .lanes
                     .iter()
                     .map(|l| {
-                        l.clips.iter().map(|c| ProjClip { asset: c.asset, pos: c.pos }).collect()
+                        l.clips
+                            .iter()
+                            .map(|c| ProjClip {
+                                asset: c.asset,
+                                pos: c.pos,
+                            })
+                            .collect()
                     })
                     .collect(),
             })
@@ -1624,7 +1830,11 @@ impl App {
             let p = audio_dir.join(format!(
                 "{:03}-{}.wav",
                 a.id,
-                if stem.is_empty() { "asset".to_string() } else { stem }
+                if stem.is_empty() {
+                    "asset".to_string()
+                } else {
+                    stem
+                }
             ));
             match crate::audio_io::export(
                 &p,
@@ -1677,7 +1887,10 @@ impl App {
         let mut missing = 0usize;
         for (i, pa) in pr.assets.iter().enumerate() {
             let found = project::resolve_asset(&pa.file, &dirs);
-            match found.as_ref().and_then(|p| crate::audio_io::decode_to_mono(p, sr).ok()) {
+            match found
+                .as_ref()
+                .and_then(|p| crate::audio_io::decode_to_mono(p, sr).ok())
+            {
                 Some(v) => assets.push(Asset {
                     id: i as u32,
                     name: pa.name.clone(),
@@ -1716,11 +1929,21 @@ impl App {
                     arr.tracks[t].add_lane();
                 }
                 for c in lane {
-                    arr.insert(t, k, Clip { asset: c.asset, pos: c.pos });
+                    arr.insert(
+                        t,
+                        k,
+                        Clip {
+                            asset: c.asset,
+                            pos: c.pos,
+                        },
+                    );
                 }
             }
-            let saved: Vec<(String, Vec<f32>)> =
-                pt.fx.iter().map(|s| (s.stem.clone(), s.params.clone())).collect();
+            let saved: Vec<(String, Vec<f32>)> = pt
+                .fx
+                .iter()
+                .map(|s| (s.stem.clone(), s.params.clone()))
+                .collect();
             let stems = self.fx_registry.stems();
             self.fx_entries[t] = fx::merge_entries(&[], &stems, &saved);
             self.rebuild_fx(t);
@@ -1736,11 +1959,18 @@ impl App {
         self.sel_clip = None;
         self.metro_bpm = pr.metro.bpm.to_string();
         self.metro_num = pr.metro.num.to_string();
-        self.metro_sub =
-            SUBDIVISIONS.iter().position(|(c, _)| *c == pr.metro.sub).unwrap_or(0);
-        self.q_sub = SUBDIVISIONS.iter().position(|(c, _)| *c == pr.quantize.q_sub).unwrap_or(3);
-        self.snap_sub =
-            SUBDIVISIONS.iter().position(|(c, _)| *c == pr.quantize.snap_sub).unwrap_or(3);
+        self.metro_sub = SUBDIVISIONS
+            .iter()
+            .position(|(c, _)| *c == pr.metro.sub)
+            .unwrap_or(0);
+        self.q_sub = SUBDIVISIONS
+            .iter()
+            .position(|(c, _)| *c == pr.quantize.q_sub)
+            .unwrap_or(3);
+        self.snap_sub = SUBDIVISIONS
+            .iter()
+            .position(|(c, _)| *c == pr.quantize.snap_sub)
+            .unwrap_or(3);
         self.auto_quantize = pr.quantize.auto;
         self.loop_tl = pr.quantize.loop_tl;
         self.backend.cmd(Cmd::SetLoop(self.loop_tl));
@@ -1754,7 +1984,10 @@ impl App {
         self.status = if missing == 0 {
             format!("loaded project “{}” ({} assets)", pr.name, pr.assets.len())
         } else {
-            format!("loaded “{}”: {} asset(s) missing (silent)", pr.name, missing)
+            format!(
+                "loaded “{}”: {} asset(s) missing (silent)",
+                pr.name, missing
+            )
         };
     }
 
@@ -1778,7 +2011,11 @@ impl App {
         if self.export_whole {
             self.backend.cmd(Cmd::ExportProject { path, fmt });
         } else {
-            self.backend.cmd(Cmd::ExportTrack { i: self.selected, path, fmt });
+            self.backend.cmd(Cmd::ExportTrack {
+                i: self.selected,
+                path,
+                fmt,
+            });
         }
         self.show_export = false;
     }
@@ -1820,12 +2057,16 @@ impl App {
     fn handle_evt(&mut self, evt: Evt) {
         match evt {
             Evt::Unavailable(msg) => self.status = msg,
-            Evt::Ready { client_name, sample_rate } => {
+            Evt::Ready {
+                client_name,
+                sample_rate,
+            } => {
                 self.client_name = Some(client_name.clone());
                 self.sample_rate = sample_rate;
                 self.status = "JACK ready — select ports, then Apply".into();
-                self.backend
-                    .cmd(Cmd::SetLatency { ms: self.latency_ms.trim().parse().unwrap_or(0.0) });
+                self.backend.cmd(Cmd::SetLatency {
+                    ms: self.latency_ms.trim().parse().unwrap_or(0.0),
+                });
                 self.backend.cmd(Cmd::SetLoop(self.loop_tl));
                 self.send_metro();
                 // Effect instances made before the backend was up were
@@ -1839,7 +2080,10 @@ impl App {
                 // session so audio flows on launch without re-clicking.
                 if let Some((ins, outs)) = &self.applied_ports {
                     if !ins.is_empty() || !outs.is_empty() {
-                        self.backend.cmd(Cmd::Apply { ins: ins.clone(), outs: outs.clone() });
+                        self.backend.cmd(Cmd::Apply {
+                            ins: ins.clone(),
+                            outs: outs.clone(),
+                        });
                     }
                 }
                 self.push_project();
@@ -1853,11 +2097,15 @@ impl App {
                 self.status = format!("applied: {} in / {} out", ins, outs);
             }
             Evt::Transport { on } => {
-                self.status = if on { "transport running".into() } else { "transport stopped".into() };
+                self.status = if on {
+                    "transport running".into()
+                } else {
+                    "transport stopped".into()
+                };
             }
             Evt::Take { track, at, data } => self.take_pipeline(track, at, data),
 
-                    Evt::Midi(raw) => {
+            Evt::Midi(raw) => {
                 if let Some(msg) = MidiMsg::parse(&raw.bytes) {
                     // Bindable messages drive every bound action (Settings →
                     // MIDI Bindings); value/velocity are ignored.
@@ -1871,8 +2119,11 @@ impl App {
                                 // stale min/max calibration for the slot.
                                 self.knob_cal[slot] = None;
                                 self.save_config();
-                                self.status =
-                                    format!("bound {} → {}", MidiAction::ALL[slot].label(), bind.label());
+                                self.status = format!(
+                                    "bound {} → {}",
+                                    MidiAction::ALL[slot].label(),
+                                    bind.label()
+                                );
                             }
                             self.midi_learning_slot = None;
                         } else if let Some(kl) = self.knob_learn.as_mut() {
@@ -1887,7 +2138,9 @@ impl App {
                             // numbers mid-sweep.
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
-                                MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => Some(*velocity),
+                                MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
+                                    Some(*velocity)
+                                }
                                 MidiMsg::ProgramChange { program, .. } => Some(*program),
                                 _ => None,
                             };
@@ -1939,7 +2192,9 @@ impl App {
                                 _ => None,
                             };
                             for i in 0..N_ACTIONS {
-                                let Some(b) = self.midi_binds[i] else { continue };
+                                let Some(b) = self.midi_binds[i] else {
+                                    continue;
+                                };
                                 // A continuous (knob) binding owns its whole
                                 // axis (type + channel) — the wizard never
                                 // binds the data byte, so CC-number drift
@@ -1999,17 +2254,15 @@ impl App {
                 }
             }
 
-                    Evt::MidiSources(names) => {
+            Evt::MidiSources(names) => {
                 self.midi_sources = names;
             }
             Evt::Notice(msg) => self.status = msg,
             Evt::Xrun => {}
             Evt::Error(e) => self.status = e,
-
         }
     }
 }
-
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
@@ -2019,7 +2272,11 @@ impl eframe::App for App {
         // runs or a take rolls, tick at ~50 fps so the playhead is smooth.
         let active = self.backend.engine.transport_on()
             || (0..MAX_LOOPS).any(|t| self.backend.engine.rec_state_of(t) == TR_REC);
-        ctx.request_repaint_after(std::time::Duration::from_millis(if active { 20 } else { 100 }));
+        ctx.request_repaint_after(std::time::Duration::from_millis(if active {
+            20
+        } else {
+            100
+        }));
 
         self.handle_shortcuts(ctx);
 
@@ -2055,13 +2312,27 @@ impl App {
         // claim those gestures is here: remove the raw events and zero the
         // deltas, then apply them ourselves. Plain wheel is left alone so
         // ScrollAreas (rack, mixer, track stack) keep scrolling normally.
-        let mut zoom = 0.0f32;
+        // Zoom accumulates in log space (sum of delta·scale, then exp) so
+        // scrolling in then out by the same amount returns exactly, several
+        // events in one frame compose geometrically, and the per-event
+        // scale differs by wheel unit: one notch is a LINE, a trackpad
+        // flick reports PIXELS.
+        let mut zoom_ln = 0.0f32;
         let mut pan = 0.0f32;
         ui.ctx().input_mut(|i| {
             i.events.retain(|e| match e {
-                egui::Event::MouseWheel { delta, modifiers, .. } => {
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } => {
                     if modifiers.command || modifiers.ctrl {
-                        zoom += delta.y;
+                        let s = match unit {
+                            egui::MouseWheelUnit::Line => ZOOM_WHEEL_LINE,
+                            _ => ZOOM_WHEEL_PX,
+                        };
+                        zoom_ln += (delta.y * s).clamp(-1.5, 1.5);
                         false
                     } else if modifiers.shift {
                         pan += delta.x + delta.y;
@@ -2072,12 +2343,12 @@ impl App {
                 }
                 _ => true,
             });
-            if zoom != 0.0 || pan != 0.0 {
+            if zoom_ln != 0.0 || pan != 0.0 {
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
             }
         });
-        if zoom != 0.0 {
-            self.px_per_sec = (self.px_per_sec * (1.0 + zoom * 0.006)).clamp(24.0, 1200.0);
+        if zoom_ln != 0.0 {
+            self.px_per_sec = (self.px_per_sec * zoom_ln.exp()).clamp(ZOOM_MIN, ZOOM_MAX);
         }
         if pan != 0.0 {
             self.hscroll = (self.hscroll - pan * 2.0).max(0.0);
@@ -2140,7 +2411,6 @@ impl App {
     }
 }
 
-
 fn top_bar(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::top("topbar").exact_size(44.0).show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -2157,7 +2427,11 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             egui::vec2(20.0, 2.0),
                         ),
                         1.0,
-                        if app.show_settings { Color32::WHITE } else { Color32::from_rgb(200, 200, 205) },
+                        if app.show_settings {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(200, 200, 205)
+                        },
                     );
                 }
             }
@@ -2193,33 +2467,59 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                  from the playhead. Stop holds the position.",
             );
             if play_btn.clicked() {
-                app.backend.cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
+                app.backend
+                    .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
             }
             ui.label(RichText::new(pos_label(app)).monospace());
 
             // ---- metronome / grid tempo ----
             ui.separator();
-            if ui.checkbox(&mut app.metro_on, "metro").on_hover_text("Metronome click on the grid (never recorded)").changed() {
+            // Start/stop button (was a checkbox): lights up while the
+            // click runs, like the transport button next to it.
+            let metro_btn = ui
+                .add_sized(
+                    [58.0, 20.0],
+                    egui::Button::selectable(
+                        app.metro_on,
+                        RichText::new(if app.metro_on { "STOP" } else { "METRO" })
+                            .strong()
+                            .small(),
+                    ),
+                )
+                .on_hover_text(
+                    "Metronome start/stop: ticks the grid at the playhead \
+                     without moving it (never recorded). M also toggles it.",
+                );
+            if metro_btn.clicked() {
+                app.metro_on = !app.metro_on;
                 app.send_metro();
             }
             ui.label("bpm");
-            let mut bpm_edit = app.metro_bpm.clone();
-            let commit = ui
-                .add(egui::TextEdit::singleline(&mut bpm_edit).desired_width(38.0))
-                .lost_focus()
-                || ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if commit {
-                app.metro_bpm = bpm_edit;
+            // Bound straight to the app state: the old pattern of cloning
+            // into a local EVERY FRAME wiped each keystroke before it could
+            // land, so the box could never be edited (it snapped back to
+            // the saved value). Commit to the engine on Enter / focus-out.
+            let bpm_rt = ui
+                .add(
+                    egui::TextEdit::singleline(&mut app.metro_bpm)
+                        .desired_width(38.0)
+                        .horizontal_align(egui::Align::Center)
+                        .font(egui::TextStyle::Monospace),
+                )
+                .on_hover_text("Grid tempo 20..300 BPM. Press Enter to apply.");
+            if bpm_rt.lost_focus() {
                 app.send_metro();
             }
             ui.label("beat");
-            let mut num_edit = app.metro_num.clone();
-            let commit = ui
-                .add(egui::TextEdit::singleline(&mut num_edit).desired_width(24.0))
-                .lost_focus()
-                || ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if commit {
-                app.metro_num = num_edit;
+            let num_rt = ui
+                .add(
+                    egui::TextEdit::singleline(&mut app.metro_num)
+                        .desired_width(24.0)
+                        .horizontal_align(egui::Align::Center)
+                        .font(egui::TextStyle::Monospace),
+                )
+                .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
+            if num_rt.lost_focus() {
                 app.send_metro();
             }
 
@@ -2238,12 +2538,49 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 };
                 if frac > 0.01 {
                     painter.rect_filled(
-                        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height())),
+                        egui::Rect::from_min_size(
+                            rect.min,
+                            egui::vec2(rect.width() * frac, rect.height()),
+                        ),
                         1.0,
                         color,
                     );
                 }
                 ui.label(RichText::new("vol").strong().small());
+                // Master volume now mirrors the per-track rows: editable dB
+                // text box, slider, raw MIDI readout and a "0" zeroize
+                // button. The scratch edit lives in `lv_edit` under the
+                // sentinel track index so it can't collide with a track.
+                const MASTER_IDX: usize = usize::MAX;
+                let mut mtxt = app
+                    .lv_edit
+                    .get(&(KIND_VOL, MASTER_IDX))
+                    .cloned()
+                    .unwrap_or_else(|| db_num(vol_amp(app.master_midi)));
+                let mrt = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut mtxt)
+                            .desired_width(46.0)
+                            .horizontal_align(egui::Align::Center)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .on_hover_text("Master level in dB (e.g. -6.5). Press Enter to apply.");
+                ui.add(
+                    egui::Label::new(RichText::new("dB").monospace().weak().small())
+                        .selectable(false),
+                );
+                if mrt.has_focus() {
+                    app.lv_edit.insert((KIND_VOL, MASTER_IDX), mtxt.clone());
+                } else {
+                    app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
+                }
+                if mrt.lost_focus() && ui.input(|u| u.key_pressed(egui::Key::Enter)) {
+                    if let Some(v) = level_parse(KIND_VOL, &mtxt) {
+                        app.master_midi = v;
+                        app.levels_dirty = true;
+                    }
+                    app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
+                }
                 let mut mv = app.master_midi as i16;
                 if ui
                     .add_sized(
@@ -2256,19 +2593,34 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     app.master_midi = mv.clamp(0, 127) as u8;
                     app.levels_dirty = true;
                 }
-                ui.label(
-                    RichText::new(db_str(vol_amp(app.master_midi)))
-                        .monospace()
-                        .small(),
+                ui.add(
+                    egui::Label::new(RichText::new(format!("{mv:>3}")).monospace().weak().small())
+                        .selectable(false),
                 )
-                .on_hover_text("Master output volume");
+                .on_hover_text("Raw MIDI value (0..=127) of the master fader.");
+                if ui
+                    .small_button(RichText::new("0").monospace())
+                    .on_hover_text("Reset master volume to 0 dB")
+                    .clicked()
+                {
+                    app.master_midi = VOL_UNITY_MIDI;
+                    app.levels_dirty = true;
+                }
                 if ui.button("Export").clicked() {
                     app.show_export = true;
                 }
-                if ui.button("Load").on_hover_text("Browse saved projects").clicked() {
+                if ui
+                    .button("Load")
+                    .on_hover_text("Browse saved projects")
+                    .clicked()
+                {
                     app.show_load = true;
                 }
-                if ui.button("Save as").on_hover_text("Save under a new name").clicked() {
+                if ui
+                    .button("Save as")
+                    .on_hover_text("Save under a new name")
+                    .clicked()
+                {
                     app.request_save(true);
                 }
                 let save_tip = match &app.proj_name {
@@ -2296,9 +2648,11 @@ fn pos_label(app: &App) -> String {
     format!("{}.{}  {}:{:04.1}", bar, beat, (t / 60.0) as u64, t % 60.0)
 }
 
-
 fn base_name(p: &str) -> String {
-    Path::new(p.trim()).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.trim().to_string())
+    Path::new(p.trim())
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.trim().to_string())
 }
 
 /// Rack row snapshot: (folder path, [(file name, path)], scan error).
@@ -2389,7 +2743,10 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         // and silently kill the row's own clicked().
                         let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, &name)), Sense::click_and_drag());
                         if dr.clicked() {
-                            app.ensure_asset(&fp);
+                            // Click = select + audition (asset preview).
+                            if let Some(k) = app.ensure_asset(&fp) {
+                                app.preview_asset(k);
+                            }
                         }
                         if dr.drag_started() {
                             if let Some(k) = app.ensure_asset(&fp) {
@@ -2403,7 +2760,10 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 dr.dnd_set_drag_payload(k);
                             }
                         }
-                        row.on_hover_text(format!("{} — click to select, drag onto a lane", fp.display()));
+                        row.on_hover_text(format!(
+                            "{} \u{b7} click to audition (preview), drag onto a lane to place a clip",
+                            fp.display()
+                        ));
                     }
                 }
                 if let Some(fi) = rescan {
@@ -2457,6 +2817,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         let dr = ui.interact(row.rect, ui.id().with(("assetdrag", k)), Sense::click_and_drag());
                         if dr.clicked() {
                             app.sel_asset = Some(k);
+                            app.preview_asset(k);
                         }
                         if dr.drag_started() {
                             dr.dnd_set_drag_payload(k);
@@ -2492,7 +2853,6 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
             });
         });
 }
-
 
 /// The mixer dock: every track's controls, as one strip per track, pinned
 /// to the right like the asset rack. Strip heights come from [`App::track_h`]
@@ -2684,15 +3044,20 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             app.save_config();
         }
         if app.loop_tl && app.loop_mode == 0 {
-            ui.label(
-                RichText::new("(drag the ruler handles)")
-                    .weak()
-                    .small(),
-            );
+            ui.label(RichText::new("(drag the ruler handles)").weak().small());
         }
         ui.separator();
         ui.label("zoom");
-        if ui.add(Slider::new(&mut app.px_per_sec, 24.0..=1200.0).show_value(false)).changed() {}
+        // Logarithmic so the default (160 px/s) sits near the centre of the
+        // 3..2400 range: max-out shows ~100 bars, max-in edits samples.
+        if ui
+            .add(
+                Slider::new(&mut app.px_per_sec, ZOOM_MIN..=ZOOM_MAX)
+                    .logarithmic(true)
+                    .show_value(false),
+            )
+            .changed()
+        {}
     });
 }
 
@@ -2756,16 +3121,37 @@ fn s_at(x0: f32, x: f32, sr: f64, px: f64) -> u64 {
     (((x - x0).max(0.0) as f64 / px) * sr) as u64
 }
 
-/// Paint the metronome grid (bar lines bold, beat lines faint) plus the
+/// Paint the metronome grid (bar lines bold, beat lines faint, sub-beat
+/// snap lines even fainter — drawn at the snap subdivision) plus the
 /// playhead across `rect`. `x0` is where timeline position 0 sits in point
 /// coordinates — left of `rect` whenever the view is panned — so every strip
 /// (pinned ruler and lane alike) maps samples through the identical window
 /// and the playhead renders as one straight line across the whole grid.
-fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, px: f64, sr: f64, ruler: bool, x0: f32) {
+fn paint_grid(
+    ui: &mut egui::Ui,
+    app: &App,
+    rect: egui::Rect,
+    px: f64,
+    sr: f64,
+    ruler: bool,
+    x0: f32,
+) {
     let p = ui.painter();
-    p.rect_filled(rect, 0.0, if ruler { Color32::from_rgb(34, 34, 40) } else { Color32::from_rgb(24, 24, 29) });
+    p.rect_filled(
+        rect,
+        0.0,
+        if ruler {
+            Color32::from_rgb(34, 34, 40)
+        } else {
+            Color32::from_rgb(24, 24, 29)
+        },
+    );
     let beat_px = quantize::beat_samples(sr as u32, app.bpm()) * (px / sr);
     let num = app.beats() as u64;
+    // Sub-beat snap tier: follow the snap combo, but only while the step
+    // stays readable (≥4 px apart) and actually subdivides the beat.
+    let steps = SUBDIVISIONS[app.snap_sub].0;
+    let snap_on = steps > 1 && (beat_px / steps as f64) > 4.0;
     if beat_px > 3.0 {
         // Only the beats inside this strip's visible window (cheap at any
         // project length, correct under panning).
@@ -2776,10 +3162,27 @@ fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, px: f64, sr: f64, 
             if x < rect.min.x - 1.0 || x > rect.max.x + 1.0 {
                 continue;
             }
+            // Snap steps between this beat and the next (k = 0 is the beat
+            // line itself; snap subdivisions never coincide with a beat).
+            if snap_on {
+                for k in 1..steps {
+                    let sx = x0 + ((b as f64 + k as f64 / steps as f64) * beat_px) as f32;
+                    if sx < rect.min.x - 1.0 || sx > rect.max.x + 1.0 {
+                        continue;
+                    }
+                    p.line_segment(
+                        [egui::pos2(sx, rect.min.y), egui::pos2(sx, rect.max.y)],
+                        egui::Stroke::new(0.6, COL_SNAP_LINE),
+                    );
+                }
+            }
             let bar = b % num == 0;
             p.line_segment(
                 [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
-                egui::Stroke::new(if bar { 1.3 } else { 0.6 }, if bar { COL_BAR_LINE } else { COL_BEAT_LINE }),
+                egui::Stroke::new(
+                    if bar { 1.3 } else { 0.6 },
+                    if bar { COL_BAR_LINE } else { COL_BEAT_LINE },
+                ),
             );
             if ruler && bar && beat_px * num as f64 > 44.0 {
                 p.text(
@@ -2860,7 +3263,11 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                 && app.loop_mode == 0
                 && (pt.x - hx0).abs().min((pt.x - hx1).abs()) <= 7.0
             {
-                Some(if (pt.x - hx0).abs() <= (pt.x - hx1).abs() { 0 } else { 1 })
+                Some(if (pt.x - hx0).abs() <= (pt.x - hx1).abs() {
+                    0
+                } else {
+                    1
+                })
             } else {
                 None
             };
@@ -2870,8 +3277,14 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                 let snapu = app.snap_unit();
                 let pos = snap_start(s_at(x0, pt.x, sr, px), snapu);
                 let bar = app.bar_samples();
-                let (mut s, mut e) =
-                    (app.loop_area.0, if app.loop_area.1 == 0 { 2 * bar } else { app.loop_area.1 });
+                let (mut s, mut e) = (
+                    app.loop_area.0,
+                    if app.loop_area.1 == 0 {
+                        2 * bar
+                    } else {
+                        app.loop_area.1
+                    },
+                );
                 if h == 0 {
                     s = pos.min(e.saturating_sub(1));
                 } else {
@@ -2914,7 +3327,11 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
             egui::vec2(r.width(), TRACK_SEP),
         ),
         0.0,
-        if hot { Color32::from_rgb(96, 96, 116) } else { Color32::from_rgb(56, 56, 64) },
+        if hot {
+            Color32::from_rgb(96, 96, 116)
+        } else {
+            Color32::from_rgb(56, 56, 64)
+        },
     );
     if sep.drag_started_by(egui::PointerButton::Primary) {
         if let Some(pt) = sep.interact_pointer_pos() {
@@ -2945,18 +3362,32 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
 /// egui's native drag-and-drop (the old cross-response handoff dropped
 /// nothing because the rack owned the pointer).
 #[allow(clippy::too_many_arguments)] // (grid geometry) + (view state) tuples read worse
-fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f64, sr: f64, h: f32) {
+fn lane_row(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    t: usize,
+    k: usize,
+    w: f32,
+    px: f64,
+    sr: f64,
+    h: f32,
+) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag());
     let x0 = rect.min.x - app.hscroll;
     let snapu = app.snap_unit();
     let sel_clip = app.sel_clip;
-    let clips: Vec<(Clip, String)> = app
-        .arr
-        .tracks[t]
-        .lanes[k]
+    let clips: Vec<(Clip, String)> = app.arr.tracks[t].lanes[k]
         .clips
         .iter()
-        .map(|c| (*c, app.assets.get(c.asset as usize).map(|a| a.name.clone()).unwrap_or_default()))
+        .map(|c| {
+            (
+                *c,
+                app.assets
+                    .get(c.asset as usize)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
 
     // ---- paint (clipped to this strip) ----
@@ -2984,7 +3415,10 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
             ui,
             app,
             c.asset,
-            egui::Rect::from_min_max(egui::pos2(cx0, rect.min.y + 1.0), egui::pos2(cx1, rect.max.y - 1.0)),
+            egui::Rect::from_min_max(
+                egui::pos2(cx0, rect.min.y + 1.0),
+                egui::pos2(cx1, rect.max.y - 1.0),
+            ),
             COL_CLIP,
             sel,
         );
@@ -3021,7 +3455,10 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
         let gx0 = x_of(x0, ns, sr, px).clamp(rect.min.x, rect.max.x);
         let gx1 = x_of(x0, ns + len, sr, px).clamp(rect.min.x + 2.0, rect.max.x);
         ui.painter().rect_stroke(
-            egui::Rect::from_min_max(egui::pos2(gx0, rect.min.y + 1.0), egui::pos2(gx1, rect.max.y - 1.0)),
+            egui::Rect::from_min_max(
+                egui::pos2(gx0, rect.min.y + 1.0),
+                egui::pos2(gx1, rect.max.y - 1.0),
+            ),
             2.0,
             egui::Stroke::new(2.0, COL_GHOST),
             egui::StrokeKind::Inside,
@@ -3036,7 +3473,14 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
         if let Some(pt) = ui.input(|i| i.pointer.hover_pos()) {
             if rect.contains(pt) {
                 let ns = snap_start(s_at(x0, pt.x, sr, px), snapu);
-                app.arr.insert(t, k, Clip { asset: a as u32, pos: ns });
+                app.arr.insert(
+                    t,
+                    k,
+                    Clip {
+                        asset: a as u32,
+                        pos: ns,
+                    },
+                );
                 let li = app.arr.tracks[t].lanes[k].clips.len() - 1;
                 app.sel_clip = Some((t, k, li));
                 app.push_project();
@@ -3056,12 +3500,19 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
         if let Some(pt) = resp.interact_pointer_pos() {
             if rect.contains(pt) {
                 let pos = s_at(x0, pt.x, sr, px);
-                let hit = clips.iter().position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset));
+                let hit = clips
+                    .iter()
+                    .position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset));
                 match hit {
                     Some(ci) => {
                         app.sel_clip = Some((t, k, ci));
                         let cpos = app.arr.tracks[t].lanes[k].clips[ci].pos;
-                        app.drag_clip = Some(ClipDrag { t, lane: k, c: ci, grab: cpos.saturating_sub(pos) });
+                        app.drag_clip = Some(ClipDrag {
+                            t,
+                            lane: k,
+                            c: ci,
+                            grab: cpos.saturating_sub(pos),
+                        });
                     }
                     None => {
                         // Empty grid = playhead handle: press-jumps on
@@ -3100,7 +3551,10 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
             if rect.contains(pt) {
                 app.last_click_track = Some(t);
                 let pos = s_at(x0, pt.x, sr, px);
-                match clips.iter().position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset)) {
+                match clips
+                    .iter()
+                    .position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset))
+                {
                     Some(ci) => app.sel_clip = Some((t, k, ci)),
                     None => {
                         app.sel_clip = None;
@@ -3115,14 +3569,25 @@ fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f6
     // pointer state: 0.36 has no secondary-only Sense, and a click-sensing
     // overlay would steal primary clicks from the widgets underneath.
     let rmb = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
-    if rmb && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| rect.contains(p)) {
+    if rmb
+        && ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| rect.contains(p))
+    {
         app.clear_track(t);
     }
 }
 
 /// Draw one clip's rectangle with its asset's waveform, normalized by the
 /// asset's own peak so quiet takes stay legible.
-fn draw_asset_clip(ui: &mut egui::Ui, app: &mut App, asset: u32, rect: egui::Rect, fill: Color32, sel: bool) {
+fn draw_asset_clip(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    asset: u32,
+    rect: egui::Rect,
+    fill: Color32,
+    sel: bool,
+) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, fill.linear_multiply(0.45));
     if rect.width() >= 4.0 {
@@ -3132,11 +3597,18 @@ fn draw_asset_clip(ui: &mut egui::Ui, app: &mut App, asset: u32, rect: egui::Rec
             let col_w = rect.width() / n as f32;
             let cy = rect.center().y;
             let amp = rect.height() * 0.46;
-            let col = if sel { COL_CLIP_SEL } else { Color32::from_rgb(210, 225, 250) };
+            let col = if sel {
+                COL_CLIP_SEL
+            } else {
+                Color32::from_rgb(210, 225, 250)
+            };
             let stroke = egui::Stroke::new((col_w * 0.7).max(0.8), col);
             for (i, [lo, hi]) in data.iter().enumerate() {
                 let x = rect.min.x + (i as f32 + 0.5) * col_w;
-                p.line_segment([egui::pos2(x, cy - hi * amp), egui::pos2(x, cy - lo * amp)], stroke);
+                p.line_segment(
+                    [egui::pos2(x, cy - hi * amp), egui::pos2(x, cy - lo * amp)],
+                    stroke,
+                );
             }
         }
     }
@@ -3168,10 +3640,15 @@ fn asset_wave(app: &mut App, asset: u32, cols: usize) -> Option<Vec<[f32; 2]>> {
     for [lo, hi] in data {
         norm.push([lo / peak, hi / peak]);
     }
-    app.wave.insert(asset, AssetWave { cols, data: norm.clone() });
+    app.wave.insert(
+        asset,
+        AssetWave {
+            cols,
+            data: norm.clone(),
+        },
+    );
     Some(norm)
 }
-
 
 const KIND_VOL: u8 = 0;
 const KIND_GAIN: u8 = 1;
@@ -3201,8 +3678,11 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // Editable value box (number only), centred text, flush against the
         // slider.
         let key = (kind, i);
-        let mut txt =
-            app.lv_edit.get(&key).cloned().unwrap_or_else(|| level_display(kind, midi));
+        let mut txt = app
+            .lv_edit
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| level_display(kind, midi));
         let rt = ui
             .add(
                 egui::TextEdit::singleline(&mut txt)
@@ -3218,8 +3698,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // only, so typing never has to fight the "dB" suffix.
         if kind != KIND_PAN {
             ui.add(
-                egui::Label::new(RichText::new("dB").monospace().weak().small())
-                    .selectable(false),
+                egui::Label::new(RichText::new("dB").monospace().weak().small()).selectable(false),
             );
         }
         if rt.has_focus() {
@@ -3244,12 +3723,13 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // slider kept its own taller default height. Leave room for the
         // raw-value readout and the reset button.
         let mut v = midi;
-        let sw = (ui.available_width()
-            - if kind == KIND_PAN { 56.0 } else { 76.0 })
-            .max(30.0);
+        let sw = (ui.available_width() - if kind == KIND_PAN { 56.0 } else { 76.0 }).max(30.0);
         let bh = rt.rect.height();
         let r = ui
-            .add_sized(egui::vec2(sw, bh), Slider::new(&mut v, 0..=127).show_value(false))
+            .add_sized(
+                egui::vec2(sw, bh),
+                Slider::new(&mut v, 0..=127).show_value(false),
+            )
             .on_hover_text(hover);
         if r.changed() {
             match kind {
@@ -3267,8 +3747,13 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // Reset this strip straight to its "0" position.
         if ui
             .small_button(RichText::new("0").monospace())
-            .on_hover_text(["Reset volume to 0 dB", "Reset gain to 0 dB", "Center the pan"]
-                [kind as usize])
+            .on_hover_text(
+                [
+                    "Reset volume to 0 dB",
+                    "Reset gain to 0 dB",
+                    "Center the pan",
+                ][kind as usize],
+            )
             .clicked()
         {
             match kind {
@@ -3304,7 +3789,11 @@ fn db_num(amp: f32) -> String {
 /// Volume / gain floor at MIDI 1 for finite values (0 stays reserved for
 /// the exact "-inf"); pan maps -100..=100 -> 0..=127.
 fn level_parse(kind: u8, s: &str) -> Option<u8> {
-    let t: String = s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    let t: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
     let t = t.strip_suffix("db").unwrap_or(&t);
     match kind {
         KIND_PAN => t.parse::<f32>().ok().map(pan_midi),
@@ -3325,7 +3814,6 @@ fn level_parse(kind: u8, s: &str) -> Option<u8> {
     }
 }
 
-
 /// Enabled effects drawn on the loop row as plain name buttons, left to
 /// right in chain order. The buttons replace the old inline sliders: a
 /// click opens the effect's child editor window (auto sliders, or the
@@ -3337,7 +3825,9 @@ fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
         if !e.enabled {
             continue;
         }
-        let Some(desc) = app.fx_registry.desc(&e.stem).cloned() else { continue };
+        let Some(desc) = app.fx_registry.desc(&e.stem).cloned() else {
+            continue;
+        };
         let mut hover = String::new();
         if let Some(d) = desc.description.as_deref() {
             hover.push_str(d);
@@ -3349,7 +3839,10 @@ fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
         } else {
             Color32::from_gray(140)
         };
-        if ui.button(RichText::new(&desc.name).small().color(color)).on_hover_text(hover).clicked()
+        if ui
+            .button(RichText::new(&desc.name).small().color(color))
+            .on_hover_text(hover)
+            .clicked()
         {
             open_slot = Some(k);
         }
@@ -3359,7 +3852,6 @@ fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
         app.open_fx_editor(i, k);
     }
 }
-
 
 fn wave_cols(buf: &[f32], cols: usize) -> Vec<[f32; 2]> {
     let n = buf.len();
@@ -3543,7 +4035,11 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                     let slot = app.knob_learn.as_ref().unwrap().slot;
                     app.knob_learn = Some(KnobLearn {
                         slot,
-                        bind: MidiBind { ty: 0xff, ch: 0, d1: 0 },
+                        bind: MidiBind {
+                            ty: 0xff,
+                            ch: 0,
+                            d1: 0,
+                        },
                         has_axis: false,
                         axis_locked: false,
                         last_val: None,
@@ -3599,7 +4095,8 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
                 None => "—".to_string(),
             }
         };
-        let mut btn = egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(150.0, 0.0));
+        let mut btn =
+            egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(150.0, 0.0));
         if listening || learning_knob {
             btn = btn.fill(Color32::from_rgb(60, 90, 120));
         }
@@ -3637,7 +4134,8 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
                 None => "—".to_string(),
             }
         };
-        let mut btn = egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(44.0, 0.0));
+        let mut btn =
+            egui::Button::new(RichText::new(txt).monospace()).min_size(egui::vec2(44.0, 0.0));
         if learning {
             btn = btn.fill(Color32::from_rgb(60, 90, 120));
         }
@@ -3721,7 +4219,6 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
         });
     app.show_export = open && !cancelled && !done;
 }
-
 
 /// The per-loop effects window: folder picker ("effects location"), one
 /// row per script with a toggle (disabled by default), reorder arrows for
@@ -3920,7 +4417,6 @@ fn arrow_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
     resp
 }
 
-
 fn port_list(
     ui: &mut egui::Ui,
     title: &str,
@@ -3951,7 +4447,10 @@ fn port_list(
             }
         }
         ui.label(
-            RichText::new(format!("  {}", p.name)).weak().small().monospace(),
+            RichText::new(format!("  {}", p.name))
+                .weak()
+                .small()
+                .monospace(),
         );
     }
 }
@@ -3985,9 +4484,16 @@ fn port_list_lr(
         let (mut l, mut r) = (entry & 1 != 0, entry & 2 != 0);
         ui.horizontal(|ui| {
             let rl = ui.checkbox(&mut l, "L").on_hover_text("play the LEFT side");
-            let rr = ui.checkbox(&mut r, "R").on_hover_text("play the RIGHT side");
+            let rr = ui
+                .checkbox(&mut r, "R")
+                .on_hover_text("play the RIGHT side");
             ui.label(RichText::new(short).strong().small());
-            ui.label(RichText::new(format!("  {}", p.name)).weak().small().monospace());
+            ui.label(
+                RichText::new(format!("  {}", p.name))
+                    .weak()
+                    .small()
+                    .monospace(),
+            );
             if rl.changed() || rr.changed() {
                 let bits = (l as u8) | ((r as u8) << 1);
                 if bits == 0 {
@@ -4025,7 +4531,9 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                             ui.label(RichText::new(&last.describe).monospace());
                             ui.separator();
                             ui.label(
-                                RichText::new(format!("| {}", last.raw_hex)).weak().monospace(),
+                                RichText::new(format!("| {}", last.raw_hex))
+                                    .weak()
+                                    .monospace(),
                             );
                         });
                     });
@@ -4046,7 +4554,11 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
 
             if !app.midi_sources.is_empty() {
                 ui.add_space(4.0);
-                ui.label(RichText::new("sources linked to slooper:midi_in").weak().small());
+                ui.label(
+                    RichText::new("sources linked to slooper:midi_in")
+                        .weak()
+                        .small(),
+                );
                 for s in &app.midi_sources {
                     ui.label(RichText::new(format!("  {s}")).weak().small().monospace());
                 }
@@ -4063,14 +4575,15 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                             ui.label(RichText::new(line.type_name).monospace());
                             ui.label(RichText::new(&line.describe).weak().monospace());
                             ui.label(
-                                RichText::new(format!("| {}", line.raw_hex)).weak().monospace(),
+                                RichText::new(format!("| {}", line.raw_hex))
+                                    .weak()
+                                    .monospace(),
                             );
                         });
                     }
                 });
         });
 }
-
 
 fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::left("settings").resizable(true).default_size(410.0).min_size(330.0).show(ui, |ui| {
@@ -4111,6 +4624,36 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 )
                     .weak()
                     .small(),
+            );
+
+            // ---- asset preview --------------------------------------------
+            ui.separator();
+            ui.label(RichText::new("ASSET PREVIEW").strong());
+            if ui
+                .checkbox(&mut app.preview_enabled, "audition rack entries on click")
+                .on_hover_text("Clicking an asset-rack entry plays it at the master output (never recorded). Click the entry again to stop.")
+                .changed()
+            {
+                app.save_config();
+            }
+            ui.horizontal(|ui| {
+                ui.label("preview length (s):");
+                let prt = ui
+                    .add(egui::TextEdit::singleline(&mut app.preview_secs).desired_width(60.0))
+                    .on_hover_text("Seconds of audio to audition: shorter entries play in full, longer ones are cut after this many seconds.");
+                if prt.lost_focus() {
+                    let v = app.preview_secs_f();
+                    app.preview_secs = v.to_string();
+                    app.save_config();
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Entries at most this long play in full; longer ones are auditioned \
+                     from the start for exactly this many seconds.",
+                )
+                .weak()
+                .small(),
             );
 
             // ---- projects --------------------------------------------------
@@ -4251,7 +4794,6 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
     });
 }
 
-
 /// First-save (or Save As) name prompt.
 fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
     if !app.show_save_prompt {
@@ -4271,7 +4813,11 @@ fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
             ui.label("Project name:");
             let re = ui.add(egui::TextEdit::singleline(&mut app.save_draft).desired_width(320.0));
             enter_hit = re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.label(RichText::new(format!("→ {}/<name>.{}", dir.display(), project::EXT)).weak().small());
+            ui.label(
+                RichText::new(format!("→ {}/<name>.{}", dir.display(), project::EXT))
+                    .weak()
+                    .small(),
+            );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -4308,28 +4854,31 @@ fn load_window(ui: &mut egui::Ui, app: &mut App) {
             if list.is_empty() {
                 ui.label("No projects here yet — Ctrl+S saves the first one.");
             }
-            egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                for (name, path) in &list {
-                    let cur = *name == app.proj_name;
-                    let b = ui
-                        .add_sized([390.0, 24.0], egui::Button::new(RichText::new(name).strong()))
-                        .on_hover_text(path.display().to_string());
-                    if cur {
-                        ui.label(RichText::new("current project").weak().small());
+            egui::ScrollArea::vertical()
+                .max_height(340.0)
+                .show(ui, |ui| {
+                    for (name, path) in &list {
+                        let cur = *name == app.proj_name;
+                        let b = ui
+                            .add_sized(
+                                [390.0, 24.0],
+                                egui::Button::new(RichText::new(name).strong()),
+                            )
+                            .on_hover_text(path.display().to_string());
+                        if cur {
+                            ui.label(RichText::new("current project").weak().small());
+                        }
+                        if b.clicked() {
+                            load = Some(path.clone());
+                        }
                     }
-                    if b.clicked() {
-                        load = Some(path.clone());
-                    }
-                }
-            });
+                });
         });
     if let Some(p) = load {
         app.do_load(&p);
     }
     app.show_load = open;
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -4340,7 +4889,10 @@ mod tests {
         assert_eq!(SHORTCUT_DEFAULTS.len(), N_ACTIONS);
         assert_eq!(N_ACTIONS, 121);
         // Space is the global transport toggle; knob slots are never keyed.
-        assert_eq!(SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PlayAll)], Some(egui::Key::Space));
+        assert_eq!(
+            SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PlayAll)],
+            Some(egui::Key::Space)
+        );
         assert!(SHORTCUT_DEFAULTS[73..].iter().all(|k| k.is_none()));
         // Every default key is unique (learn mode enforces the same).
         let mut seen: Vec<egui::Key> = SHORTCUT_DEFAULTS.iter().flatten().copied().collect();
@@ -4388,7 +4940,7 @@ mod tests {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1080.0, 640.0),
+                egui::vec2(1440.0, 853.0),
             )),
             events,
             ..Default::default()
@@ -4403,7 +4955,12 @@ mod tests {
         egui::Event::PointerMoved(p)
     }
     fn btn(p: egui::Pos2, b: egui::PointerButton, down: bool) -> egui::Event {
-        egui::Event::PointerButton { pos: p, button: b, pressed: down, modifiers: Default::default() }
+        egui::Event::PointerButton {
+            pos: p,
+            button: b,
+            pressed: down,
+            modifiers: Default::default(),
+        }
     }
 
     /// SETTINGS must dock to the LEFT of the asset rack (add-order test:
@@ -4417,7 +4974,7 @@ mod tests {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1080.0, 640.0),
+                egui::vec2(1440.0, 853.0),
             )),
             ..Default::default()
         };
@@ -4440,8 +4997,14 @@ mod tests {
         let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
         drop(prims);
         out.textures_delta.clear();
-        assert!(x_settings < f32::MAX && x_rack < f32::MAX, "both headings painted");
-        assert!(x_settings < x_rack, "SETTINGS x={x_settings} must be left of ASSET RACK x={x_rack}");
+        assert!(
+            x_settings < f32::MAX && x_rack < f32::MAX,
+            "both headings painted"
+        );
+        assert!(
+            x_settings < x_rack,
+            "SETTINGS x={x_settings} must be left of ASSET RACK x={x_rack}"
+        );
     }
 
     /// The full user gesture: press a rack row, drag onto a track's lane
@@ -4459,8 +5022,16 @@ mod tests {
         let mut y_row = None;
         for y in (96..220).step_by(3) {
             let p = egui::pos2(40.0, y as f32);
-            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
             if app.sel_asset.is_some() {
                 y_row = Some(y as f32);
                 break;
@@ -4473,15 +5044,30 @@ mod tests {
         // under track 0 owns a few pixels above it now).
         let start = egui::pos2(40.0, y_row);
         let lane = egui::pos2(500.0, 240.0);
-        frame(&mut app, &ctx, vec![moved(start), btn(start, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(start), btn(start, egui::PointerButton::Primary, true)],
+        );
         frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, y_row + 6.0))]);
         frame(&mut app, &ctx, vec![moved(egui::pos2(320.0, 170.0))]);
         frame(&mut app, &ctx, vec![moved(lane)]);
-        assert!(egui::DragAndDrop::has_payload_of_type::<usize>(&ctx), "drag carries the asset");
-        frame(&mut app, &ctx, vec![btn(lane, egui::PointerButton::Primary, false)]);
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<usize>(&ctx),
+            "drag carries the asset"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(lane, egui::PointerButton::Primary, false)],
+        );
 
         let total = |a: &App| -> usize {
-            a.arr.tracks.iter().map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>()).sum()
+            a.arr
+                .tracks
+                .iter()
+                .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+                .sum()
         };
         assert_eq!(total(&app), 1, "drag-drop placed exactly one clip");
         assert!(app.sel_clip.is_some(), "the dropped clip is selected");
@@ -4494,8 +5080,16 @@ mod tests {
         // the mixer): sweep the drop lane's vertical neighbourhood.
         for y in (214..=300).step_by(3) {
             let p = egui::pos2(500.0, y as f32);
-            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Secondary, false)],
+            );
             if total(&app) == 0 {
                 cleared = true;
                 break;
@@ -4515,13 +5109,28 @@ mod tests {
         app.loop_area = (0, 0);
         assert_eq!(app.loop_region_eff(), (0, 192_000), "area default = 2 bars");
         app.loop_area = (24_000, 96_000);
-        assert_eq!(app.loop_region_eff(), (24_000, 96_000), "dragged handles win");
+        assert_eq!(
+            app.loop_region_eff(),
+            (24_000, 96_000),
+            "dragged handles win"
+        );
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         let len = app.asset_len(a);
         app.loop_mode = 1;
-        app.arr.insert(0, 0, Clip { asset: a, pos: 48_000 });
-        assert_eq!(app.loop_region_eff(), (0, 48_000 + len), "longest = last clip end");
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: a,
+                pos: 48_000,
+            },
+        );
+        assert_eq!(
+            app.loop_region_eff(),
+            (0, 48_000 + len),
+            "longest = last clip end"
+        );
         app.loop_mode = 2;
         assert_eq!(app.loop_region_eff(), (0, app.total_len()));
     }
@@ -4538,7 +5147,13 @@ mod tests {
 
     #[test]
     fn key_names_roundtrip() {
-        for k in [egui::Key::A, egui::Key::Num3, egui::Key::F7, egui::Key::Space, egui::Key::M] {
+        for k in [
+            egui::Key::A,
+            egui::Key::Num3,
+            egui::Key::F7,
+            egui::Key::Space,
+            egui::Key::M,
+        ] {
             assert_eq!(key_from_name(&key_debug(k)), Some(k), "roundtrip {k:?}");
         }
     }
@@ -4587,7 +5202,11 @@ mod tests {
         assert_eq!(app.track_h(0), TRACK_MIN_H, "automatic height");
         app.set_track_h(0, 200.0);
         assert_eq!(app.track_h(0), 200.0);
-        assert_eq!(app.track_h(1), TRACK_MIN_H, "a sibling keeps its own height");
+        assert_eq!(
+            app.track_h(1),
+            TRACK_MIN_H,
+            "a sibling keeps its own height"
+        );
         app.set_track_h(0, 10.0);
         assert_eq!(app.track_h(0), TRACK_MIN_H, "clamped to the lane floor");
     }
@@ -4638,5 +5257,376 @@ mod tests {
         frame(&mut app, &ctx, vec![wheel(5.0, egui::Modifiers::NONE)]);
         assert_eq!(app.px_per_sec, z1, "plain wheel leaves zoom alone");
     }
-}
 
+    // ---- regression pins: zoom range, sensitivity & centred default ----
+
+    #[test]
+    fn zoom_is_fast_falls_far_and_centers_default() {
+        let mut app = headless_app("zoom");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let wheel = |dy: f32, m: egui::Modifiers| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            modifiers: m,
+        };
+        // One notch must move the view visibly (~12 %, was 0.6 % — the
+        // "ctrl+wheel is too slow" complaint).
+        let z0 = app.px_per_sec;
+        frame(&mut app, &ctx, vec![wheel(1.0, egui::Modifiers::COMMAND)]);
+        assert!(
+            app.px_per_sec >= z0 * 1.08,
+            "one ctrl+wheel notch zoomed only {:.1} %",
+            (app.px_per_sec / z0 - 1.0) * 100.0
+        );
+        // One notch out lands back (log-space accumulation is symmetric).
+        frame(&mut app, &ctx, vec![wheel(-1.0, egui::Modifiers::COMMAND)]);
+        assert!(
+            (app.px_per_sec - z0).abs() < 0.5,
+            "notch in then out cancels"
+        );
+        // Max zoom-out shows at least 100 measures in the ~936 pt viewport
+        // of the 1440×853 window at 80 BPM 4/4 (3 s per bar — the exact
+        // geometry the report quoted: 13 bars at the old 24 px/s floor).
+        let bar_s = 60.0 * 4.0 / 80.0;
+        let viewport_pt = 936.0;
+        let bars = viewport_pt / (ZOOM_MIN * bar_s);
+        assert!(bars >= 100.0, "ZOOM_MIN shows only {bars:.0} bars");
+        // Wheeling all the way out lands exactly on the floor.
+        app.px_per_sec = ZOOM_DEFAULT;
+        for _ in 0..60 {
+            frame(&mut app, &ctx, vec![wheel(-3.0, egui::Modifiers::COMMAND)]);
+        }
+        assert_eq!(app.px_per_sec, ZOOM_MIN);
+        // The logarithmic slider keeps the untouched default near centre.
+        let t = (ZOOM_DEFAULT.ln() - ZOOM_MIN.ln()) / (ZOOM_MAX.ln() - ZOOM_MIN.ln());
+        assert!(
+            (0.45..=0.75).contains(&t),
+            "default sits at {t:.2} of the slider"
+        );
+    }
+
+    // ---- regression pins: metronome editor + start/stop button ----
+
+    /// Center of the first painted glyph galley exactly `want` (top-level
+    /// draw order: the top bar paints before every dock).
+    fn label_center(app: &mut App, ctx: &egui::Context, want: &str) -> Option<egui::Pos2> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut c = None;
+        for cs in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text() == want {
+                    c = Some(t.pos + t.galley.rect.center().to_vec2());
+                    break;
+                }
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        c
+    }
+
+    fn key_ev(key: egui::Key, m: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        }
+    }
+
+    /// Click, select-all, replace with `value`, Enter. `find` answers
+    /// whether the click landed on the widget under test after typing "7".
+    fn type_into_focused(app: &mut App, ctx: &egui::Context, value: &str) {
+        frame(app, ctx, vec![key_ev(egui::Key::Home, Default::default())]);
+        frame(
+            app,
+            ctx,
+            vec![key_ev(egui::Key::End, egui::Modifiers::SHIFT)],
+        );
+        for c in value.chars() {
+            frame(app, ctx, vec![egui::Event::Text(c.to_string())]);
+        }
+        // Enter: single-line TextEdits commit by losing focus (egui 0.36).
+        frame(app, ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
+    }
+
+    /// The regression test for "bpm and beats/measure can never be edited
+    /// — the box always snaps back to 120/4": typing must stick to the app
+    /// state, Enter commits, and the saved config follows.
+    #[test]
+    fn metro_tempo_boxes_are_editable_and_commit() {
+        let mut app = headless_app("metroedit");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+
+        // Find the bpm box: click-scan the top bar, type a digit, and the
+        // app field that moved says which box got focus.
+        let mut found = None;
+        for x in (160..1000).step_by(4) {
+            let p = egui::pos2(x as f32, 22.0);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
+            let before = (app.metro_bpm.clone(), app.metro_num.clone());
+            frame(&mut app, &ctx, vec![egui::Event::Text("7".into())]);
+            if app.metro_bpm != before.0 {
+                found = Some(("bpm", x));
+                break;
+            }
+            app.metro_bpm = before.0;
+            app.metro_num = before.1;
+        }
+        let (_, x_bpm) = found.expect("a click in the top bar focuses the bpm box");
+        type_into_focused(&mut app, &ctx, "96");
+        assert_eq!(app.metro_bpm, "96", "typed bpm survives the frame loop");
+
+        // Same trick for the beats box, scanning right of the bpm box.
+        let mut found = None;
+        for x in (x_bpm + 10..1040).step_by(4) {
+            let p = egui::pos2(x as f32, 22.0);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
+            let before = (app.metro_bpm.clone(), app.metro_num.clone());
+            frame(&mut app, &ctx, vec![egui::Event::Text("7".into())]);
+            if app.metro_num != before.1 {
+                found = Some(x);
+                break;
+            }
+            app.metro_bpm = before.0;
+            app.metro_num = before.1;
+        }
+        assert!(found.is_some(), "a click focuses the beats box");
+        type_into_focused(&mut app, &ctx, "3");
+        assert_eq!(app.metro_num, "3", "typed beats-per-measure survives");
+
+        // Commit landed in the config (send_metro saves on commit).
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"metro_bpm\": 96"), "config: {cfg_txt}");
+        assert!(cfg_txt.contains("\"metro_num\": 3"), "config: {cfg_txt}");
+    }
+
+    /// The metro checkbox became a start/stop button: clicking it toggles
+    /// the click and relabels (METRO → STOP → METRO).
+    #[test]
+    fn metro_button_starts_and_stops() {
+        let mut app = headless_app("metrobtn");
+        let ctx = egui::Context::default();
+        let p = label_center(&mut app, &ctx, "METRO").expect("METRO button painted");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
+        assert!(app.metro_on, "click starts the click track");
+        let p = label_center(&mut app, &ctx, "STOP").expect("running button reads STOP");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
+        assert!(!app.metro_on, "clicking again stops it");
+    }
+
+    // ---- regression pins: asset preview, master widgets, snap grid ----
+
+    /// Clicking a rack row auditions the sample; clicking the same row
+    /// again stops it; the Settings checkbox disables the whole feature.
+    #[test]
+    fn rack_click_previews_and_toggles() {
+        let mut app = headless_app("rackprev");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let click = |app: &mut App, ctx: &egui::Context, y: f32| {
+            let p = egui::pos2(40.0, y);
+            frame(
+                app,
+                ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        };
+        // Find kick.wav's row: the click that starts a preview.
+        let mut y_row = None;
+        for y in (96..220).step_by(3) {
+            click(&mut app, &ctx, y as f32);
+            if app.preview_playing.is_some() {
+                y_row = Some(y as f32);
+                break;
+            }
+        }
+        let y_row = y_row.expect("clicking a rack row previews it");
+        assert!(app
+            .preview_playing
+            .as_deref()
+            .is_some_and(|p| p.ends_with("kick.wav")));
+        assert!(app.status.starts_with("previewing kick"), "{}", app.status);
+        // Second click on the same entry stops (toggle).
+        click(&mut app, &ctx, y_row);
+        assert_eq!(
+            app.preview_playing, None,
+            "clicking the auditioning row stops it"
+        );
+        // Disabled in Settings → clicks never preview.
+        app.preview_enabled = false;
+        click(&mut app, &ctx, y_row);
+        assert_eq!(app.preview_playing, None, "preview disabled in settings");
+        // Re-enabled → clicks audition again.
+        app.preview_enabled = true;
+        click(&mut app, &ctx, y_row);
+        assert!(app.preview_playing.is_some(), "re-enabled preview works");
+    }
+
+    /// Preview length parses/clamps and defaults to 5 s (config defaults
+    /// are pinned in config::tests; the cut logic lives in preview_asset).
+    #[test]
+    fn preview_secs_parses_and_clamps() {
+        let mut app = headless_app("prevsecs");
+        assert_eq!(app.preview_secs_f(), 5.0, "default 5 s");
+        app.preview_secs = "12.5".into();
+        assert_eq!(app.preview_secs_f(), 12.5);
+        app.preview_secs = "junk".into();
+        assert_eq!(app.preview_secs_f(), 5.0, "garbage falls back to 5");
+        app.preview_secs = "9999".into();
+        assert_eq!(app.preview_secs_f(), 600.0, "clamped");
+    }
+
+    /// Master volume grew the per-track row widgets: an editable dB box
+    /// and a "0" zeroize button resetting to 0 dB.
+    #[test]
+    fn master_volume_has_text_box_and_zero_button() {
+        let mut app = headless_app("mastervol");
+        let ctx = egui::Context::default();
+        app.master_midi = 50;
+        frame(&mut app, &ctx, vec![]);
+        // Zeroize button (first painted "0" galley is the top bar's —
+        // panels draw in add order, and the top bar is first).
+        let z = label_center(&mut app, &ctx, "0").expect("a \"0\" button is painted");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(z), btn(z, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(z, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.master_midi, VOL_UNITY_MIDI,
+            "zeroize resets master to 0 dB"
+        );
+
+        // Editable box: click exactly on the painted dB value, type, commit.
+        let want = db_num(vol_amp(app.master_midi));
+        let p = label_center(&mut app, &ctx, &want).expect("master volume box is painted");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![egui::Event::Text("9".into())]);
+        assert!(
+            app.lv_edit.contains_key(&(KIND_VOL, usize::MAX)),
+            "click+type holds a scratch edit on the master box"
+        );
+        type_into_focused(&mut app, &ctx, "-12");
+        assert_eq!(
+            app.master_midi,
+            vol_midi(-12.0),
+            "typed dB value applies to master"
+        );
+    }
+
+    /// Sub-beat snap lines: a third, fainter grid tier drawn at the snap
+    /// subdivision; gone when snap is the plain beat or the steps would
+    /// crowd (< 4 px apart).
+    #[test]
+    fn snap_grid_lines_follow_snap_setting() {
+        let mut app = headless_app("snapgrid");
+        let ctx = egui::Context::default();
+        let snap_lines = |app: &mut App, ctx: &egui::Context| -> usize {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let n = out
+                .shapes
+                .iter()
+                .filter(|cs| {
+                    matches!(&cs.shape, egui::epaint::Shape::LineSegment { stroke, .. }
+                        if stroke.color == COL_SNAP_LINE)
+                })
+                .count();
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            n
+        };
+        // Default snap = sixteenth notes at the default zoom: the sub tier
+        // paints (ruler + lanes).
+        assert!(
+            snap_lines(&mut app, &ctx) > 0,
+            "snap tier painted at snap subdivision"
+        );
+        // Quarter-note snap: the beat line IS the snap grid → no sub tier.
+        app.snap_sub = 0;
+        assert_eq!(
+            snap_lines(&mut app, &ctx),
+            0,
+            "no sub tier for quarter-note snap"
+        );
+        // Zoomed to the floor the steps fall under 4 px → tier hidden.
+        app.snap_sub = SUBDIVISIONS.iter().position(|s| s.0 == 8).unwrap();
+        app.px_per_sec = ZOOM_MIN;
+        assert_eq!(
+            snap_lines(&mut app, &ctx),
+            0,
+            "sub tier hides when steps crowd"
+        );
+    }
+}

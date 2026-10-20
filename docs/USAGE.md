@@ -53,7 +53,7 @@ timeline while you play.
 
 | Region | Contents |
 | --- | --- |
-| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **metro** + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** · peak meter · **master volume** (−∞…+6 dB) |
+| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** · peak meter · **master volume** (−∞…+6 dB; editable dB box, raw readout and a **0** zeroize button — same row widgets as per-track vol) |
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
 | **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles |
@@ -84,8 +84,13 @@ seeded into `~/.local/share/slooper/samples/808` on startup and is the
 default rack folder until you add your own.
 
 Folders at the top, audio under each. Drag any file row onto any lane to
-place it; click a row to **select the asset** — three buttons then act on
-it:
+place it; click a row to **select the asset** — and to **audition it**:
+clicking a row plays it at the master output (an entry no longer than the
+preview length — Settings → **preview length (s)**, default 5 — plays in
+full, a longer one plays its first *n* seconds; clicking the row again
+stops). Toggle auditioning off in the settings panel (**ASSET PREVIEW →
+enable**). Auditions never feed recording or the export bus. Three buttons
+then act on the selected asset:
 
 | Button | Effect |
 | --- | --- |
@@ -166,11 +171,14 @@ is **never** captured into a take.
 
   With looping off the playhead parks at the region end and the transport
   stops.
-- **Zoom & scroll**: **Ctrl + mouse wheel** zooms the timeline (same state as
-  the grid-toolbar zoom slider), **Shift + mouse wheel** pans horizontally,
-  plain wheel scrolls the track stack vertically. (These gestures are
-  intercepted at the top of the frame — egui's own Ctrl+wheel interface zoom
-  is pinned back to the GUI-scale setting every frame.)
+- **Zoom & scroll**: **Ctrl + mouse wheel** zooms the timeline (~12 % per
+  notch, same state as the grid-toolbar zoom slider), **Shift + mouse
+  wheel** pans horizontally, plain wheel scrolls the track stack vertically.
+  (These gestures are intercepted at the top of the frame — egui's own
+  Ctrl+wheel interface zoom is pinned back to the GUI-scale setting every
+  frame.) The zoom slider is **logarithmic**: at the far-left floor
+  (3 px/s) a maximised window shows ~100 measures, the default sits near
+  the slider centre, and the right end edits at the sample level.
 - **Resize a track**: drag the **separation bar** under it. Only that track
   changes; its lanes (parent + children) always share the height equally.
   A new child lane never shrinks the others — the track grows by one lane's
@@ -180,15 +188,20 @@ is **never** captured into a take.
   parks. Per-track **play gates** (PLAYED/muted) and per-track
   record/clear bindings keep working the same while the global transport
   runs.
-- A bare **metronome** (metro on, transport stopped) keeps the playhead
-  rolling on the grid without sounding any clips — a click track for
-  punching in. Transport stopped *and* metro off freezes the playhead.
+- A bare **metronome** (METRO clicked on, transport stopped) ticks on its
+  own free-running grid **without moving the playhead or sounding any
+  clips** — a click track to play along to. Only the transport advances the
+  playhead; transport stopped freezes it, metro running or not. Starting
+  the transport while the metro runs simply aligns both clocks.
 
 ## Metronome & grid
 
 The metronome **defines the project grid**: **bpm** (20–300, default 120),
 **beats/measure** (1–16), and **subdivision** all come from the transport
-bar, and the ruler/bar numbers/quantize/snap grids all derive from them.
+bar (both numbers are editable text boxes — type and press Enter), and the
+ruler/bar numbers/quantize/snap grids all derive from them. Click **METRO**
+to start the click (the button reads **STOP** while running; click again to
+stop).
 
 - Three tones: high = downbeat (beat 1), mid = quarter notes, low = chosen
   subdivision.
@@ -204,7 +217,11 @@ checkbox. On the grid toolbar:
 - **quantize** dropdown — the subdivision the *content* snaps to (quarter,
   eighth, triplet, sixteenth, triplet-eighths, thirty-second).
 - **snap** dropdown — the grid *clip placement* follows while dragging and
-  when takes auto-place.
+  when takes auto-place. The timeline also draws the snap grid: at
+  sub-beat settings a third, very faint hairline tier marks every snap
+  step (ruler and lanes); it vanishes when snap is the plain quarter note
+  (the beat line already is the grid) or when zoomed out so far the steps
+  would crowd.
 - **auto-quantize** — every fresh recording is quantized on the way into
   the rack.
 
