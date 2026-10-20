@@ -9,9 +9,12 @@
 //! - left panel: ASSET RACK — folder list (primary = recordings land there),
 //!   one draggable row per audio file, project assets below
 //! - central: grid toolbar (auto-quantize, quantize/snap subdivisions,
-//!   asset quantize/trim, zoom) above the timeline: ruler + one block per
-//!   track (header, mixer rows when selected, lane strips with clips);
-//!   clips drag with snap, the ruler scrubs the playhead
+//!   asset quantize/trim, zoom) above the timeline: a ruler pinned above
+//!   the track scroll + one block per track (header, ALWAYS-visible mixer
+//!   with the FX button, lane strips with clips); clips drag with snap,
+//!   and pressing the pinned ruler or any empty grid area scrubs the
+//!   playhead (both map the identical x window; wheel/trackpad pans)
+//! - the settings panel docks to the LEFT of the asset rack when open
 //! - bottom: MIDI monitor
 //! - windows: settings, effects, effect editor, knob learner, export,
 //!   save-project prompt, load-project browser
@@ -350,10 +353,12 @@ pub struct App {
     /// Timeline zoom.
     px_per_sec: f32,
     drag_clip: Option<ClipDrag>,
-    /// Asset index being dragged out of the rack (`None` = no rack drag).
-    drag_asset: Option<usize>,
-    /// Where the in-flight rack drop should land: (track, lane, sample).
-    drop_hover: Option<(usize, usize, u64)>,
+    /// A press on empty grid owns the pointer until release: dragging it
+    /// scrubs the global playhead (aligned with the lane grid exactly).
+    scrub_drag: bool,
+    /// Horizontal view offset of the timeline in px (shared by the pinned
+    /// ruler and every lane strip — the playhead stays one straight line).
+    hscroll: f32,
     /// Selected clip (track, lane, clip index).
     sel_clip: Option<(usize, usize, usize)>,
 
@@ -527,8 +532,8 @@ impl App {
             wave: HashMap::new(),
             px_per_sec: 160.0,
             drag_clip: None,
-            drag_asset: None,
-            drop_hover: None,
+            scrub_drag: false,
+            hscroll: 0.0,
             sel_clip: None,
             rack,
             sel_asset: None,
@@ -1794,6 +1799,15 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
+        self.ui_root(ui);
+    }
+}
+
+impl App {
+    /// The whole window's content. Split out from [`eframe::App::ui`] so
+    /// headless tests can drive the real widget tree (panels, DnD, mixer)
+    /// through `egui::Context::run` without an eframe frame.
+    pub fn ui_root(&mut self, ui: &mut egui::Ui) {
         self.backend.gain.store(self.gain.to_bits(), Ordering::Relaxed);
 
         if self.sel_sent != self.selected {
@@ -1813,17 +1827,20 @@ impl eframe::App for App {
         }
 
         top_bar(ui, self);
-        rack_panel(ui, self);
+        // Left panels stack outward in add order, so rendering SETTINGS
+        // before the rack pops it up to the rack's LEFT; the rack and the
+        // timeline simply shift right while it is open.
         if self.show_settings {
             settings_panel(ui, self);
         }
+        rack_panel(ui, self);
         midi_monitor(ui, self);
         central_panels(ui, self);
 
-        // A rack drag released outside any lane simply dies here.
+        // Watchdog: a scrub/clip drag that somehow loses its release event
+        // must not stick (rack drops now run on egui's native DnD).
         if !ui.ctx().input(|i| i.pointer.any_down()) {
-            self.drag_asset = None;
-            self.drop_hover = None;
+            self.scrub_drag = false;
         }
 
         if self.show_export {
@@ -2062,19 +2079,33 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                     for (name, fp) in files {
                         let sel = app.sel_asset.is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
-                        let row = ui.selectable_label(sel, RichText::new(&name).small());
-                        let rrect = row.rect;
-                        if row.clicked() {
+                        // Full-width row: a plain selectable_label shrink-wraps
+                        // to the text, leaving most of the row dead to clicks.
+                        let avail = ui.available_size();
+                        let row = ui.add_sized(
+                            avail,
+                            egui::Button::selectable(sel, RichText::new(&name).small()),
+                        );
+                        // ONE click_and_drag response for the row: a separate
+                        // drag-sense overlay on top would CAPTURE the press
+                        // and silently kill the row's own clicked().
+                        let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, &name)), Sense::click_and_drag());
+                        if dr.clicked() {
                             app.ensure_asset(&fp);
                         }
-                        row.on_hover_text(format!("{} — click to select, drag onto a lane", fp.display()));
-                        let dr = ui.interact(rrect, ui.id().with(("rackdrag", fi, &name)), Sense::drag());
                         if dr.drag_started() {
                             if let Some(k) = app.ensure_asset(&fp) {
-                                app.drag_asset = Some(k);
                                 app.sel_asset = Some(k);
+                                // egui-native drag: the payload travels with
+                                // the gesture and lane strips receive the
+                                // release themselves (a manual cross-panel
+                                // drag never landed — the rack owned it).
+                                // If the decode failed there is no payload
+                                // and the drop does nothing.
+                                dr.dnd_set_drag_payload(k);
                             }
                         }
+                        row.on_hover_text(format!("{} — click to select, drag onto a lane", fp.display()));
                     }
                 }
                 if let Some(fi) = rescan {
@@ -2116,19 +2147,23 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     ui.label(RichText::new("project assets").weak().small());
                     for (k, name, dirty) in extra {
                         let sel = app.sel_asset == Some(k);
-                        let row = ui.selectable_label(
-                            sel,
-                            RichText::new(format!("{}{}", name, if dirty { " *" } else { "" })).small(),
+                        let avail = ui.available_size();
+                        let row = ui.add_sized(
+                            avail,
+                            egui::Button::selectable(
+                                sel,
+                                RichText::new(format!("{}{}", name, if dirty { " *" } else { "" })).small(),
+                            ),
                         );
-                        let rrect = row.rect;
-                        if row.clicked() {
+                        // Merged click+drag response (see rack rows above).
+                        let dr = ui.interact(row.rect, ui.id().with(("assetdrag", k)), Sense::click_and_drag());
+                        if dr.clicked() {
                             app.sel_asset = Some(k);
                         }
-                        row.on_hover_text("part of this project (not a rack file) — draggable");
-                        let dr = ui.interact(rrect, ui.id().with(("assetdrag", k)), Sense::drag());
                         if dr.drag_started() {
-                            app.drag_asset = Some(k);
+                            dr.dnd_set_drag_payload(k);
                         }
+                        row.on_hover_text("part of this project (not a rack file) — draggable");
                     }
                 }
 
@@ -2207,14 +2242,26 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         let total = app.total_len().max(1);
         let px = app.px_per_sec as f64;
         let w = ((total as f64 / sr) * px).max(640.0) as f32;
-        // Rack-drop hover is recomputed by the lane under the cursor.
-        app.drop_hover = None;
-        egui::ScrollArea::both()
+        // Horizontal view offset: trackpad / tilt-wheel pans; clamped so the
+        // strip can never scroll past the project end. Shared by the ruler
+        // and every lane strip -> aligned grids, one straight playhead.
+        if ui.input(|i| !i.pointer.any_down()) {
+            app.scrub_drag = false;
+        }
+        let dx = ui.input(|i| i.smooth_scroll_delta.x);
+        if dx != 0.0 {
+            app.hscroll -= dx;
+        }
+        let avail = ui.available_width().max(200.0);
+        app.hscroll = app.hscroll.clamp(0.0, (w - avail).max(0.0));
+        // Pinned ruler: always visible above the track scroll (it used to
+        // scroll away with the content), same width + x origin as the lanes.
+        ruler_row(ui, app, avail, px, sr);
+        egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ruler_row(ui, app, w, px, sr);
                 for t in 0..MAX_LOOPS {
-                    track_block(ui, app, t, w, px, sr);
+                    track_block(ui, app, t, avail, px, sr);
                 }
             });
     });
@@ -2231,16 +2278,25 @@ fn s_at(x0: f32, x: f32, sr: f64, px: f64) -> u64 {
 }
 
 /// Paint the metronome grid (bar lines bold, beat lines faint) plus the
-/// playhead across `rect`.
-fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, w: f32, px: f64, sr: f64, ruler: bool) {
+/// playhead across `rect`. `x0` is where timeline position 0 sits in point
+/// coordinates — left of `rect` whenever the view is panned — so every strip
+/// (pinned ruler and lane alike) maps samples through the identical window
+/// and the playhead renders as one straight line across the whole grid.
+fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, px: f64, sr: f64, ruler: bool, x0: f32) {
     let p = ui.painter();
     p.rect_filled(rect, 0.0, if ruler { Color32::from_rgb(34, 34, 40) } else { Color32::from_rgb(24, 24, 29) });
     let beat_px = quantize::beat_samples(sr as u32, app.bpm()) * (px / sr);
     let num = app.beats() as u64;
     if beat_px > 3.0 {
-        let beats = (w as f64 / beat_px) as u64 + 1;
-        for b in 0..beats.min(8192) {
-            let x = rect.min.x + (b as f64 * beat_px) as f32;
+        // Only the beats inside this strip's visible window (cheap at any
+        // project length, correct under panning).
+        let b_lo = (((rect.min.x - x0).max(0.0) as f64 / beat_px) as u64).saturating_sub(1);
+        let b_hi = (((rect.max.x - x0).max(0.0) as f64 / beat_px) as u64) + 2;
+        for b in b_lo..b_hi.min(b_lo + 4096) {
+            let x = x0 + (b as f64 * beat_px) as f32;
+            if x < rect.min.x - 1.0 || x > rect.max.x + 1.0 {
+                continue;
+            }
             let bar = b % num == 0;
             p.line_segment(
                 [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
@@ -2259,7 +2315,7 @@ fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, w: f32, px: f64, s
     }
     // Playhead.
     let pos = app.backend.engine.pos();
-    let x = x_of(rect.min.x, pos, sr, px);
+    let x = x_of(x0, pos, sr, px);
     if x >= rect.min.x && x <= rect.max.x {
         p.line_segment(
             [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
@@ -2268,34 +2324,37 @@ fn paint_grid(ui: &mut egui::Ui, app: &App, rect: egui::Rect, w: f32, px: f64, s
     }
 }
 
-/// Timeline ruler: measure grid, numbers, and the scrub handle — press or
-/// drag anywhere here to move the global playhead.
-fn ruler_row(ui: &mut egui::Ui, app: &mut App, w: f32, px: f64, sr: f64) {
-    ui.horizontal(|ui| {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 20.0), Sense::click_and_drag());
-        paint_grid(ui, app, rect, w, px, sr, true);
-        if let Some(pt) = resp.interact_pointer_pos() {
-            if (resp.dragged() || resp.clicked()) && rect.contains(pt) {
-                let pos = s_at(rect.min.x, pt.x, sr, px);
-                app.backend.cmd(Cmd::Seek { pos });
-            }
+/// Timeline ruler: measure grid, bar numbers, and the scrub handle — press
+/// or drag anywhere here to move the global playhead. Pinned above the track
+/// scroll so it is always visible; shares its x window with the lane strips.
+fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, 20.0), Sense::click_and_drag());
+    let x0 = rect.min.x - app.hscroll;
+    paint_grid(ui, app, rect, px, sr, true, x0);
+    if let Some(pt) = resp.interact_pointer_pos() {
+        if (resp.dragged() || resp.clicked()) && rect.contains(pt) {
+            let pos = s_at(x0, pt.x, sr, px);
+            app.backend.cmd(Cmd::Seek { pos });
         }
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        }
-    });
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
 }
 
-/// Everything for one track: header row, mixer rows when selected, one
-/// lane strip per lane (track + child lanes).
+/// Everything for one track: header row (right-click = clear clips), the
+/// always-visible mixer with the FX button, then one lane strip per lane
+/// (track + child lanes).
 fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: f64) {
     let sel = app.selected == t;
     let rec = app.backend.engine.rec_state_of(t) == TR_REC;
     let on = app.backend.engine.track_on(t);
     let clips: usize = app.arr.tracks[t].lanes.iter().map(|l| l.clips.len()).sum();
     ui.add_space(3.0);
-    ui.horizontal(|ui| {
-        let head = ui.selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong());
+    let head = ui.horizontal(|ui| {
+        let head = ui
+            .selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong())
+            .on_hover_text("Click to select \u{b7} right-click anywhere in the header clears this track's clips");
         if head.clicked() {
             app.selected = t;
         }
@@ -2314,9 +2373,6 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
         {
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
         }
-        if ui.button("clear").on_hover_text("Remove this track's clips (assets stay in the rack)").clicked() {
-            app.clear_track(t);
-        }
         if ui.button("+ child").on_hover_text("Add a child lane (stacks additively)").clicked() {
             app.arr.add_lane(t);
             app.push_project();
@@ -2326,126 +2382,206 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
             app.arr.remove_lane(t, nl - 1);
             app.push_project();
         }
-        fx_buttons(ui, app, t);
-        ui.label(RichText::new(format!("{} clip(s) · {} lane(s)", clips, nl)).weak().small());
+        ui.label(RichText::new(format!("{} clip(s) \u{b7} {} lane(s)", clips, nl)).weak().small());
     });
-    if sel {
-        for kind in [KIND_VOL, KIND_GAIN, KIND_PAN] {
-            level_row(ui, app, t, kind);
-        }
+    // Right-click anywhere on the header removes the track's clips. Read
+    // from the global pointer state and hit-tested against the header rect:
+    // 0.36 has no secondary-only Sense, and a click-sensing overlay would
+    // steal primary clicks from the buttons underneath.
+    let rmb = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+    if rmb && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| head.response.rect.contains(p)) {
+        app.clear_track(t);
     }
+    // Mixer is always visible (was: only the selected track). The FX button
+    // sits directly right of the slider stack, with the chain chips below it.
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            for kind in [KIND_VOL, KIND_GAIN, KIND_PAN] {
+                level_row(ui, app, t, kind);
+            }
+        });
+        ui.vertical(|ui| {
+            if ui
+                .button("FX")
+                .on_hover_text("This track's effects: enable scripts, reorder the chain, open parameter editors")
+                .clicked()
+            {
+                app.fx_window = Some(t);
+            }
+            fx_buttons(ui, app, t);
+        });
+    });
     for k in 0..app.arr.tracks[t].lanes.len() {
         lane_row(ui, app, t, k, w, px, sr);
     }
 }
 
-/// One lane strip: grid + clips + drag/seek interactions. Lane 0 is the
-/// track itself; lanes 1.. are its children.
+/// One lane strip: grid + clips + interactions, clipped to its own rect and
+/// sharing the pinned ruler's x window (pan offset included). Pressing empty
+/// grid scrubs the playhead; clips drag with snap; rack drags arrive through
+/// egui's native drag-and-drop (the old cross-response handoff dropped
+/// nothing because the rack owned the pointer).
 fn lane_row(ui: &mut egui::Ui, app: &mut App, t: usize, k: usize, w: f32, px: f64, sr: f64) {
-    ui.horizontal(|ui| {
-        let tag = if k == 0 { "track".to_string() } else { format!("child {k}") };
-        ui.label(RichText::new(tag).weak().small());
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), Sense::click_and_drag());
-        paint_grid(ui, app, rect, w, px, sr, false);
-        let snapu = app.snap_unit();
-        let sel_clip = app.sel_clip;
-        let clips: Vec<(Clip, String)> = app
-            .arr
-            .tracks[t]
-            .lanes[k]
-            .clips
-            .iter()
-            .map(|c| (*c, app.assets.get(c.asset as usize).map(|a| a.name.clone()).unwrap_or_default()))
-            .collect();
-        for (ci, (c, name)) in clips.iter().enumerate() {
-            let len = app.asset_len(c.asset);
-            let x0 = x_of(rect.min.x, c.pos, sr, px);
-            let x1 = x_of(rect.min.x, c.pos + len, sr, px);
-            if x1 < rect.min.x || x0 > rect.max.x {
-                continue;
-            }
-            let sel = sel_clip == Some((t, k, ci));
-            draw_asset_clip(ui, app, c.asset, egui::Rect::from_min_max(egui::pos2(x0, rect.min.y + 1.0), egui::pos2(x1, rect.max.y - 1.0)), COL_CLIP, sel);
-            if x1 - x0 > 36.0 && !name.is_empty() {
-                ui.painter().text(
-                    egui::pos2(x0 + 3.0, rect.min.y + 2.0),
-                    egui::Align2::LEFT_TOP,
-                    name,
-                    egui::FontId::proportional(10.0),
-                    Color32::from_gray(220),
-                );
-            }
-            if sel {
-                // Selection hint: this clip is what Delete removes.
-                ui.painter().text(
-                    egui::pos2(x1 - 3.0, rect.min.y + 1.0),
-                    egui::Align2::RIGHT_TOP,
-                    "\u{d7}",
-                    egui::FontId::proportional(13.0),
-                    Color32::from_rgb(235, 120, 120),
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), Sense::click_and_drag());
+    let x0 = rect.min.x - app.hscroll;
+    let snapu = app.snap_unit();
+    let sel_clip = app.sel_clip;
+    let clips: Vec<(Clip, String)> = app
+        .arr
+        .tracks[t]
+        .lanes[k]
+        .clips
+        .iter()
+        .map(|c| (*c, app.assets.get(c.asset as usize).map(|a| a.name.clone()).unwrap_or_default()))
+        .collect();
+
+    // ---- paint (clipped to this strip) ----
+    let old_clip = ui.clip_rect();
+    ui.shrink_clip_rect(rect);
+    paint_grid(ui, app, rect, px, sr, false, x0);
+    // Lane tag rides inside the strip's left edge: it must NOT take layout
+    // room, or the lane grids would sit right of the ruler's.
+    ui.painter().text(
+        rect.min + egui::vec2(4.0, 1.0),
+        egui::Align2::LEFT_TOP,
+        if k == 0 { "track" } else { "child" },
+        egui::FontId::proportional(9.0),
+        Color32::from_gray(110),
+    );
+    for (ci, (c, name)) in clips.iter().enumerate() {
+        let len = app.asset_len(c.asset);
+        let cx0 = x_of(x0, c.pos, sr, px);
+        let cx1 = x_of(x0, c.pos + len, sr, px);
+        if cx1 < rect.min.x || cx0 > rect.max.x {
+            continue;
+        }
+        let sel = sel_clip == Some((t, k, ci));
+        draw_asset_clip(
+            ui,
+            app,
+            c.asset,
+            egui::Rect::from_min_max(egui::pos2(cx0, rect.min.y + 1.0), egui::pos2(cx1, rect.max.y - 1.0)),
+            COL_CLIP,
+            sel,
+        );
+        if cx1 - cx0 > 36.0 && !name.is_empty() {
+            ui.painter().text(
+                egui::pos2(cx0 + 3.0, rect.min.y + 2.0),
+                egui::Align2::LEFT_TOP,
+                name,
+                egui::FontId::proportional(10.0),
+                Color32::from_gray(220),
+            );
+        }
+        if sel {
+            // Selection hint: this clip is what Delete removes.
+            ui.painter().text(
+                egui::pos2(cx1 - 3.0, rect.min.y + 1.0),
+                egui::Align2::RIGHT_TOP,
+                "\u{d7}",
+                egui::FontId::proportional(13.0),
+                Color32::from_rgb(235, 120, 120),
+            );
+        }
+    }
+    // Rack drag: ghost preview while a native egui drag hovers this strip
+    // (contains_pointer keeps working even while the source is dragged).
+    let drop_in: Option<usize> = resp.dnd_hover_payload::<usize>().map(|a| *a);
+    if let (Some(a), Some(pt)) = (drop_in, ui.input(|i| i.pointer.hover_pos())) {
+        let pt = pt.clamp(
+            egui::pos2(rect.min.x, rect.min.y),
+            egui::pos2(rect.max.x, rect.max.y),
+        );
+        let ns = snap_start(s_at(x0, pt.x, sr, px), snapu);
+        let len = app.asset_len(a as u32);
+        let gx0 = x_of(x0, ns, sr, px).clamp(rect.min.x, rect.max.x);
+        let gx1 = x_of(x0, ns + len, sr, px).clamp(rect.min.x + 2.0, rect.max.x);
+        ui.painter().rect_stroke(
+            egui::Rect::from_min_max(egui::pos2(gx0, rect.min.y + 1.0), egui::pos2(gx1, rect.max.y - 1.0)),
+            2.0,
+            egui::Stroke::new(2.0, COL_GHOST),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ui.set_clip_rect(old_clip);
+
+    // ---- interactions ----
+    // Release of a rack drag over this strip places the clip (the strip
+    // receives it directly; the old manual cross-panel handoff never did).
+    if let Some(a) = resp.dnd_release_payload::<usize>().map(|a| *a) {
+        if let Some(pt) = ui.input(|i| i.pointer.hover_pos()) {
+            if rect.contains(pt) {
+                let ns = snap_start(s_at(x0, pt.x, sr, px), snapu);
+                app.arr.insert(t, k, Clip { asset: a as u32, pos: ns });
+                let li = app.arr.tracks[t].lanes[k].clips.len() - 1;
+                app.sel_clip = Some((t, k, li));
+                app.push_project();
+                app.status = format!(
+                    "clip placed on track {} \u{b7} {}",
+                    t + 1,
+                    if k == 0 { "track" } else { "child lane" }
                 );
             }
         }
-        // Rack drag: ghost preview of the clip that would drop here.
-        if let Some(a) = app.drag_asset {
-            if let Some(pt) = resp.interact_pointer_pos() {
-                if rect.contains(pt) {
-                    let ns = snap_start(s_at(rect.min.x, pt.x, sr, px), snapu);
-                    app.drop_hover = Some((t, k, ns));
-                    let len = app.asset_len(a as u32);
-                    let x0 = x_of(rect.min.x, ns, sr, px);
-                    let x1 = x_of(rect.min.x, ns + len, sr, px);
-                    ui.painter().rect_stroke(
-                        egui::Rect::from_min_max(egui::pos2(x0, rect.min.y + 1.0), egui::pos2(x1, rect.max.y - 1.0)),
-                        2.0,
-                        egui::Stroke::new(2.0, COL_GHOST),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-            }
-        }
-        // Interactions.
+        return; // the drop consumed this frame's pointer
+    }
+    if resp.drag_started_by(egui::PointerButton::Primary) {
         if let Some(pt) = resp.interact_pointer_pos() {
-            if resp.drag_started() && rect.contains(pt) {
-                let pos = s_at(rect.min.x, pt.x, sr, px);
-                // Which clip, if any, is under the cursor?
-                let mut hit: Option<usize> = None;
-                for (ci, (c, _)) in clips.iter().enumerate() {
-                    if pos >= c.pos && pos < c.pos + app.asset_len(c.asset) {
-                        hit = Some(ci);
-                    }
-                }
+            if rect.contains(pt) {
+                let pos = s_at(x0, pt.x, sr, px);
+                let hit = clips.iter().position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset));
                 match hit {
                     Some(ci) => {
                         app.sel_clip = Some((t, k, ci));
                         let cpos = app.arr.tracks[t].lanes[k].clips[ci].pos;
                         app.drag_clip = Some(ClipDrag { t, lane: k, c: ci, grab: cpos.saturating_sub(pos) });
                     }
-                    None => app.sel_clip = None,
-                }
-            } else if resp.dragged() {
-                if let Some(d) = app.drag_clip {
-                    if d.t == t && d.lane == k && rect.contains(pt) {
-                        let pos = snap_start(s_at(rect.min.x, pt.x, sr, px).saturating_add(d.grab), snapu);
-                        app.arr.move_clip(t, k, d.c, pos);
+                    None => {
+                        // Empty grid = playhead handle: press-jumps on
+                        // release (below), drag keeps scanning; the movement
+                        // area spans the grid of every track and matches the
+                        // pinned ruler position 1:1.
+                        app.sel_clip = None;
+                        app.scrub_drag = true;
+                        app.backend.cmd(Cmd::Seek { pos });
                     }
                 }
             }
         }
-        if resp.drag_stopped() {
-            if app.drag_clip.take().is_some() {
-                app.push_project();
-            }
-            // Drop a dragged rack asset exactly where the ghost preview sat.
-            if let Some((dt, dk, dpos)) = app.drop_hover.take() {
-                if let Some(a) = app.drag_asset.take() {
-                    app.arr.insert(dt, dk, Clip { asset: a as u32, pos: dpos });
-                    app.sel_clip = Some((dt, dk, app.arr.tracks[dt].lanes[dk].clips.len() - 1));
-                    app.push_project();
+    } else if resp.dragged_by(egui::PointerButton::Primary) {
+        if let Some(pt) = resp.interact_pointer_pos() {
+            if app.scrub_drag {
+                if rect.contains(pt) {
+                    let pos = s_at(x0, pt.x, sr, px);
+                    app.backend.cmd(Cmd::Seek { pos });
+                }
+            } else if let Some(d) = app.drag_clip {
+                if d.t == t && d.lane == k && rect.contains(pt) {
+                    let pos = snap_start(s_at(x0, pt.x, sr, px).saturating_add(d.grab), snapu);
+                    app.arr.move_clip(t, k, d.c, pos);
                 }
             }
         }
-    });
+    }
+    if resp.drag_stopped() && app.drag_clip.take().is_some() {
+        app.push_project();
+    }
+    if resp.clicked() && !resp.dragged() && !app.scrub_drag && app.drag_clip.is_none() {
+        // Plain click (no drag happened): select the clip under it, or scrub
+        // if the click landed on empty grid.
+        if let Some(pt) = resp.interact_pointer_pos() {
+            if rect.contains(pt) {
+                let pos = s_at(x0, pt.x, sr, px);
+                match clips.iter().position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset)) {
+                    Some(ci) => app.sel_clip = Some((t, k, ci)),
+                    None => {
+                        app.sel_clip = None;
+                        app.backend.cmd(Cmd::Seek { pos });
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Draw one clip's rectangle with its asset's waveform, normalized by the
@@ -3661,6 +3797,157 @@ mod tests {
         assert_eq!(seen.len(), n);
     }
 
+    // ---- headless window tests (real widget tree, synthetic pointer) ----
+
+    /// Fresh App with null audio, a scratch config dir, and one rack folder
+    /// holding a generated kick.wav. Returns the app and the file's y-row
+    /// finder left to the caller (layout is deterministic at px 1.0).
+    fn headless_app(tag: &str) -> App {
+        std::env::set_var("SIMPLOOPER_NULL_AUDIO", "1");
+        let dir = std::env::temp_dir().join(format!("sp-uity-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("simplooper")).unwrap();
+        std::fs::create_dir_all(dir.join("simplooper/effects")).unwrap();
+        let samples = dir.join("samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        let data: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        crate::audio_io::export(
+            &samples.join("kick.wav"),
+            48000,
+            &data,
+            crate::audio_io::ExportFormat::Wav,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("simplooper/config.json"),
+            format!(r#"{{"rack_folders":["{}"]}}"#, samples.display()),
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let mut app = App::new(Backend::start());
+        app.drain_events(); // discard the null-audio notice
+        app.sample_rate = 48_000; // null audio never sends Evt::Ready
+        app
+    }
+
+    /// One UI frame with the given pointer events.
+    fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1080.0, 640.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+    }
+
+    fn moved(p: egui::Pos2) -> egui::Event {
+        egui::Event::PointerMoved(p)
+    }
+    fn btn(p: egui::Pos2, b: egui::PointerButton, down: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: p, button: b, pressed: down, modifiers: Default::default() }
+    }
+
+    /// SETTINGS must dock to the LEFT of the asset rack (add-order test:
+    /// both panels are left panels; whichever is added first sits outermost,
+    /// so its heading text renders further left).
+    #[test]
+    fn settings_panel_pops_up_left_of_the_rack() {
+        let mut app = headless_app("settings");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1080.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        // Read headings from the pre-tessellate shapes (0.36 tessellates
+        // text away into callbacks, but the Shape list still carries galleys).
+        let mut x_settings = f32::MAX;
+        let mut x_rack = f32::MAX;
+        for cs in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                let txt = t.galley.text();
+                if txt.contains("SETTINGS") {
+                    x_settings = x_settings.min(t.pos.x);
+                }
+                if txt.contains("ASSET RACK") {
+                    x_rack = x_rack.min(t.pos.x);
+                }
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        assert!(x_settings < f32::MAX && x_rack < f32::MAX, "both headings painted");
+        assert!(x_settings < x_rack, "SETTINGS x={x_settings} must be left of ASSET RACK x={x_rack}");
+    }
+
+    /// The full user gesture: press a rack row, drag onto a track's lane
+    /// strip, release -> a clip lands on that track (and Delete-selection
+    /// is set). Then a right-click on the track header clears it again.
+    /// Drives the real egui DnD plugin end to end — this is the regression
+    /// test for "dragging from the rack dropped nothing".
+    #[test]
+    fn rack_drag_drops_a_clip_and_header_rmb_clears() {
+        let mut app = headless_app("drop");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]); // layout pass
+
+        // Click-probe the rack rows to locate kick.wav deterministically.
+        let mut y_row = None;
+        for y in (96..220).step_by(3) {
+            let p = egui::pos2(40.0, y as f32);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            if app.sel_asset.is_some() {
+                y_row = Some(y as f32);
+                break;
+            }
+        }
+        let y_row = y_row.expect("a rack row was clickable (kick.wav)");
+
+        // Drag: press, move past the drag threshold, hover the lane strip of
+        // track 1, release there.
+        let start = egui::pos2(40.0, y_row);
+        let lane = egui::pos2(500.0, 210.0);
+        frame(&mut app, &ctx, vec![moved(start), btn(start, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, y_row + 6.0))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(320.0, 170.0))]);
+        frame(&mut app, &ctx, vec![moved(lane)]);
+        assert!(egui::DragAndDrop::has_payload_of_type::<usize>(&ctx), "drag carries the asset");
+        frame(&mut app, &ctx, vec![btn(lane, egui::PointerButton::Primary, false)]);
+
+        let total = |a: &App| -> usize {
+            a.arr.tracks.iter().map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>()).sum()
+        };
+        assert_eq!(total(&app), 1, "drag-drop placed exactly one clip");
+        assert!(app.sel_clip.is_some(), "the dropped clip is selected");
+        assert_eq!(app.status, "clip placed on track 1 \u{b7} track");
+
+        // Right-click the Track-1 header (probe the small header band): it
+        // must clear the clip.
+        let mut cleared = false;
+        for y in (104..=150).step_by(3) {
+            let p = egui::pos2(300.0, y as f32);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+            if total(&app) == 0 {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared, "right-click on the track header cleared its clips");
+    }
+
     #[test]
     fn key_names_roundtrip() {
         for k in [egui::Key::A, egui::Key::Num3, egui::Key::F7, egui::Key::Space, egui::Key::M] {
@@ -3694,3 +3981,4 @@ mod tests {
         assert!(cfg.projects_dir().ends_with("simplooper-projects"));
     }
 }
+

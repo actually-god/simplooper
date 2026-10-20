@@ -53,19 +53,22 @@ timeline while you play.
 | Region | Contents |
 | --- | --- |
 | **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · **loop** checkbox · bar.beat position · **metro** + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** · peak meter · master gain |
-| **Left panel** | the [asset rack](#the-asset-rack) |
+| **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
 | **Grid toolbar** | auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
-| **Timeline** | ruler (bar numbers, click/drag scrubs) + one block per track: header row, mixer (when selected), and one lane strip per lane, each a horizontal clip space scrolled in the same frame |
+| **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs, playhead visible while stopped) + one block per track: header row, always-visible mixer, and one lane strip per lane — all sharing one horizontal scroll, so ruler and lane grids stay aligned |
 | **Bottom** | MIDI monitor (every event on `simplooper:midi_in`) |
 
 Each **track header** holds: the track name (click the row to select the
 track), **REC** (turns **STOP REC** while rolling), the play gate
 (**PLAYED** ⇄ **muted** — a muted track contributes nothing while its clips
-stay put), **clear** (remove this track's clips; assets stay in the rack),
-**+ child** / **- child** (add/remove child lanes), and a `N clips · M
-lanes` status. Selecting a track reveals **vol / gain / pan** sliders
-(editable dB / −100…+100 text boxes + raw MIDI readout) and its **FX**
-chain — exactly the mixer model from earlier versions, now per track.
+stay put), **+ child** / **- child** (add/remove child lanes), and a
+`N clips · M lanes` status. **Right-click the header** removes the track's
+clips (assets stay in the rack; same as `C`).
+
+Every track shows its **vol / gain / pan** sliders (editable dB /
+−100…+100 text boxes + raw MIDI readout) and an **fx** button directly to
+their right — no selection needed; the button opens that track's FX chain.
+Tracks with effects show their chain inline below the sliders.
 
 ## The asset rack
 
@@ -102,8 +105,9 @@ it:
   the last one (its clips go with it — base lane only ever survives).
   Recording or dropping onto an occupied base lane **opens a child lane
   automatically** instead of touching existing clips.
-- **Clear** on the header removes the track's clips (all lanes except the
-  base, which empties too); your rack assets stay untouched.
+- **Clear**: **right-click the track header** (or press `C` on the selected
+  track) removes the track's clips (all lanes except the base, which empties
+  too); your rack assets stay untouched.
 
 ## Recording takes
 
@@ -129,9 +133,10 @@ is **never** captured into a take.
 - **PLAY/STOP** (top bar, or `Space`, or bound MIDI) runs **everything**
   from wherever the playhead is, and stopping **holds the position** —
   start and stop at any point of the project, like a DAW.
-- **Drag the playhead**: click or drag anywhere on the ruler (or on lane
-  strips where no clip is under the cursor… the ruler is the reliable
-  target) to scrub; the whole view follows. The red line + position readout
+- **Drag the playhead**: click or drag anywhere on the **ruler** (always
+  pinned above the tracks) or on any lane's empty grid to scrub — the
+  movement area spans every track's grid in aligned columns; the whole view
+  follows. The red line + position readout
   (`bar.beat` in project time signature) always show where you are, running
   or not.
 - **loop** (default on) wraps the playhead at the project end forever;
