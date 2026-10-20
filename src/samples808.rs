@@ -9,7 +9,7 @@
 //!
 //! The WAVs are embedded in the binary (`include_bytes!`) so every install —
 //! package, desktop copy, or `cargo run` — ships them. On startup the app
-//! seeds them into `$XDG_DATA_HOME/simplooper/samples/808` (default
+//! seeds them into `$XDG_DATA_HOME/slooper/samples/808` (default
 //! `~/.local/share/...`) — files are (re)written whenever the on-disk copy is
 //! missing or a different size, so a deleted file comes back but a live
 //! install never fights itself. The seeded folder becomes the asset-rack
@@ -40,7 +40,7 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("808-clave.wav", include_bytes!("../samples/808/808-clave.wav")),
 ];
 
-/// `$XDG_DATA_HOME/simplooper` (default `~/.local/share/simplooper`).
+/// `$XDG_DATA_HOME/slooper` (default `~/.local/share/slooper`).
 pub fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
@@ -51,7 +51,7 @@ pub fn data_dir() -> PathBuf {
                 .join(".local")
                 .join("share")
         });
-    base.join("simplooper")
+    base.join("slooper")
 }
 
 /// The folder the pack is seeded into.
@@ -146,7 +146,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::env::set_var("XDG_DATA_HOME", &base);
         let dir = seed_pack();
-        assert_eq!(dir, base.join("simplooper").join("samples").join("808"));
+        assert_eq!(dir, base.join("slooper").join("samples").join("808"));
         for (name, data) in FILES {
             let p = dir.join(name);
             let on = std::fs::read(&p).unwrap_or_else(|e| panic!("{name}: {e}"));

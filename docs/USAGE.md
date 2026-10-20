@@ -1,10 +1,10 @@
-# Using simplooper
+# Using slooper
 
 A quick tour, then the reference details. Everything lives in one window
 (~1080×640, resizable down to 780×480); configuration is saved automatically
 when you quit, and your session itself saves into a **project** file (Ctrl+S).
 
-simplooper is a small **clip-based DAW**: one global playhead over a
+slooper is a small **clip-based DAW**: one global playhead over a
 metronome-defined bar grid, sixteen tracks with additive child lanes, an
 asset rack you drag audio from, and takes that place themselves onto the
 timeline while you play.
@@ -28,8 +28,8 @@ timeline while you play.
 ## First launch
 
 1. Start your JACK-compatible audio server (PipeWire with `pipewire-jack`,
-   or jack2). simplooper never starts one for you.
-2. Launch simplooper. The top bar shows `simplooper @ 48000 Hz` once the
+   or jack2). slooper never starts one for you.
+2. Launch slooper. The top bar shows `slooper @ 48000 Hz` once the
    audio engine is up.
 3. Click the **hamburger ☰** (top-left) → settings panel:
    - **INPUTS** — tick the remote output ports you want to record (your mic /
@@ -40,7 +40,7 @@ timeline while you play.
    - **Apply Selection**. Your choice is remembered and re-applied
      automatically on every launch, including when the JACK graph rebuilds.
 4. The **asset rack** (left panel) opens on the bundled **TR-808 pack** —
-   drag any file onto the grid to hear it. **+ folder** points simplooper at
+   drag any file onto the grid to hear it. **+ folder** points slooper at
    more samples/backing tracks; the **first folder is the primary folder** —
    everything you record is written there as WAV, so one folder holds both
    your starting material and your growing take library.
@@ -58,7 +58,7 @@ timeline while you play.
 | **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles |
 | **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll; any header-height difference shows as empty room at the top of the strip column): **name · REC · PLAYED/muted · +child/−child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button) and **FX…**; strips scroll in lockstep with the timeline |
-| **Bottom** | MIDI monitor (every event on `simplooper:midi_in`) |
+| **Bottom** | MIDI monitor (every event on `slooper:midi_in`) |
 
 Each **mixer strip** holds the track's whole control surface: the name row
 (click it to select the track — the strip tints), **REC** (turns **STOP REC**
@@ -80,7 +80,7 @@ empty grid or on a clip.
 A fresh install ships a **bundled TR-808 pack** — fourteen one-shots sampled
 from a real Roland TR-808 (kick, sub, snares, clap, hats, crash, cowbell,
 three toms, rimshot, clave; provenance in `samples/808/CREDITS.md`). It's
-seeded into `~/.local/share/simplooper/samples/808` on startup and is the
+seeded into `~/.local/share/slooper/samples/808` on startup and is the
 default rack folder until you add your own.
 
 Folders at the top, audio under each. Drag any file row onto any lane to
@@ -219,15 +219,15 @@ the asset in place, so every clip referencing it follows.
 
 - **Ctrl+S** saves. The first save of a session opens a **name prompt**;
   after that the same key saves straight into
-  `<projects folder>/<name>.simplooper`. **Ctrl+Shift+S** always re-asks
+  `<projects folder>/<name>.slooper`. **Ctrl+Shift+S** always re-asks
   (save-as). The **Save** button mirrors the key; **Save as** opens the
   prompt.
 - **Load** lists every project in the projects folder, newest first —
   clicking one replaces the session (unsaved changes are lost, so save
   first).
 - The **projects folder** is a setting (☰ settings → Projects): default
-  `~/.local/share/simplooper-projects`, changeable/browsable.
-- A `.simplooper` file is a small versioned JSON document: grid settings,
+  `~/.local/share/slooper-projects`, changeable/browsable.
+- A `.slooper` file is a small versioned JSON document: grid settings,
   quantize/snap, per-track mixer + FX, the whole track/lane/clip
   arrangement, and the asset table. **Audio is never embedded** — assets
   reference WAV files. At save time, derived/edited assets are written into
@@ -272,7 +272,7 @@ in **any** text box, and auto-repeat never re-fires):
 
 ## MIDI control
 
-simplooper exposes a JACK MIDI input port, **`simplooper:midi_in`**. Every
+slooper exposes a JACK MIDI input port, **`slooper:midi_in`**. Every
 incoming event is parsed and shown in the bottom monitor panel (and on
 stdout), so you can verify a controller before binding anything.
 
@@ -303,7 +303,7 @@ Each track has its own effect chain; each effect instance is **per-track**
 **FX** window on each row:
 
 - **Effects location** — folder scanned for scripts (default
-  `~/.local/share/simplooper/effects`, seeded with `template.rs` + the ABI
+  `~/.local/share/slooper/effects`, seeded with `template.rs` + the ABI
   contract on first run). **Rescan** re-reads it after you edit a script.
 - **The list** — toggle per script (default off), display name, author /
   description hover; enabled effects snap to the top, ↑↓ reorder —
@@ -339,15 +339,15 @@ output mix are never delayed, so nothing drifts.
 
 | Symptom | Fix |
 | --- | --- |
-| "no JACK server" / connection error on launch | Start PipeWire or `jackd` first — simplooper never starts a server itself (`NO_START` by design). |
+| "no JACK server" / connection error on launch | Start PipeWire or `jackd` first — slooper never starts a server itself (`NO_START` by design). |
 | No sound although the engine shows ready | ☰ settings → tick output (and input) ports → **Apply Selection**. Selections persist, but if your hardware changed, re-apply. |
 | Record button does nothing | Takes write into the **primary (first) rack folder** before they can become clips — the bundled 808 pack covers you by default, but if you removed every folder, press **+ folder**; the status line names the reason. |
 | Recorded clip starts early/late | Settings → latency (ms); and check **auto-quantize**/**snap** for grid drift you can *hear*. |
 | Clips skip at the loop wrap | Lengths that don't divide the bar grid: select the asset → **Quantize**, or enable **auto-quantize**. |
-| MIDI not seen | Check the bottom MIDI monitor panel; make sure a source is connected to `simplooper:midi_in`. |
+| MIDI not seen | Check the bottom MIDI monitor panel; make sure a source is connected to `slooper:midi_in`. |
 | Effect scripts "compile failed" | Fix the script (error text is in the FX list) → **Rescan**. Missing rustc entirely → install the Rust toolchain; other features keep working. |
 | MP3/OGG export does nothing | Install `ffmpeg`. |
-| Where do my files live? | Config: `$XDG_CONFIG_HOME/simplooper/config.json` · projects: `~/.local/share/simplooper-projects/` (a setting) · takes: your **primary rack folder** · effects: `~/.local/share/simplooper/effects/`. |
+| Where do my files live? | Config: `$XDG_CONFIG_HOME/slooper/config.json` · projects: `~/.local/share/slooper-projects/` (a setting) · takes: your **primary rack folder** · effects: `~/.local/share/slooper/effects/`. |
 
 ---
 Next: [INSTALL.md](INSTALL.md) to build/install, or

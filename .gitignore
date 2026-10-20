@@ -4,6 +4,6 @@
 # makepkg artifacts (e.g. testing an AUR checkout's PKGBUILD in-tree)
 /pkg/
 *.pkg.tar.zst
-/src/simplooper-*/
+/src/slooper-*/
 /src/*.tar.gz
 /*.tar.gz

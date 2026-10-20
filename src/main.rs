@@ -1,11 +1,11 @@
-//! simplooper — a minimalist clip-based audio DAW for Linux (JACK / PipeWire).
+//! slooper — a minimalist clip-based audio DAW for Linux (JACK / PipeWire).
 //!
 //! Sixteen tracks on a global, draggable playhead with a global loop region
 //! (area / current longest / whole song). Asset-rack drag & drop onto a
 //! metronome-defined bar grid, a right-docked Mixer aligned per track,
 //! clip copy/paste, additive child lanes, takes that record into rack assets
 //! and auto-placed clips, metronome-anchored quantize/trim, a bundled TR-808
-//! sample pack, `.simplooper` projects, per-track effects, MIDI action
+//! sample pack, `.slooper` projects, per-track effects, MIDI action
 //! mapping plus keyboard shortcuts, live mix passthrough and a MIDI monitor.
 
 /// Bundled application icon (placeholder for now — see assets/icon.png).
@@ -13,7 +13,7 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result {
     // Start the JACK/PipeWire-JACK backend thread (NO_START: never auto-starts a server).
-    let backend = simplooper::audio::Backend::start();
+    let backend = slooper::audio::Backend::start();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1080.0, 640.0])
@@ -28,9 +28,9 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "simplooper",
+        "slooper",
         options,
-        Box::new(move |_cc| Ok(Box::new(simplooper::ui::App::new(backend)))),
+        Box::new(move |_cc| Ok(Box::new(slooper::ui::App::new(backend)))),
     )
 }
 

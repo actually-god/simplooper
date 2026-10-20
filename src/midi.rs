@@ -1,4 +1,4 @@
-//! MIDI message parsing and display formatting for simplooper.
+//! MIDI message parsing and display formatting for slooper.
 //!
 //! The realtime audio thread hands us already-split raw messages (JACK's
 //! `jack_midi_event_get` handles running status internally), so each message

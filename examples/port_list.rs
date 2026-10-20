@@ -1,4 +1,4 @@
-//! List all JACK audio ports as seen by the jack crate (same view simplooper gets).
+//! List all JACK audio ports as seen by the jack crate (same view slooper gets).
 use jack::{Client, ClientOptions, PortFlags};
 
 fn main() {

@@ -1,10 +1,10 @@
 //! midi_tester — send a repeating burst of MIDI messages into a JACK MIDI port.
 //!
-//! Handy for exercising simplooper's MIDI monitor (or any JACK client) without
+//! Handy for exercising slooper's MIDI monitor (or any JACK client) without
 //! hardware:
 //!
 //! ```sh
-//! cargo run --example midi_tester                 # target simplooper:midi_in
+//! cargo run --example midi_tester                 # target slooper:midi_in
 //! cargo run --example midi_tester -- myapp:midi  # custom target port
 //! ```
 //!
@@ -48,7 +48,7 @@ fn main() {
         .iter()
         .find(|a| !a.starts_with('-'))
         .cloned()
-        .unwrap_or_else(|| "simplooper:midi_in".into());
+        .unwrap_or_else(|| "slooper:midi_in".into());
     let once = args.iter().any(|a| a == "--once");
 
     let (client, _status) = match Client::new("midi_tester", ClientOptions::NO_START_SERVER) {

@@ -1,4 +1,4 @@
-// ============================================================ simplooper ==
+// ============================================================ slooper ==
 // parametric_eq.rs — a full parametric equalizer with a custom child GUI.
 //
 // Six fully parametric bands (like ReaEQ / most DAW channel EQs), RBJ
@@ -6,7 +6,7 @@
 // highpass, notch, bandpass — per-band type / frequency / gain / Q, plus
 // dry/wet mix and output trim. Params are plain effect params (26 sliders),
 // so persistence and the audio path need nothing special; what makes this
-// one shine is the OPTIONAL child GUI (`simplooper_effect_gui` below):
+// one shine is the OPTIONAL child GUI (`slooper_effect_gui` below):
 //
 //   * the live |H(f)| response curve of the whole band cascade,
 //   * a 240-band live spectrum of the incoming audio behind the curve
@@ -841,9 +841,9 @@ static PARAMS: [EffectParamV1; 26] = [
 ];
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
-    abi: SIMPLOOPER_EFFECT_ABI,
+    abi: SLOOPER_EFFECT_ABI,
     name: c"Parametric EQ".as_ptr(),
-    author: c"simplooper".as_ptr(),
+    author: c"slooper".as_ptr(),
     description:
         c"6-band parametric EQ (RBJ biquads): shelf/peak/notch/bandpass per band, response curve + live spectrum in its own window.".as_ptr(),
     n_params: NPARAMS,
@@ -854,7 +854,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 };
 
 pub static GUI: EffectGuiV1 = EffectGuiV1 {
-    abi: SIMPLOOPER_EFFECT_GUI_ABI,
+    abi: SLOOPER_EFFECT_GUI_ABI,
     want_width: 700.0,
     want_height: 470.0,
     create: gui_create,
@@ -863,11 +863,11 @@ pub static GUI: EffectGuiV1 = EffectGuiV1 {
 };
 
 #[no_mangle]
-pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1 {
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
 }
 
 #[no_mangle]
-pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 {
+pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 {
     &GUI
 }

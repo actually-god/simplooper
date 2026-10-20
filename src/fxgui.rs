@@ -6,13 +6,13 @@
 //! * **Auto** (default, zero effect code): one labelled slider per param,
 //!   straight from the [`EffectDesc`] — the same widget style the loop rows
 //!   used before the editor existed.
-//! * **Custom**: the effect exported `simplooper_effect_gui` ([`fx::
+//! * **Custom**: the effect exported `slooper_effect_gui` ([`fx::
 //!   EffectGuiRef`]). We allocate a canvas, build a [`GuiFrameV1`] and a
 //!   [`GuiApiV1`] whose function pointers trampolines into egui draw calls
 //!   ([`Bridge`]), and call the effect's `draw`. No egui type ever crosses
 //!   the C boundary — only floats, pointers and u32s.
 //!
-//! One editor window at a time (simplooper.s per-track effects window and
+//! One editor window at a time (slooper.s per-track effects window and
 //! the loop rows both route through it). The editor holds an `Arc<Instance>`
 //! clone for its whole lifetime, so the audio instance (and the dlopen'd
 //! library) cannot die under a live GUI.

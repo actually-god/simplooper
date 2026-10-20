@@ -1,21 +1,21 @@
-// ============================================================ simplooper ==
-// effect_api.rs — the simplooper effect ABI, version 1.
+// ============================================================ slooper ==
+// effect_api.rs — the slooper effect ABI, version 1.
 //
 // THIS FILE IS NOT AUTHORED BY HAND AS A STANDALONE PROGRAM. It is a shared
-// contract, written once into every effects folder by simplooper itself and
+// contract, written once into every effects folder by slooper itself and
 // embedded in the binary (src/effect_api.rs is the source of truth). Effect
 // scripts pull it in with:
 //
 //     include!("effect_api.rs");
 //
-// because that resolves next to the script, where simplooper keeps a fresh
-// copy. Never edit the copy inside your effects folder — if simplooper
+// because that resolves next to the script, where slooper keeps a fresh
+// copy. Never edit the copy inside your effects folder — if slooper
 // rewrites it (or the version number below changes), your effect adapts.
 //
 // ---------------------------------------------------------------------------
 // What an effect is
 // ---------------------------------------------------------------------------
-// An effect script is one standalone Rust file. simplooper compiles each
+// An effect script is one standalone Rust file. slooper compiles each
 // valid `*.rs` file in the effects folder with:
 //
 //     rustc --edition 2021 --crate-type cdylib <file>
@@ -32,8 +32,8 @@
 // 1. `pub static DESC: EffectInfoV1` — the description block below.
 //    `name` is the only field you must give real text: it is what the GUI
 //    shows next to the toggle and in the loop row.
-// 2. `#[no_mangle] pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1`
-//    — the entry point simplooper looks for. One line, see the template.
+// 2. `#[no_mangle] pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1`
+//    — the entry point slooper looks for. One line, see the template.
 // 3. The three functions wired into DESC:
 //    - `create`     (sample_rate) -> state pointer. Called once per enabled
 //                   instance. Return core::ptr::null_mut() to signal failure
@@ -50,46 +50,46 @@
 // ---------------------------------------------------------------------------
 // - `author`, `description`: shown as hover text in the effects window.
 //   Use core::ptr::null() when you have nothing to show.
-// - Parameters: up to SIMPLOOPER_MAX_PARAMS entries in the `params` array.
+// - Parameters: up to SLOOPER_MAX_PARAMS entries in the `params` array.
 //   Each one becomes a labelled slider in the effect's AUTO child window,
 //   clamped to [min, max], seeded with `default`. To ADD a parameter:
 //   append an `EffectParamV1` entry, raise `n_params`, and read
 //   `*params.add(K)` in `process`.
 //   To REMOVE one: delete the entry, lower `n_params`, drop its use.
-//   Keep the array indices and the `process` reads in sync — simplooper
-//   validates `n_params <= SIMPLOOPER_MAX_PARAMS` but cannot know which
+//   Keep the array indices and the `process` reads in sync — slooper
+//   validates `n_params <= SLOOPER_MAX_PARAMS` but cannot know which
 //   index you meant. A slider with min == max renders inert; that is fine.
 // - A CUSTOM child GUI (curve displays, drag handles, live meters): export
-//   the optional `simplooper_effect_gui` symbol — see the GUI contract at
+//   the optional `slooper_effect_gui` symbol — see the GUI contract at
 //   the bottom of this file. Everything else stays exactly as-is, so old
 //   scripts are untouched by it.
 //
 // ---------------------------------------------------------------------------
 // How to check your effect is VALID
 // ---------------------------------------------------------------------------
-// Simplooper marks a script valid only when ALL of this succeeds:
+// Slooper marks a script valid only when ALL of this succeeds:
 //   * it compiles with the command above (no `extern crate`s beyond std/core;
 //     include! of effect_api.rs must resolve — keep the script in the folder),
-//   * the library exports `simplooper_effect_info`,
-//   * DESC.abi == SIMPLOOPER_EFFECT_ABI, name is non-null UTF-8 text,
-//     n_params <= SIMPLOOPER_MAX_PARAMS, and all three function pointers are
+//   * the library exports `slooper_effect_info`,
+//   * DESC.abi == SLOOPER_EFFECT_ABI, name is non-null UTF-8 text,
+//     n_params <= SLOOPER_MAX_PARAMS, and all three function pointers are
 //     non-null.
 // You can dry-run the compile yourself in the effects folder:
 //     rustc --edition 2021 --crate-type cdylib my_effect.rs
 // and see every rejection reason in the effects window (invalid files are
-// listed with the compiler/loader error). Inside simplooper, toggling the
+// listed with the compiler/loader error). Inside slooper, toggling the
 // effect on a loop proves `create` + `process` run live.
 // ---------------------------------------------------------------------------
 
 /// ABI version. Bumped only when this struct layout or the callback contract
-/// changes incompatibly; simplooper refuses effects built for another version.
-pub const SIMPLOOPER_EFFECT_ABI: u32 = 1;
+/// changes incompatibly; slooper refuses effects built for another version.
+pub const SLOOPER_EFFECT_ABI: u32 = 1;
 
 /// Hard cap on params per effect (keeps the realtime param snapshot fixed
 /// size; the auto GUI will not show more). Effects with a CUSTOM child GUI
 /// (see the GUI contract at the bottom of this file) lay params out however
 /// they like — the cap is on param count, not on widgets.
-pub const SIMPLOOPER_MAX_PARAMS: usize = 32;
+pub const SLOOPER_MAX_PARAMS: usize = 32;
 
 /// One slider the auto child window rides per param: label + range + default.
 #[repr(C)]
@@ -108,7 +108,7 @@ pub struct EffectParamV1 {
 /// only — nothing from outside core/std may cross this boundary.
 #[repr(C)]
 pub struct EffectInfoV1 {
-    /// Must be [`SIMPLOOPER_EFFECT_ABI`].
+    /// Must be [`SLOOPER_EFFECT_ABI`].
     pub abi: u32,
     /// Display name in the GUI (REQUIRED, non-null).
     pub name: *const core::ffi::c_char,
@@ -116,7 +116,7 @@ pub struct EffectInfoV1 {
     pub author: *const core::ffi::c_char,
     /// Optional one-paragraph description (or null).
     pub description: *const core::ffi::c_char,
-    /// Number of valid entries in `params` (0..=SIMPLOOPER_MAX_PARAMS).
+    /// Number of valid entries in `params` (0..=SLOOPER_MAX_PARAMS).
     pub n_params: u32,
     /// Param descriptors — null exactly when `n_params == 0`.
     pub params: *const EffectParamV1,
@@ -138,19 +138,19 @@ pub struct EffectInfoV1 {
 // ---------------------------------------------------------------------------
 // OPTIONAL: the child GUI (editor window) contract
 // ---------------------------------------------------------------------------
-// By default simplooper gives every effect a child window with one slider
+// By default slooper gives every effect a child window with one slider
 // per param — effects window / loop-row button → window, no GUI code
 // needed. An effect that wants a CUSTOM editor exports ONE extra symbol:
 //
 //     #[no_mangle]
-//     pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 { &GUI }
+//     pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
 //
 // with a `GUI: EffectGuiV1` static (its own version field:
-// SIMPLOOPER_EFFECT_GUI_ABI). Effects without this symbol keep the auto
+// SLOOPER_EFFECT_GUI_ABI). Effects without this symbol keep the auto
 // slider window; everything else in this file is unchanged for them.
 //
 // The child GUI is IMMEDIATE MODE, like the primitives below suggest:
-// simplooper calls your `draw` once per frame while the window is open.
+// slooper calls your `draw` once per frame while the window is open.
 // You receive
 //   * `gs`     — your own per-window state (from `gui_create`), and
 //   * `state`  — the AUDIO instance state (the same pointer `create`
@@ -161,7 +161,7 @@ pub struct EffectInfoV1 {
 //                you want (origin = canvas top-left, y down, points).
 // Interaction returns 1 the frame the user changed something; you then
 // push new values with `api.set_param(k, v)` — the same params `process`
-// reads, so audio follows automatically (and simplooper persists them).
+// reads, so audio follows automatically (and slooper persists them).
 //
 // GUI-thread rules (relaxed vs. process, but real):
 //   * Allocation, format!, Vec are OK here (60 fps UI code).
@@ -174,7 +174,7 @@ pub struct EffectInfoV1 {
 // ---------------------------------------------------------------------------
 
 /// Child-GUI ABI version (independent of the audio ABI above).
-pub const SIMPLOOPER_EFFECT_GUI_ABI: u32 = 1;
+pub const SLOOPER_EFFECT_GUI_ABI: u32 = 1;
 
 /// Everything one `draw` call knows about the current frame. Plain data.
 #[repr(C)]
@@ -207,7 +207,7 @@ pub struct GuiFrameV1 {
 /// Colors are RGBA floats 0..1.
 #[repr(C)]
 pub struct GuiApiV1 {
-    /// Must be [`SIMPLOOPER_EFFECT_GUI_ABI`] (checked for you).
+    /// Must be [`SLOOPER_EFFECT_GUI_ABI`] (checked for you).
     pub abi: u32,
     /// Per-frame context token. Pass it as the first argument of EVERY
     /// call below: `(api.line)(api.ctx, …)`. Valid only during `draw`.
@@ -279,7 +279,7 @@ pub struct GuiApiV1 {
     // ---- audio param access (the ONLY channel to `process`) ----
     /// Current value of param `k` (0..`n_params`); 0.0 out of range.
     pub get_param: extern "C" fn(ctx: *mut core::ffi::c_void, k: u32) -> f32,
-    /// Ride param `k` (clamped to its declared range by simplooper;
+    /// Ride param `k` (clamped to its declared range by slooper;
     /// remembers the change for persistence).
     pub set_param: extern "C" fn(ctx: *mut core::ffi::c_void, k: u32, v: f32),
     /// How many params this effect has.
@@ -290,9 +290,9 @@ pub struct GuiApiV1 {
 /// plain data + plain function pointers, no Rust types cross the boundary.
 #[repr(C)]
 pub struct EffectGuiV1 {
-    /// Must be [`SIMPLOOPER_EFFECT_GUI_ABI`].
+    /// Must be [`SLOOPER_EFFECT_GUI_ABI`].
     pub abi: u32,
-    /// Preferred canvas size in points (0 = let simplooper choose ~480×320).
+    /// Preferred canvas size in points (0 = let slooper choose ~480×320).
     pub want_width: f32,
     pub want_height: f32,
     /// Per-open-window constructor (called when the child window opens;

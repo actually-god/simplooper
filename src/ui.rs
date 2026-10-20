@@ -1,7 +1,7 @@
-//! egui front-end for simplooper: a small DAW — sixteen tracks with child
+//! egui front-end for slooper: a small DAW — sixteen tracks with child
 //! lanes, a global draggable playhead, a global loop region, an asset rack,
 //! clip copy/paste, clip-based arrangement, metronome-anchored quantize and
-//! `.simplooper` projects.
+//! `.slooper` projects.
 //!
 //! Layout:
 //! - top bar: hamburger (settings), status, transport, position readout,
@@ -340,7 +340,7 @@ const TRACK_SEP_HIT: f32 = 7.0;
 /// Loop region modes (see [`App::loop_mode`]); index = config value.
 const LOOP_MODES: [&str; 3] = ["area", "current longest", "whole song"];
 
-/// The user's home folder (projects default to `~/simplooper-projects`).
+/// The user's home folder (projects default to `~/slooper-projects`).
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -448,7 +448,7 @@ pub struct App {
 
     // --- project file ---
     proj_name: String,
-    /// Text override for the projects folder ("" = `~/simplooper-projects`).
+    /// Text override for the projects folder ("" = `~/slooper-projects`).
     project_dir: String,
     show_save_prompt: bool,
     save_draft: String,
@@ -1362,7 +1362,7 @@ impl App {
                 .collect(),
         };
         if let Err(e) = cfg.save() {
-            eprintln!("[simplooper] could not save config: {e}");
+            eprintln!("[slooper] could not save config: {e}");
         }
     }
 
@@ -1527,7 +1527,7 @@ impl App {
     fn projects_dir(&self) -> PathBuf {
         let t = self.project_dir.trim();
         if t.is_empty() {
-            home_dir().join("simplooper-projects")
+            home_dir().join("slooper-projects")
         } else {
             PathBuf::from(t)
         }
@@ -1545,7 +1545,7 @@ impl App {
         }
     }
 
-    /// Snapshot the GUI master copies into a `.simplooper` document.
+    /// Snapshot the GUI master copies into a `.slooper` document.
     fn build_project(&self, name: String) -> Project {
         let tracks: Vec<ProjTrack> = (0..MAX_LOOPS)
             .map(|t| ProjTrack {
@@ -2167,8 +2167,8 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
 
             ui.separator();
             let title = match &app.proj_name {
-                n if n.is_empty() => "simplooper · untitled".to_string(),
-                n => format!("simplooper · {n}"),
+                n if n.is_empty() => "slooper · untitled".to_string(),
+                n => format!("slooper · {n}"),
             };
             ui.heading(RichText::new(title).strong());
             let status = match &app.client_name {
@@ -3684,9 +3684,9 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                     // export time (see `do_export`), so changing the format
                     // never means re-picking the destination.
                     let name = if app.export_whole {
-                        "simplooper-project".to_string()
+                        "slooper-project".to_string()
                     } else {
-                        format!("simplooper-track-{}", app.selected + 1)
+                        format!("slooper-track-{}", app.selected + 1)
                     };
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("Export destination")
@@ -4034,9 +4034,9 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                 ui.label(RichText::new("waiting for MIDI input…").weak());
                 ui.label(
                     RichText::new(
-                        "the audio thread reads the JACK port simplooper:midi_in and \
+                        "the audio thread reads the JACK port slooper:midi_in and \
                          listens on every channel — link your device to it (e.g. \
-                         pw-link 'your-midi-port' 'simplooper:midi_in') and send a \
+                         pw-link 'your-midi-port' 'slooper:midi_in') and send a \
                          message; new source ports appear below automatically",
                     )
                     .weak()
@@ -4046,7 +4046,7 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
 
             if !app.midi_sources.is_empty() {
                 ui.add_space(4.0);
-                ui.label(RichText::new("sources linked to simplooper:midi_in").weak().small());
+                ui.label(RichText::new("sources linked to slooper:midi_in").weak().small());
                 for s in &app.midi_sources {
                     ui.label(RichText::new(format!("  {s}")).weak().small().monospace());
                 }
@@ -4134,7 +4134,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             });
             ui.label(
                 RichText::new(format!(
-                    "Projects ({} files) save into this folder: “{}” — empty means ~/simplooper-projects. Each project keeps its audio next to it in “<name> audio”.",
+                    "Projects ({} files) save into this folder: “{}” — empty means ~/slooper-projects. Each project keeps its audio next to it in “<name> audio”.",
                     project::EXT,
                     app.projects_dir().display()
                 ))
@@ -4356,11 +4356,11 @@ mod tests {
     /// holding a generated kick.wav. Returns the app and the file's y-row
     /// finder left to the caller (layout is deterministic at px 1.0).
     fn headless_app(tag: &str) -> App {
-        std::env::set_var("SIMPLOOPER_NULL_AUDIO", "1");
+        std::env::set_var("SLOOPER_NULL_AUDIO", "1");
         let dir = std::env::temp_dir().join(format!("sp-uity-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("simplooper")).unwrap();
-        std::fs::create_dir_all(dir.join("simplooper/effects")).unwrap();
+        std::fs::create_dir_all(dir.join("slooper")).unwrap();
+        std::fs::create_dir_all(dir.join("slooper/effects")).unwrap();
         let samples = dir.join("samples");
         std::fs::create_dir_all(&samples).unwrap();
         let data: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
@@ -4372,7 +4372,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            dir.join("simplooper/config.json"),
+            dir.join("slooper/config.json"),
             format!(r#"{{"rack_folders":["{}"]}}"#, samples.display()),
         )
         .unwrap();
@@ -4576,7 +4576,7 @@ mod tests {
     #[test]
     fn projects_dir_defaults_to_home() {
         let cfg = Config::default();
-        assert!(cfg.projects_dir().ends_with("simplooper-projects"));
+        assert!(cfg.projects_dir().ends_with("slooper-projects"));
     }
 
     // ---- track resizing, lane growth, wheel routing ----

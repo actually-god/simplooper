@@ -1,4 +1,4 @@
-//! simplooper — a minimalist clip-based audio DAW for Linux (JACK / PipeWire).
+//! slooper — a minimalist clip-based audio DAW for Linux (JACK / PipeWire).
 //!
 //! Library surface:
 //! - [`audio`]: JACK/PipeWire-JACK backend (manager thread + realtime
@@ -6,7 +6,7 @@
 //! - [`arrange`]: arrangement model — tracks → lanes → clips, placement,
 //!   snapping, child-lane rules.
 //! - [`assets`]: asset-rack folder store (scan, take saves, resolution).
-//! - [`project`]: the `.simplooper` save format and projects folder.
+//! - [`project`]: the `.slooper` save format and projects folder.
 //! - [`midi`]: MIDI message parsing, trigger bindings, shortcut migration.
 //! - [`quantize`]: metronome grid math, content quantize, silence trim.
 //! - [`config`]: persistent settings (rack folders, projects dir, mixer,

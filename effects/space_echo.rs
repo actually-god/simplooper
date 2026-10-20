@@ -1,4 +1,4 @@
-// ============================================================ simplooper ==
+// ============================================================ slooper ==
 // space_echo.rs — echo AND reverb in one effect, with a custom child GUI.
 //
 // A mono effects chain: a modulated feedback delay (tone-controlled damping
@@ -557,9 +557,9 @@ static PARAMS: [EffectParamV1; 11] = [
 ];
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
-    abi: SIMPLOOPER_EFFECT_ABI,
+    abi: SLOOPER_EFFECT_ABI,
     name: c"Echo + Reverb".as_ptr(),
-    author: c"simplooper".as_ptr(),
+    author: c"slooper".as_ptr(),
     description:
         c"Modulated echo and FDN reverb with independent echo/reverb levels; damped loops, wobble LFO, animated echo-pattern window, factory presets (plain echo + practice hall .. cathedral).".as_ptr(),
     n_params: NPARAMS,
@@ -570,7 +570,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 };
 
 pub static GUI: EffectGuiV1 = EffectGuiV1 {
-    abi: SIMPLOOPER_EFFECT_GUI_ABI,
+    abi: SLOOPER_EFFECT_GUI_ABI,
     want_width: 760.0,
     want_height: 424.0,
     create: gui_create,
@@ -579,11 +579,11 @@ pub static GUI: EffectGuiV1 = EffectGuiV1 {
 };
 
 #[no_mangle]
-pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1 {
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
 }
 
 #[no_mangle]
-pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 {
+pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 {
     &GUI
 }

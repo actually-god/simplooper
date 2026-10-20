@@ -1,10 +1,10 @@
 [package]
-name = "simplooper"
-version = "0.4.0"
+name = "slooper"
+version = "0.5.0"
 edition = "2021"
 description = "Minimalist live audio looper for JACK/PipeWire (Rust, eframe)"
 license = "MIT"
-repository = "https://github.com/actually-god/simplooper"
+repository = "https://github.com/actually-god/slooper"
 keywords = ["audio", "jack", "looper", "midi"]
 categories = ["multimedia::audio"]
 

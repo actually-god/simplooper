@@ -1,4 +1,4 @@
-//! End-to-end tests for the simplooper DAW backend.
+//! End-to-end tests for the slooper DAW backend.
 //!
 //! These drive the real `Backend` (manager thread + realtime handler) against
 //! a live JACK/PipeWire-JACK server, using a second JACK client as test
@@ -12,7 +12,7 @@
 //!   are captured at a sink;
 //! - export: a placed project renders through `Cmd::Export{Track,Project}`
 //!   to a decodable WAV;
-//! - midi: messages are sent to `simplooper:midi_in` and must come back parsed.
+//! - midi: messages are sent to `slooper:midi_in` and must come back parsed.
 //!
 //! If no JACK/PipeWire server is running, the tests skip themselves.
 
@@ -25,9 +25,9 @@ use jack::{
     ProcessScope, RawMidi,
 };
 
-use simplooper::arrange::{Arrangement, Clip};
-use simplooper::audio::{Backend, Cmd, Evt};
-use simplooper::midi::MidiMsg;
+use slooper::arrange::{Arrangement, Clip};
+use slooper::audio::{Backend, Cmd, Evt};
+use slooper::midi::MidiMsg;
 
 /// Serialize the e2e tests. Each drives the live audio server in real time
 /// and asserts on sample-accurate timing; running them concurrently starves
@@ -198,14 +198,14 @@ fn e2e_midi_monitor() {
         return; // no audio server: skip
     };
 
-    // Source client with a MIDI out wired to simplooper:midi_in.
+    // Source client with a MIDI out wired to slooper:midi_in.
     let (client, _status) = Client::new("midi_test", ClientOptions::NO_START_SERVER)
         .expect("no JACK server");
     let midi_out = client.register_port("midi_out", MidiOut::default()).unwrap();
     let src_name = client.name().to_string();
     client
         .connect_ports_by_name(&format!("{src_name}:midi_out"), &format!("{client_name}:midi_in"))
-        .expect("connect to simplooper:midi_in");
+        .expect("connect to slooper:midi_in");
     let active = client
         .activate_async((), MidiSrcProc { out: midi_out, step: 0 })
         .unwrap();
@@ -293,19 +293,19 @@ fn e2e_midi_capture_and_fire_sinco() {
     };
 
     // Isolate the config file so App does not read/write the user's real one.
-    let dir = std::env::temp_dir().join(format!("simplooper-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("XDG_CONFIG_HOME", &dir);
 
     // Arm the "select track 2" slot (Select(1) in the action table) so the
     // fired action is observable via `App::selected_loop`. The next bindable
     // MIDI message is captured.
-    let mut app = simplooper::ui::App::new(b);
-    let slot = simplooper::midi::MidiAction::idx(simplooper::midi::MidiAction::Select(1));
+    let mut app = slooper::ui::App::new(b);
+    let slot = slooper::midi::MidiAction::idx(slooper::midi::MidiAction::Select(1));
     app.arm_midi_slot(slot);
     app.drain_events();
 
-    // Source client emulating SINCO MIDI 1, wired to simplooper:midi_in.
+    // Source client emulating SINCO MIDI 1, wired to slooper:midi_in.
     let (client, _status) = Client::new("sinco_emu", ClientOptions::NO_START_SERVER)
         .expect("no JACK server");
     let midi_out = client.register_port("midi_out", MidiOut::default()).unwrap();
@@ -315,7 +315,7 @@ fn e2e_midi_capture_and_fire_sinco() {
             &format!("{src_name}:midi_out"),
             &format!("{client_name}:midi_in"),
         )
-        .expect("connect to simplooper:midi_in");
+        .expect("connect to slooper:midi_in");
     let active = client
         .activate_async((), SincoSrcProc { out: midi_out, step: 0 })
         .unwrap();
@@ -334,15 +334,15 @@ fn e2e_midi_capture_and_fire_sinco() {
     // Which of the four PCs arrives first depends on JACK graph scheduling, so
     // accept any PC with value 1 or 2 on channels 0–3 — exactly what the SINCO
     // MIDI 1 sends.
-    let expected: &[simplooper::midi::MidiBind] = &[
-        simplooper::midi::MidiBind { ty: 2, ch: 0, d1: 1 },
-        simplooper::midi::MidiBind { ty: 2, ch: 1, d1: 2 },
-        simplooper::midi::MidiBind { ty: 2, ch: 2, d1: 1 },
-        simplooper::midi::MidiBind { ty: 2, ch: 3, d1: 2 },
+    let expected: &[slooper::midi::MidiBind] = &[
+        slooper::midi::MidiBind { ty: 2, ch: 0, d1: 1 },
+        slooper::midi::MidiBind { ty: 2, ch: 1, d1: 2 },
+        slooper::midi::MidiBind { ty: 2, ch: 2, d1: 1 },
+        slooper::midi::MidiBind { ty: 2, ch: 3, d1: 2 },
     ];
     let captured = app.midi_bind_at(slot);
     assert!(
-        expected.contains(&captured.unwrap_or(simplooper::midi::MidiBind { ty: 0, ch: 99, d1: 99 })),
+        expected.contains(&captured.unwrap_or(slooper::midi::MidiBind { ty: 0, ch: 99, d1: 99 })),
         "armed slot must capture one of the SINCO PC patterns, got {captured:?}"
     );
     assert_eq!(
@@ -358,7 +358,7 @@ fn e2e_midi_capture_and_fire_sinco() {
 // ----------------------------------------------- DAW transport & takes --
 
 /// Source client: a controllable sample generator (constant or PRNG ±0.2)
-/// plus a lock-free capture ring of the sink (what simplooper wrote back).
+/// plus a lock-free capture ring of the sink (what slooper wrote back).
 struct LoopSrcProc {
     out: Port<AudioOut>,
     sink: Port<AudioIn>,
@@ -632,7 +632,7 @@ fn e2e_transport_and_clips() {
 // --------------------------------------------------------------- metronome --
 
 /// Sink-only capture client: records everything arriving at the applied
-/// simplooper output into a ring buffer.
+/// slooper output into a ring buffer.
 struct CapProc {
     sink: Port<AudioIn>,
     ring: Arc<Vec<AtomicU32>>,
@@ -821,7 +821,7 @@ fn e2e_metronome() {
 /// errors for empty tracks and empty projects.
 #[test]
 fn e2e_export_writes_file() {
-    use simplooper::audio_io::ExportFormat;
+    use slooper::audio_io::ExportFormat;
     let _g = e2e_lock();
     let Some((b, _cn, sr)) = start_backend() else {
         return; // no audio server: skip
@@ -836,7 +836,7 @@ fn e2e_export_writes_file() {
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0, a1]);
     b.cmd(Cmd::SetProject { assets: table, arr: Arc::new(arr), len: 12_000 });
 
-    let dir = std::env::temp_dir().join(format!("simplooper-e2e-export-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-export-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let stem = dir.join("mix");
@@ -850,7 +850,7 @@ fn e2e_export_writes_file() {
     );
     assert!(got.is_some(), "no export Notice for a track with clips");
     let file = stem.with_extension("wav"); // extension from the format
-    let samples = simplooper::audio_io::decode_to_mono(&file, sr).expect("exported wav decodes");
+    let samples = slooper::audio_io::decode_to_mono(&file, sr).expect("exported wav decodes");
     assert!(samples.len() >= 12_000, "export shorter than the project: {}", samples.len());
     // [0,4000): only the 0.5 clip; [4000,8000): both lanes summed; then silence.
     let seg = |a: usize, c: usize| samples[a..c].iter().sum::<f32>() / (c - a) as f32;

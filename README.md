@@ -1,4 +1,4 @@
-# simplooper
+# slooper
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -60,7 +60,7 @@ shortcuts, per-track effects, and clean export.
   quantized the moment it lands. Placed clips snap to a separate **snap
   subdivision** grid while you drag.
 - **Projects** — Ctrl+S saves everything (grid, mixer, FX, lanes, clips,
-  asset table) into a single JSON `.simplooper` file in your projects
+  asset table) into a single JSON `.slooper` file in your projects
   folder; the first save asks for a name. **Save as** re-names, **Load**
   shows every project in the folder newest-first, and the projects folder
   itself is a setting. Audio is never embedded — derived assets are written
@@ -102,7 +102,7 @@ shortcuts, per-track effects, and clean export.
   in text boxes; auto-repeat never re-fires.
 - **Import / export** — export one track (its mixer + chain baked in) or the
   whole project as WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
-- **MIDI monitor** — permanent `simplooper:midi_in` JACK MIDI port; every
+- **MIDI monitor** — permanent `slooper:midi_in` JACK MIDI port; every
   event parsed and shown in the bottom panel.
 - **Latency compensation** — *latency (ms)* discards that many leading
   samples of every fresh take, so the REC click itself lands on the clip
@@ -128,17 +128,17 @@ server for you — if none is running it shows an error and stays idle.
 **Arch Linux** — once published, from the AUR:
 
 ```sh
-yay -S simplooper        # or paru -S simplooper
+yay -S slooper        # or paru -S slooper
 ```
 
 **Any distro** — build from source (prereqs per distro in
 [docs/INSTALL.md](docs/INSTALL.md)):
 
 ```sh
-git clone https://github.com/actually-god/simplooper
-cd simplooper
+git clone https://github.com/actually-god/slooper
+cd slooper
 cargo build --release
-./target/release/simplooper
+./target/release/slooper
 ```
 
 ## Using the GUI
@@ -161,7 +161,7 @@ Full walkthrough in [docs/USAGE.md](docs/USAGE.md). The short version:
 Each track owns an independent effect chain. Click a track's **FX** button:
 
 - **Effects location** — folder scanned for effect scripts; default
-  `~/.local/share/simplooper/effects`, created and seeded with `template.rs`
+  `~/.local/share/slooper/effects`, created and seeded with `template.rs`
   + the ABI contract on first run; **Rescan** compiles edited scripts.
 - **The list** — one row per script: toggle (default off), display name,
   author/description hover text; enabled effects snap to the top and ↑↓
@@ -183,7 +183,7 @@ and `space_echo.rs` (echo + reverb with tone voicing and factory presets).
 
 ### MIDI binding
 
-Send events into `simplooper:midi_in` (hardware via PipeWire, or
+Send events into `slooper:midi_in` (hardware via PipeWire, or
 `cargo run --example midi_tester`). Settings → **MIDI bindings**: click an
 action's cell (turns blue, *listening…*), send a Note On/Off, CC, or
 Program Change — first matching message binds. Velocity/CC value is ignored
@@ -237,13 +237,13 @@ src/
 │              sample), placement/snap/lane-overlap rules, serialization
 ├── assets.rs  asset rack: folder scan (audio extensions), recordings into
 │              the primary folder, take save/resolve
-├── project.rs .simplooper save format (versioned JSON), projects dir
+├── project.rs .slooper save format (versioned JSON), projects dir
 │              listing, asset re-resolution by name
 ├── audio_io.rs import decoding (symphonia) + export (WAV/FLAC native,
 │              MP3/OGG via ffmpeg, resampled with rubato)
-├── config.rs  JSON config: $XDG_CONFIG_HOME/simplooper/config.json
+├── config.rs  JSON config: $XDG_CONFIG_HOME/slooper/config.json
 ├── samples808.rs  bundled TR-808 pack: embedded WAVs + startup seeding
-│              into $XDG_DATA_HOME/simplooper/samples/808 (default rack folder)
+│              into $XDG_DATA_HOME/slooper/samples/808 (default rack folder)
 ├── fx.rs      effects framework: scan/compile/cache/load effect scripts,
 │              ABI validation, per-track chains, RT-safe parameter relay
 ├── fxgui.rs   per-effect editor windows: auto sliders or scripted GUIs
@@ -292,7 +292,7 @@ src/
 ## Packaging (Arch / AUR)
 
 The Arch `PKGBUILD` **does not live in this repository** (AUR convention: the
-packaging recipe is maintained in its own AUR package repo, `simplooper`,
+packaging recipe is maintained in its own AUR package repo, `slooper`,
 building from this project's GitHub **release tag tarball**). Once the package
 is published, see [docs/INSTALL.md](docs/INSTALL.md) for install/build
 instructions.
@@ -305,11 +305,11 @@ Repo-side obligations that keep the package healthy:
   instead.
 - `assets/icon.png` — **placeholder** blank icon; drop the final artwork over
   this file (the package installs whatever is in it).
-- `simplooper.desktop` — application-menu entry (`Icon=simplooper`).
+- `slooper.desktop` — application-menu entry (`Icon=slooper`).
 - `tests/packaging.sh` — packaging regression test (PKGBUILD syntax, required
   fields, version sync with Cargo.toml, referenced files, desktop entry,
   icon, and dependency resolvability). It reads the PKGBUILD from the AUR
-  checkout: `PKGBUILD_PATH=~/aur/simplooper/PKGBUILD ./tests/packaging.sh --full`.
+  checkout: `PKGBUILD_PATH=~/aur/slooper/PKGBUILD ./tests/packaging.sh --full`.
 
 ⚠️ Packaging footguns that still apply when testing from an AUR checkout:
 never run `makepkg -C` inside a *copy of this project* (`-C` wipes `$PWD/src`,
@@ -325,7 +325,7 @@ cargo test -- --test-threads=1
 Unit tests (85) cover MIDI parsing/binding and shortcut-table migration,
 quantize/silence-trim math, the arrangement model (placement, snapping,
 child-lane creation on overlap, removal rules), the asset store, the
-`.simplooper` project format, and engine render/mixing. The e2e suite (7
+`.slooper` project format, and engine render/mixing. The e2e suite (7
 tests) drives a real JACK client pair in real time: MIDI monitor, audio
 mixing/routing, the global transport (play/stop anywhere, seek, loop wrap),
 the metronome grid, the record → take → clip pipeline, and export. Tests
@@ -335,7 +335,7 @@ Packaging is covered by `tests/packaging.sh` (see the Packaging section).
 
 ## License
 
-simplooper is distributed under the **MIT license**
+slooper is distributed under the **MIT license**
 ([LICENSE](LICENSE)) — free to use, modify, and redistribute, commercial use
 included, as long as the copyright notice travels with substantial copies.
 
@@ -347,6 +347,6 @@ included, as long as the copyright notice travels with substantial copies.
 - [x] Clip timeline: asset rack drag & drop, snapping, additive child lanes
 - [x] Record → asset + auto-placed clip (child lane on overlap)
 - [x] Metronome-based quantize, silence trim, auto-quantize on record
-- [x] `.simplooper` project files (named save, load browser, projects folder)
+- [x] `.slooper` project files (named save, load browser, projects folder)
 - [x] Keyboard shortcuts for track + transport actions
 - [ ] Clip-level fades, split-at-playhead, per-clip gain strips

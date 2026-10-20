@@ -1,4 +1,4 @@
-//! sinco_emu — emulate the "SINCO MIDI 1" controller for testing simplooper's
+//! sinco_emu — emulate the "SINCO MIDI 1" controller for testing slooper's
 //! MIDI binding capture without touching the hardware.
 //!
 //! The real device is a four-channel switch/footswitch: each channel (MIDI
@@ -8,7 +8,7 @@
 //! messages — PC 1/2 on channels 0, 1, 2, 3 — one per process cycle.
 //!
 //! ```sh
-//! cargo run --example sinco_emu                # target simplooper:midi_in
+//! cargo run --example sinco_emu                # target slooper:midi_in
 //! cargo run --example sinco_emu -- myapp:midi  # custom target port
 //! cargo run --example sinco_emu -- --once      # send each message once, exit
 //! ```
@@ -54,7 +54,7 @@ fn main() {
         .iter()
         .find(|a| !a.starts_with('-'))
         .cloned()
-        .unwrap_or_else(|| "simplooper:midi_in".into());
+        .unwrap_or_else(|| "slooper:midi_in".into());
     let once = args.iter().any(|a| a == "--once");
 
     let (client, _status) = match Client::new("sinco_emu", ClientOptions::NO_START_SERVER) {

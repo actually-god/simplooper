@@ -1,4 +1,4 @@
-//! Project save format — the `.simplooper` file.
+//! Project save format — the `.slooper` file.
 //!
 //! A project is a small JSON document (custom, versioned, first field is the
 //! magic `format` string) that captures everything needed to rebuild a
@@ -11,7 +11,7 @@
 //! (see [`resolve_asset`]). The GUI writes derived/edited assets into
 //! `<project dir>/<project name> audio/` at save time.
 //!
-//! Layout on disk: `<project dir>/<name>.simplooper`, one file per project.
+//! Layout on disk: `<project dir>/<name>.slooper`, one file per project.
 //! [`list_projects`] enumerates them for the Load window.
 
 use std::path::{Path, PathBuf};
@@ -21,13 +21,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::TrackFxSave;
 
 /// Magic value of the `format` field.
-pub const FORMAT: &str = "simplooper-project";
+pub const FORMAT: &str = "slooper-project";
 /// Format version written by this build. v2 (0.3.0) moved the mixer volume
 /// to the -inf..=+6 dB MIDI scale (115 = 0 dB, was 127 = 0 dB); v1 files are
 /// migrated on load.
 pub const VERSION: u32 = 2;
 /// File extension (no dot) of project files.
-pub const EXT: &str = "simplooper";
+pub const EXT: &str = "slooper";
 
 /// One asset in the table; array index == asset id used by the clips.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,7 +78,7 @@ pub struct ProjQuantize {
     pub loop_tl: bool,
 }
 
-/// The full `.simplooper` document.
+/// The full `.slooper` document.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub format: String,
@@ -96,7 +96,7 @@ impl Project {
     /// Magic + version check (v1 is accepted and migrated by [`load`]).
     fn validate(&self) -> Result<(), String> {
         if self.format != FORMAT {
-            return Err("not a simplooper project file".into());
+            return Err("not a slooper project file".into());
         }
         if self.version == 0 || self.version > VERSION {
             return Err(format!("unsupported project version {}", self.version));
@@ -120,7 +120,7 @@ pub fn sanitize_name(raw: &str) -> String {
     }
 }
 
-/// `<project dir>/<name>.simplooper`.
+/// `<project dir>/<name>.slooper`.
 pub fn project_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{}.{}", sanitize_name(name), EXT))
 }
@@ -212,8 +212,8 @@ mod tests {
         // dB scale where 115 = 0 dB.
         let dir = std::env::temp_dir().join(format!("sp-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("old.simplooper");
-        std::fs::write(&p, r#"{"format":"simplooper-project","version":1,"name":"old",
+        let p = dir.join("old.slooper");
+        std::fs::write(&p, r#"{"format":"slooper-project","version":1,"name":"old",
             "metro":{"bpm":120,"num":4,"sub":3},
             "quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},
             "playhead":0,
@@ -224,8 +224,8 @@ mod tests {
         assert_eq!(loaded.tracks[0].gain, 80, "gain domain unchanged");
         assert_eq!(loaded.tracks[0].pan, 64);
         // Future versions are still refused.
-        let bad = p.with_file_name("future.simplooper");
-        std::fs::write(&bad, r#"{"format":"simplooper-project","version":99,"name":"x","metro":{"bpm":120,"num":4,"sub":3},"quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},"playhead":0,"tracks":[],"assets":[]}"#).unwrap();
+        let bad = p.with_file_name("future.slooper");
+        std::fs::write(&bad, r#"{"format":"slooper-project","version":99,"name":"x","metro":{"bpm":120,"num":4,"sub":3},"quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},"playhead":0,"tracks":[],"assets":[]}"#).unwrap();
         assert!(load(&bad).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -245,11 +245,11 @@ mod tests {
         assert_eq!(back.tracks[0].fx[0].stem, "template");
         assert_eq!(back.assets[0].file, "/x/kick.wav");
         // Wrong magic is rejected with a clear message.
-        let bad = dir.join("bad.simplooper");
+        let bad = dir.join("bad.slooper");
         std::fs::write(&bad, r#"{"format":"nope","version":1}"#).unwrap();
         assert!(load(&bad).is_err());
         // Corrupt JSON is rejected too.
-        let worse = dir.join("worse.simplooper");
+        let worse = dir.join("worse.slooper");
         std::fs::write(&worse, "{").unwrap();
         assert!(load(&worse).is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -261,13 +261,13 @@ mod tests {
         assert_eq!(sanitize_name("   "), "project");
         assert_eq!(sanitize_name("../../etc/passwd"), "-..-etc-passwd");
         let p = project_path(Path::new("/p"), "two words");
-        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "two words.simplooper");
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "two words.slooper");
 
-        // list_projects: only .simplooper files, and a missing dir is empty.
+        // list_projects: only .slooper files, and a missing dir is empty.
         let dir = std::env::temp_dir().join(format!("sp-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.simplooper"), "{}").unwrap();
+        std::fs::write(dir.join("a.slooper"), "{}").unwrap();
         std::fs::write(dir.join("b.txt"), "{}").unwrap();
         let list = list_projects(&dir);
         assert_eq!(list.len(), 1);

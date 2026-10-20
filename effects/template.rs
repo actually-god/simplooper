@@ -1,8 +1,8 @@
-// ============================================================ simplooper ==
-// template.rs — starter effect for the simplooper effect framework.
+// ============================================================ slooper ==
+// template.rs — starter effect for the slooper effect framework.
 //
 // Copy this file inside your effects folder, rename it, and edit. Every
-// effect is a single standalone Rust file that simplooper compiles and
+// effect is a single standalone Rust file that slooper compiles and
 // loads at runtime. This template starts as an audible-but-subtle tremolo
 // (an amplitude wobble); with depth = 0 it is an exact pass-through, so
 // swap its guts for your own algorithm and keep the scaffolding.
@@ -11,7 +11,7 @@
 // THE FIVE THINGS AN EFFECT NEEDS (see effect_api.rs for the full contract)
 // ---------------------------------------------------------------------------
 // 1. `include!("effect_api.rs");` — pulls in the shared ABI structs. The
-//    file lives next to this script (simplooper writes it there); keep this
+//    file lives next to this script (slooper writes it there); keep this
 //    script inside the effects folder or the include stops resolving.
 // 2. A state struct — everything this effect remembers per loop-instance
 //    (one instance per loop that enables it; loops never share state).
@@ -19,7 +19,7 @@
 // 4. A `DESC: EffectInfoV1` static wiring it together — the ONLY required
 //    field with content is `name` (shown in the GUI). author/description
 //    are optional hover text; null when unused.
-// 5. The `simplooper_effect_info` entry point — one fixed line; do not edit.
+// 5. The `slooper_effect_info` entry point — one fixed line; do not edit.
 //
 // ---------------------------------------------------------------------------
 // ADDING / REMOVING SETTINGS (sliders the user rides per loop)
@@ -34,12 +34,12 @@
 // updates them between audio blocks, never mid-`process`. Up to 8 total.
 //
 // ---------------------------------------------------------------------------
-// HOW SIMPLOOPER DECIDES THIS FILE IS "VALID"
+// HOW SLOOPER DECIDES THIS FILE IS "VALID"
 // ---------------------------------------------------------------------------
 // - it compiles:  rustc --edition 2021 --crate-type cdylib template.rs
 //   (run that inside the effects folder to check without restarting; only
 //   std/core are available — no external crates),
-// - the library exports simplooper_effect_info,
+// - the library exports slooper_effect_info,
 // - DESC.abi == 1, name non-empty, n_params <= 8, all fn pointers set.
 // Anything else (typo, bad type, missing entry point) and the effects
 // window lists the file in red with the compiler/loader error — the app and
@@ -56,7 +56,7 @@
 // ---------------------------------------------------------------------------
 
 // The shared ABI (structs, constants, validity rules) — written next to
-// this file by simplooper on every start.
+// this file by slooper on every start.
 include!("effect_api.rs");
 
 // ---------------------------------------------------------------------------
@@ -141,9 +141,9 @@ static PARAMS: [EffectParamV1; 4] = [
 ];
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
-    abi: SIMPLOOPER_EFFECT_ABI,
+    abi: SLOOPER_EFFECT_ABI,
     name: c"Template Tremolo".as_ptr(),
-    author: c"simplooper".as_ptr(),
+    author: c"slooper".as_ptr(),
     description:
         c"Starter effect: depth 0 is an exact pass-through. Copy template.rs and swap the maths in process().".as_ptr(),
     n_params: 4,
@@ -154,10 +154,10 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 };
 
 // ---------------------------------------------------------------------------
-// 5. Entry point — fixed signature; simplooper's loader looks this symbol up
+// 5. Entry point — fixed signature; slooper's loader looks this symbol up
 //    by name. Never rename, never make it generic, never add args.
 // ---------------------------------------------------------------------------
 #[no_mangle]
-pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1 {
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
 }

@@ -1,4 +1,4 @@
-//! simplooper effect framework: runtime-compiled Rust effects per loop.
+//! slooper effect framework: runtime-compiled Rust effects per loop.
 //!
 //! Every `*.rs` file in the effects folder is a self-contained effect script
 //! (contract: [`effect_api.rs`], embedded below and also written next to the
@@ -6,7 +6,7 @@
 //! enumerates the folder, compiles each script with `rustc --crate-type
 //! cdylib` into a `.build/` cache (recompiling only when the source is newer
 //! than its artifact), loads the result with libloading and validates the
-//! exported `simplooper_effect_info` description.
+//! exported `slooper_effect_info` description.
 //!
 //! Instances ([`Instance`]) are created on the GUI thread, ref-counted with
 //! Arc and handed to the audio engine through `Cmd::SetTrackEffects`. The
@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-// The C-ABI contract. Compiled twice: once into simplooper (this include)
+// The C-ABI contract. Compiled twice: once into slooper (this include)
 // and once into every effect script (via its `include!("effect_api.rs")`),
 // so both sides agree on the layout by construction.
 mod api {
@@ -31,18 +31,18 @@ mod api {
 }
 pub use api::{
     EffectGuiV1, EffectInfoV1, EffectParamV1, GuiApiV1, GuiFrameV1,
-    SIMPLOOPER_EFFECT_ABI, SIMPLOOPER_EFFECT_GUI_ABI, SIMPLOOPER_MAX_PARAMS,
+    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
-pub const MAX_PARAMS: usize = SIMPLOOPER_MAX_PARAMS;
+pub const MAX_PARAMS: usize = SLOOPER_MAX_PARAMS;
 /// Effects per loop chain (bounds the RT snapshot arrays).
 pub const MAX_FX_PER_TRACK: usize = 8;
 
 /// ABI version this build speaks.
-pub const ABI_VERSION: u32 = SIMPLOOPER_EFFECT_ABI;
+pub const ABI_VERSION: u32 = SLOOPER_EFFECT_ABI;
 /// Child-GUI ABI version this build speaks.
-pub const GUI_ABI_VERSION: u32 = SIMPLOOPER_EFFECT_GUI_ABI;
+pub const GUI_ABI_VERSION: u32 = SLOOPER_EFFECT_GUI_ABI;
 
 /// The generated shared-contract file every script includes.
 pub const API_FILE: &str = "effect_api.rs";
@@ -63,10 +63,10 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
 /// takes the raw name bytes).
-const ENTRY: &[u8] = b"simplooper_effect_info\0";
+const ENTRY: &[u8] = b"slooper_effect_info\0";
 /// Optional symbol exporting the custom child-GUI vtable. Absent = the
 /// effect gets the auto slider window; the audio ABI does not care.
-const GUI_ENTRY: &[u8] = b"simplooper_effect_gui\0";
+const GUI_ENTRY: &[u8] = b"slooper_effect_gui\0";
 
 // ---------------------------------------------------------------------------
 // Directory handling
@@ -74,9 +74,9 @@ const GUI_ENTRY: &[u8] = b"simplooper_effect_gui\0";
 
 /// The folder effects live in when nothing was configured: next to the
 /// installed package. Exes under a `bin/` directory use the FHS-style
-/// sibling (`../share/simplooper/effects` → `/usr/share/...` or
+/// sibling (`../share/slooper/effects` → `/usr/share/...` or
 /// `~/.local/share/...`); dev builds get `effects/` beside the binary
-/// (repo checkout). Falls back to `$XDG_DATA_HOME/simplooper/effects` when
+/// (repo checkout). Falls back to `$XDG_DATA_HOME/slooper/effects` when
 /// the first choice cannot be created.
 pub fn default_effects_dir() -> PathBuf {
     let exe_dir = std::env::current_exe()
@@ -87,7 +87,7 @@ pub fn default_effects_dir() -> PathBuf {
     let primary = if under_bin {
         exe_dir
             .parent()
-            .map(|root| root.join("share").join("simplooper").join("effects"))
+            .map(|root| root.join("share").join("slooper").join("effects"))
             .unwrap_or_else(|| exe_dir.join("effects"))
     } else {
         exe_dir.join("effects")
@@ -100,7 +100,7 @@ pub fn default_effects_dir() -> PathBuf {
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".local").join("share"));
-    let fallback = base.join("simplooper").join("effects");
+    let fallback = base.join("slooper").join("effects");
     let _ = std::fs::create_dir_all(&fallback);
     fallback
 }
@@ -111,10 +111,10 @@ fn home_dir() -> PathBuf {
 
 /// Resolve the effects folder and make it usable: create it when missing,
 /// refresh the generated `effect_api.rs` when it differs (silently skipping
-/// read-only folders that already ship a matching copy). `SIMPLOOPER_EFFECTS_DIR`
+/// read-only folders that already ship a matching copy). `SLOOPER_EFFECTS_DIR`
 /// overrides everything (used by tests and for quick experimentation).
 pub fn prepare_effects_dir(cfg_dir: Option<&str>) -> PathBuf {
-    let env_dir = std::env::var("SIMPLOOPER_EFFECTS_DIR")
+    let env_dir = std::env::var("SLOOPER_EFFECTS_DIR")
         .ok()
         .filter(|p| !p.trim().is_empty());
     let dir = match env_dir.as_deref().or(cfg_dir.map(str::trim)) {
@@ -836,7 +836,7 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("could not create build dir: {e}"))?;
     }
     let crate_name = sanitize_crate_name(
-        out.file_stem().and_then(|s| s.to_str()).unwrap_or("simplooper_effect"),
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("slooper_effect"),
     );
     let tmp = out.with_extension("so.tmp");
     let output = Command::new("rustc")
@@ -876,14 +876,14 @@ unsafe fn validate(
     lib: &libloading::Library,
 ) -> Result<(EffectDesc, EffectFns, Option<&'static EffectGuiV1>), String> {
     let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> =
-        lib.get(ENTRY).map_err(|_| "missing entry point simplooper_effect_info — see template.rs".to_string())?;
+        lib.get(ENTRY).map_err(|_| "missing entry point slooper_effect_info — see template.rs".to_string())?;
     let info = sym();
     if info.is_null() {
-        return Err("simplooper_effect_info returned null".into());
+        return Err("slooper_effect_info returned null".into());
     }
     let d = &*info;
     if d.abi != ABI_VERSION {
-        return Err(format!("effect ABI version {} (this simplooper speaks {ABI_VERSION})", d.abi));
+        return Err(format!("effect ABI version {} (this slooper speaks {ABI_VERSION})", d.abi));
     }
     let name = read_cstr(d.name).ok_or("effect has no name — DESC.name must be text")?;
     let author = d.author.cast_non_null().and_then(read_cstr);
@@ -906,11 +906,11 @@ unsafe fn validate(
             let gsym: libloading::Symbol<extern "C" fn() -> *const EffectGuiV1> = gsym;
             let g = gsym();
             if g.is_null() {
-                return Err("simplooper_effect_gui returned null".into());
+                return Err("slooper_effect_gui returned null".into());
             }
             let g = &*g;
             if g.abi != GUI_ABI_VERSION {
-                return Err(format!("child GUI ABI version {} (this simplooper speaks {GUI_ABI_VERSION})", g.abi));
+                return Err(format!("child GUI ABI version {} (this slooper speaks {GUI_ABI_VERSION})", g.abi));
             }
             // create/draw/destroy are non-nullable fn types in the shared
             // ABI file — a script cannot put null in them and compile, so
@@ -1067,7 +1067,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("simplooper-fx-{}-{tag}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("slooper-fx-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1726,12 +1726,12 @@ extern "C" fn create(_sr: f64) -> *mut core::ffi::c_void { core::ptr::null_mut()
 extern "C" fn destroy(_s: *mut core::ffi::c_void) {}
 extern "C" fn process(_s: *mut core::ffi::c_void, i: f32, _p: *const f32) -> f32 { i }
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
-    abi: SIMPLOOPER_EFFECT_ABI, name: c"t".as_ptr(), author: core::ptr::null(),
+    abi: SLOOPER_EFFECT_ABI, name: c"t".as_ptr(), author: core::ptr::null(),
     description: core::ptr::null(), n_params: 0, params: core::ptr::null(),
     create, destroy, process,
 };
 #[no_mangle]
-pub extern "C" fn simplooper_effect_info() -> *const EffectInfoV1 { &DESC }
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 { &DESC }
 "#;
         let gui_fns = r#"
 extern "C" fn gcreate(_sr: f64) -> *mut core::ffi::c_void { core::ptr::null_mut() }
@@ -1743,14 +1743,14 @@ pub static GUI: EffectGuiV1 = EffectGuiV1 {
     create: gcreate, draw: gdraw, destroy: gdestroy,
 };
 #[no_mangle]
-pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 { &GUI }
+pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
 "#;
         let dir = temp_dir("gui");
         std::fs::write(dir.join(API_FILE), API_SRC).unwrap();
         std::fs::write(dir.join("plain.rs"), minimal_audio).unwrap();
         std::fs::write(
             dir.join("guied.rs"),
-            format!("const ABI_CONST: u32 = SIMPLOOPER_EFFECT_GUI_ABI;\n{minimal_audio}{gui_fns}"),
+            format!("const ABI_CONST: u32 = SLOOPER_EFFECT_GUI_ABI;\n{minimal_audio}{gui_fns}"),
         )
         .unwrap();
         std::fs::write(
@@ -1788,7 +1788,7 @@ pub extern "C" fn simplooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert_eq!(reg.stems(), vec!["ok".to_string()]);
         let errs: HashMap<_, _> = reg.items().iter().map(|i| (i.stem.clone(), i.error.clone().unwrap_or_default())).collect();
         assert!(errs["broken"].contains("compile failed"), "{}", errs["broken"]);
-        assert!(errs["noinfo"].contains("simplooper_effect_info"), "{}", errs["noinfo"]);
+        assert!(errs["noinfo"].contains("slooper_effect_info"), "{}", errs["noinfo"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

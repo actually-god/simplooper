@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Simplooper
+Name=Slooper
 Comment=Lightweight JACK clip-based DAW with MIDI and keyboard control
-Exec=simplooper
-Icon=simplooper
+Exec=slooper
+Icon=slooper
 Terminal=false
 Categories=AudioVideo;Audio;Midi;
 Keywords=audio;jack;daw;loop;midi;recording;

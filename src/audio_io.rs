@@ -234,7 +234,7 @@ fn encode_with_ffmpeg(
 ) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
-    let tmp = path.with_extension("simplooper-tmp.wav");
+    let tmp = path.with_extension("slooper-tmp.wav");
     write_wav(&tmp, rate, samples)?;
     let codec = match fmt {
         ExportFormat::Mp3 => "libmp3lame",
@@ -267,7 +267,7 @@ mod tests {
 
     fn tmp_stem(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("simplooper-export-{tag}-{}", std::process::id()));
+        p.push(format!("slooper-export-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
     }

@@ -1,8 +1,8 @@
 //! Persistent configuration: rebindable keyboard shortcuts, MIDI bindings,
 //! per-track mixer levels, metronome/grid settings and folder locations.
 //!
-//! Stored as JSON at `$XDG_CONFIG_HOME/simplooper/config.json` (falling back to
-//! `~/.config/simplooper/config.json`). A missing or corrupt file yields
+//! Stored as JSON at `$XDG_CONFIG_HOME/slooper/config.json` (falling back to
+//! `~/.config/slooper/config.json`). A missing or corrupt file yields
 //! defaults; saving is best-effort (UI keeps working if the write fails).
 //! Unknown fields are ignored and removed fields (root loops, the old
 //! metronome-quantize toggle) simply drop out, so configs from any older
@@ -134,7 +134,7 @@ pub struct Config {
     /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
     #[serde(default)]
     pub vol_scale_v2: bool,
-    /// Where `.simplooper` project files live (empty = `~/simplooper-projects`).
+    /// Where `.slooper` project files live (empty = `~/slooper-projects`).
     #[serde(default)]
     pub project_dir: String,
     /// Asset rack folders, in order. The first entry is the *primary* folder:
@@ -233,14 +233,14 @@ fn default_true() -> bool {
 }
 
 impl Config {
-    /// `$XDG_CONFIG_HOME/simplooper/config.json` (or `~/.config/...`).
+    /// `$XDG_CONFIG_HOME/slooper/config.json` (or `~/.config/...`).
     pub fn path() -> PathBuf {
         let base = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".config"));
-        base.join("simplooper").join("config.json")
+        base.join("slooper").join("config.json")
     }
 
     /// Load the config, falling back to defaults on any error.
@@ -253,7 +253,7 @@ impl Config {
                     // A torn/invalid write must never be silently replaced:
                     // keep it next to the config for recovery, start fresh.
                     let _ = std::fs::rename(Self::path(), Self::path().with_extension("corrupt"));
-                    eprintln!("[simplooper] config invalid ({e}) — saved as config.corrupt, using defaults");
+                    eprintln!("[slooper] config invalid ({e}) — saved as config.corrupt, using defaults");
                     return Self::default();
                 }
             },
@@ -281,11 +281,11 @@ impl Config {
         std::fs::write(&p, s).map_err(|e| e.to_string())
     }
 
-    /// Where `.simplooper` files live: the configured folder, or the
-    /// `simplooper-projects` folder in the user's home when unset.
+    /// Where `.slooper` files live: the configured folder, or the
+    /// `slooper-projects` folder in the user's home when unset.
     pub fn projects_dir(&self) -> PathBuf {
         if self.project_dir.trim().is_empty() {
-            home_dir().join("simplooper-projects")
+            home_dir().join("slooper-projects")
         } else {
             PathBuf::from(self.project_dir.trim())
         }
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn projects_dir_fallback() {
         let mut cfg = Config::default();
-        assert!(cfg.projects_dir().ends_with("simplooper-projects"));
+        assert!(cfg.projects_dir().ends_with("slooper-projects"));
         cfg.project_dir = "/srv/music".into();
         assert_eq!(cfg.projects_dir(), PathBuf::from("/srv/music"));
     }

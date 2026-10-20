@@ -33,6 +33,6 @@ knob positions 0/2.5/5/7.5/10):
 | `808-clave.wav`      | `CL.WAV`      | Claves                             |
 
 The app embeds these files and seeds them to
-`$XDG_DATA_HOME/simplooper/samples/808` on first launch.
+`$XDG_DATA_HOME/slooper/samples/808` on first launch.
 
 With thanks to Michael Fischer — and to every 808 track since 1980.

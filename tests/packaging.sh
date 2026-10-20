@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Packaging regression test for the Simplooper AUR package.
+# Packaging regression test for the Slooper AUR package.
 #
 # Catches the class of failure where `makepkg -si` cannot resolve the
 # PKGBUILD's dependencies on the current system — e.g. depending on a
@@ -10,7 +10,7 @@
 # repo), so point the script at your AUR checkout:
 #
 # Usage:
-#   PKGBUILD_PATH=~/aur/simplooper/PKGBUILD ./tests/packaging.sh
+#   PKGBUILD_PATH=~/aur/slooper/PKGBUILD ./tests/packaging.sh
 #                                 fast checks: syntax, metadata, files, deps
 #   ... ./tests/packaging.sh --full
 #                                 additionally build the package in a sandbox
@@ -54,15 +54,15 @@ n_sha=$(printf '%s' "$sha_line" | tr -cd "'" | wc -c)
   || err "source has $((n_src / 2)) entries but sha256sums has $((n_sha / 2))"
 
 # --- 4. files referenced by package() ---------------------------------------
-for f in simplooper.desktop assets/icon.png Cargo.lock; do
+for f in slooper.desktop assets/icon.png Cargo.lock; do
   [ -f "$f" ] || err "file required by PKGBUILD is missing: $f"
 done
 
 # --- 5. desktop entry --------------------------------------------------------
-grep -q "^Type=Application$" simplooper.desktop || err "desktop: missing Type=Application"
-grep -q "^Exec=" simplooper.desktop || err "desktop: missing Exec="
-grep -q "^Icon=simplooper$" simplooper.desktop \
-  || err "desktop: Icon must be 'simplooper' (matches installed icon file name)"
+grep -q "^Type=Application$" slooper.desktop || err "desktop: missing Type=Application"
+grep -q "^Exec=" slooper.desktop || err "desktop: missing Exec="
+grep -q "^Icon=slooper$" slooper.desktop \
+  || err "desktop: Icon must be 'slooper' (matches installed icon file name)"
 
 # --- 6. icon ------------------------------------------------------------------
 file assets/icon.png | grep -q "PNG image data, 256 x 256" \
@@ -110,17 +110,17 @@ if [ "${1:-}" = "--full" ]; then
   # Reproduce the user's exact layout: a copy of the project folder with the
   # PKGBUILD inside it, so makepkg's default $srcdir=$PWD/src collides with
   # Rust's own src/ — the scenario that broke package() before.
-  mkdir -p "$tmp/proj" "$tmp/stage/simplooper-${pkgbuild_ver}"
+  mkdir -p "$tmp/proj" "$tmp/stage/slooper-${pkgbuild_ver}"
   tar cf - --exclude=target --exclude=.git . | tar xf - -C "$tmp/proj" \
     || { err "could not stage project copy"; }
   # GitHub-layout source tarball: files under a top-level dir.
-  tar cf - --exclude=target --exclude=.git . | tar xf - -C "$tmp/stage/simplooper-${pkgbuild_ver}" \
+  tar cf - --exclude=target --exclude=.git . | tar xf - -C "$tmp/stage/slooper-${pkgbuild_ver}" \
     || { err "could not stage source tree"; }
-  tar czf "$tmp/proj/simplooper-${pkgbuild_ver}.tar.gz" -C "$tmp/stage" "simplooper-${pkgbuild_ver}" \
+  tar czf "$tmp/proj/slooper-${pkgbuild_ver}.tar.gz" -C "$tmp/stage" "slooper-${pkgbuild_ver}" \
     || { err "could not create source tarball"; }
-  sum=$(sha256sum "$tmp/proj/simplooper-${pkgbuild_ver}.tar.gz" | cut -d' ' -f1)
+  sum=$(sha256sum "$tmp/proj/slooper-${pkgbuild_ver}.tar.gz" | cut -d' ' -f1)
   cp "$PKG" "$tmp/proj/PKGBUILD"
-  sed -i "s|^source=.*|source=(\"simplooper-${pkgbuild_ver}.tar.gz\")|" "$tmp/proj/PKGBUILD"
+  sed -i "s|^source=.*|source=(\"slooper-${pkgbuild_ver}.tar.gz\")|" "$tmp/proj/PKGBUILD"
   sed -i "s|^sha256sums=.*|sha256sums=('$sum')|" "$tmp/proj/PKGBUILD"
   # --nodeps: dep resolvability was already verified in step 7; we must not
   # let makepkg install pacman rust/cargo over a rustup toolchain.
@@ -132,12 +132,12 @@ if [ "${1:-}" = "--full" ]; then
   if [ -z "$pkg" ]; then
     err "no .pkg.tar.zst produced"
   else
-    tar -tf "$pkg" | grep -q "usr/bin/simplooper$" \
-      || err "package missing usr/bin/simplooper"
-    tar -tf "$pkg" | grep -q "usr/share/applications/simplooper.desktop$" \
+    tar -tf "$pkg" | grep -q "usr/bin/slooper$" \
+      || err "package missing usr/bin/slooper"
+    tar -tf "$pkg" | grep -q "usr/share/applications/slooper.desktop$" \
       || err "package missing desktop entry"
-    tar -tf "$pkg" | grep -q "usr/share/icons/hicolor/256x256/apps/simplooper.png$" \
-      || err "package missing icon (must install as simplooper.png)"
+    tar -tf "$pkg" | grep -q "usr/share/icons/hicolor/256x256/apps/slooper.png$" \
+      || err "package missing icon (must install as slooper.png)"
     if grep -q 'reference to \$srcdir' "$tmp/proj/build.log"; then
       err "build log contains a \$srcdir path leak"
     fi

@@ -1,4 +1,4 @@
-//! JACK/PipeWire-JACK audio backend for simplooper (DAW engine).
+//! JACK/PipeWire-JACK audio backend for slooper (DAW engine).
 //!
 //! A dedicated non-realtime "audio manager" thread owns the `jack::Client`.
 //! The GUI talks to it over an mpsc command channel and receives state
@@ -36,7 +36,7 @@ use jack::{
 
 use crate::arrange::Arrangement;
 
-pub const CLIENT_NAME: &str = "simplooper";
+pub const CLIENT_NAME: &str = "slooper";
 const MIDI_PORT_SHORT: &str = "midi_in";
 /// Fixed pool of mix slots; `Apply` maps the selected ports onto slots 0..n-1.
 pub const MAX_SLOTS: usize = 16;
@@ -225,7 +225,7 @@ pub enum Evt {
     /// recording started, `data` the captured mono samples. The GUI stores
     /// it as an asset and places a clip; the engine keeps nothing.
     Take { track: usize, at: u64, data: Arc<[f32]> },
-    /// A remote MIDI source ports currently wired into `simplooper:midi_in`
+    /// A remote MIDI source ports currently wired into `slooper:midi_in`
     /// (auto-connected; refreshed on port/client registration events).
     Midi(RawMidiMsg),
     MidiSources(Vec<String>),
@@ -273,7 +273,7 @@ impl Backend {
         );
 
         let thread = std::thread::Builder::new()
-            .name("simplooper-audio".into())
+            .name("slooper-audio".into())
             .spawn(move || {
                 run(cmd_rx, evt_tx, t_gain, t_peak, t_xruns, t_midi_drops, t_engine);
             })
@@ -818,21 +818,21 @@ fn run(
     // client library, reported as glibc heap corruption), and none of that
     // surface is what a headless UI test exercises. Behaves exactly like the
     // "no JACK server" path below.
-    if std::env::var("SIMPLOOPER_NULL_AUDIO").is_ok() {
-        let _ = evt_tx.send(Evt::Unavailable("null audio (SIMPLOOPER_NULL_AUDIO)".into()));
+    if std::env::var("SLOOPER_NULL_AUDIO").is_ok() {
+        let _ = evt_tx.send(Evt::Unavailable("null audio (SLOOPER_NULL_AUDIO)".into()));
         return;
     }
     let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("No JACK/PipeWire-JACK server available: {}", describe_err(e));
-            eprintln!("[simplooper] {}", msg);
+            eprintln!("[slooper] {}", msg);
             let _ = evt_tx.send(Evt::Unavailable(msg));
             return;
         }
     };
     if status.contains(ClientStatus::NAME_NOT_UNIQUE) {
-        eprintln!("[simplooper] client renamed to '{}'", client.name());
+        eprintln!("[slooper] client renamed to '{}'", client.name());
     }
 
     // Register the fixed slot pool + MIDI port before activation. Pool ports
@@ -927,7 +927,7 @@ fn run(
     let client_name = active.as_client().name().to_string();
     let sample_rate = active.as_client().sample_rate();
     eprintln!(
-        "[simplooper] JACK client '{}' active @ {} Hz",
+        "[slooper] JACK client '{}' active @ {} Hz",
         client_name, sample_rate
     );
     let _ = evt_tx.send(Evt::Ready { client_name: client_name.clone(), sample_rate });
@@ -1160,7 +1160,7 @@ fn apply_layout(
                         "could not connect input {src} -> {pool_name}: {}",
                         describe_err(e)
                     );
-                    eprintln!("[simplooper] {msg}");
+                    eprintln!("[slooper] {msg}");
                     let _ = tx.try_send(Evt::Error(msg));
                 }
             }
@@ -1230,7 +1230,7 @@ fn apply_layout(
         }
     }
 
-    eprintln!("[simplooper] applied {applied_in} input(s), {applied_out} output(s)");
+    eprintln!("[slooper] applied {applied_in} input(s), {applied_out} output(s)");
     let _ = tx.send(Evt::Applied { ins: applied_in, outs: applied_out });
 }
 
@@ -1247,7 +1247,7 @@ fn send_ports_try(client: &Client, tx: &SyncSender<Evt>) {
     let _ = tx.try_send(Evt::Ports { ins, outs });
 }
 
-/// Re-derive which remote MIDI source ports feed `simplooper:midi_in` and
+/// Re-derive which remote MIDI source ports feed `slooper:midi_in` and
 /// make the actual connections. Devices often get a brand-new port name on
 /// every connect (and may use any channel), so a single manually-made link
 /// is not enough: we wire *every* remote MIDI source port into our input,
@@ -1283,11 +1283,11 @@ fn rescan_midi_sources(client: &Client, tx: &SyncSender<Evt>, known: &mut Vec<St
     // PipeWire-JACK "freshly activated" delay for ports that just appeared.
     for name in found.iter() {
         if let Err(e) = connect_retry(client, name, &dst) {
-            eprintln!("[simplooper] MIDI link {name} → {dst}: {e}");
+            eprintln!("[slooper] MIDI link {name} → {dst}: {e}");
         }
     }
     *known = found.clone();
-    eprintln!("[simplooper] MIDI sources: {}", if known.is_empty() { "none".into() } else { known.join(", ") });
+    eprintln!("[slooper] MIDI sources: {}", if known.is_empty() { "none".into() } else { known.join(", ") });
     let _ = tx.try_send(Evt::MidiSources(known.clone()));
     true
 }
@@ -2219,7 +2219,7 @@ mod tests {
         if !crate::fx::rustc_available() {
             return; // environments without a compiler skip the loader
         }
-        let dir = std::env::temp_dir().join(format!("simplooper-fxrender-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("slooper-fxrender-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(crate::fx::TEMPLATE_FILE), crate::fx::TEMPLATE_SRC).unwrap();
