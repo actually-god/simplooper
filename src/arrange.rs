@@ -23,10 +23,44 @@ use crate::quantize::round_up_to;
 
 /// A placed instance of an asset: start position in timeline samples. The
 /// asset id indexes the engine/GUI asset table.
+///
+/// Trimming is non-destructive: `cut` samples are skipped from the start of
+/// the source, and `play_len` (when set) caps how much plays — the asset
+/// itself is never touched, so either edge can be re-extended at any time.
+/// Extending `play_len` past the source data plays silence beyond it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Clip {
     pub asset: u32,
     pub pos: u64,
+    /// Source samples skipped at the start (left trim).
+    pub cut: u64,
+    /// Timeline length to play; `None` = as much of the source as remains
+    /// after `cut`. Values past the source pad with silence.
+    pub play_len: Option<u64>,
+}
+
+impl Clip {
+    /// New untrimmed clip.
+    pub fn new(asset: u32, pos: u64) -> Self {
+        Clip { asset, pos, cut: 0, play_len: None }
+    }
+    /// Samples of playable source left after `cut`.
+    pub fn avail(&self, alen: u64) -> u64 {
+        alen.saturating_sub(self.cut)
+    }
+    /// Timeline length of this clip (silence tail included when `play_len`
+    /// exceeds the source).
+    pub fn span(&self, alen: u64) -> u64 {
+        self.play_len.unwrap_or_else(|| self.avail(alen)).max(1)
+    }
+    /// End on the timeline.
+    pub fn end(&self, alen: u64) -> u64 {
+        self.pos.saturating_add(self.span(alen))
+    }
+    /// Timeline sample where the SOURCE data ends (silence beyond this).
+    pub fn data_end(&self, alen: u64) -> u64 {
+        self.pos.saturating_add(self.avail(alen))
+    }
 }
 
 /// One lane: a horizontal strip of clips. Lane 0 is the track itself; lanes
@@ -106,13 +140,13 @@ impl Arrangement {
         self.tracks[t].remove_lane(k)
     }
 
-    /// Highest clip end across every track (`pos + asset length`).
+    /// Highest clip end across every track (`pos + clip span`).
     pub fn max_end(&self, alen: &dyn Fn(u32) -> u64) -> u64 {
         self.tracks
             .iter()
             .flat_map(|t| t.lanes.iter())
             .flat_map(|l| l.clips.iter())
-            .map(|c| c.pos.saturating_add(alen(c.asset)))
+            .map(|c| c.end(alen(c.asset)))
             .max()
             .unwrap_or(0)
     }
@@ -135,12 +169,14 @@ impl Arrangement {
         }
     }
 
-    /// Place a freshly recorded take: lane 0 first; if the new clip would land
-    /// on top of existing content there, the first child lane free at that
-    /// span is used, and if every child overlaps, a new child lane is created.
-    /// Returns the lane the clip ended up in.
-    pub fn place_auto(&mut self, t: usize, asset: u32, len: u64, pos: u64) -> usize {
+    /// Place a freshly recorded/derived take: lane 0 first; if the new clip
+    /// would land on top of existing content there, the first child lane
+    /// free at that span is used, and if every child overlaps, a new child
+    /// lane is created. `len` is the clip's timeline span (asset length,
+    /// or trim-adjusted). Returns the lane the clip ended up in.
+    pub fn place_auto(&mut self, t: usize, cl: Clip, len: u64) -> usize {
         let tr = &mut self.tracks[t];
+        let pos = cl.pos;
         let pick = if !tr.lanes[0].occupied(pos, len) {
             0
         } else {
@@ -149,7 +185,7 @@ impl Arrangement {
                 None => tr.add_lane(),
             }
         };
-        tr.lanes[pick].clips.push(Clip { asset, pos });
+        tr.lanes[pick].clips.push(cl);
         pick
     }
 
@@ -170,6 +206,21 @@ impl Arrangement {
         {
             cl.pos = pos;
         }
+    }
+
+    /// Move clip `(t, from, c)` to the end of lane `to` of the same track
+    /// (vertical drag between a track's lanes). Returns its new index.
+    pub fn move_clip_lane(&mut self, t: usize, from: usize, to: usize, c: usize) -> Option<usize> {
+        if from == to {
+            return Some(c);
+        }
+        let cl = self.remove_clip(t, from, c)?;
+        let tr = self.tracks.get_mut(t)?;
+        while tr.lanes.len() <= to {
+            tr.add_lane();
+        }
+        tr.lanes[to].clips.push(cl);
+        Some(tr.lanes[to].clips.len() - 1)
     }
 
     /// Every `(track, lane, clip)` index placing this asset.
@@ -228,14 +279,14 @@ mod tests {
     fn place_auto_prefers_base_then_children_then_new() {
         let mut a = Arrangement::new();
         // Empty track -> lane 0.
-        assert_eq!(a.place_auto(3, 0, 1000, 5_000), 0);
+        assert_eq!(a.place_auto(3, Clip::new(0, 5_000), 1000), 0);
         // Overlap on lane 0 -> first child lane.
-        assert_eq!(a.place_auto(3, 1, 1000, 5_500), 1);
+        assert_eq!(a.place_auto(3, Clip::new(1, 5_500), 1000), 1);
         // Overlap on lanes 0 and 1 -> a new child is created.
-        assert_eq!(a.place_auto(3, 2, 1000, 5_200), 2);
+        assert_eq!(a.place_auto(3, Clip::new(2, 5_200), 1000), 2);
         assert_eq!(a.tracks[3].lanes.len(), 3);
         // A span clear of everything goes back to lane 0.
-        assert_eq!(a.place_auto(3, 3, 1000, 20_000), 0);
+        assert_eq!(a.place_auto(3, Clip::new(3, 20_000), 1000), 0);
         // Child lanes stack additively, never replace: every placement lives.
         let total: usize = a.tracks[3].lanes.iter().map(|l| l.clips.len()).sum();
         assert_eq!(total, 4);
@@ -244,18 +295,18 @@ mod tests {
     #[test]
     fn occupied_boundary_touch_is_not_overlap() {
         let mut a = Arrangement::new();
-        a.place_auto(0, 0, 1000, 0);
+        a.place_auto(0, Clip::new(0, 0), 1000);
         // Clip at exactly `len` after the first touches but does not overlap.
-        assert_eq!(a.place_auto(0, 1, 1000, 1000), 0);
+        assert_eq!(a.place_auto(0, Clip::new(1, 1000), 1000), 0);
         // One sample early forces a child lane.
-        assert_eq!(a.place_auto(0, 2, 1000, 999), 1);
+        assert_eq!(a.place_auto(0, Clip::new(2, 999), 1000), 1);
     }
 
     #[test]
     fn lane_removal_keeps_base() {
         let mut a = Arrangement::new();
-        a.place_auto(1, 0, 1000, 0); // empty track: lands on lane 0...
-        a.place_auto(1, 0, 1000, 500); // ...the overlapping take opens lane 1
+        a.place_auto(1, Clip::new(0, 0), 1000); // empty track: lands on lane 0...
+        a.place_auto(1, Clip::new(0, 500), 1000); // ...the overlapping take opens lane 1
         assert_eq!(a.tracks[1].lanes.len(), 2);
         assert!(!a.remove_lane(1, 0), "lane 0 can never be removed");
         assert!(a.remove_lane(1, 1));
@@ -269,11 +320,11 @@ mod tests {
         // Empty project: one bar minimum.
         assert_eq!(a.total_len(&alen, 4_800), 4_800);
         // Clip ending off the grid rounds up to the next bar.
-        a.insert(2, 0, Clip { asset: 7, pos: 4_900 });
+        a.insert(2, 0, Clip::new(7, 4_900));
         assert_eq!(a.max_end(&alen), 5_900);
         assert_eq!(a.total_len(&alen, 4_800), 9_600);
         // Clips-of / remove-asset round trip.
-        a.place_auto(2, 7, 1000, 0); // same asset, overlap -> child lane
+        a.place_auto(2, Clip::new(7, 0), 1000); // same asset, overlap -> child lane
         assert_eq!(a.clips_of(7).len(), 2);
         assert_eq!(a.remove_asset(7), 2);
         assert!(a.is_empty());
@@ -283,8 +334,8 @@ mod tests {
     #[test]
     fn clear_track_drops_children() {
         let mut a = Arrangement::new();
-        a.place_auto(4, 0, 1000, 0);
-        a.place_auto(4, 1, 1000, 0); // child
+        a.place_auto(4, Clip::new(0, 0), 1000);
+        a.place_auto(4, Clip::new(1, 0), 1000); // child
         a.clear_track(4);
         assert_eq!(a.tracks[4].lanes.len(), 1);
         assert!(a.tracks[4].lanes[0].clips.is_empty());
@@ -293,9 +344,9 @@ mod tests {
     #[test]
     fn remove_clip_targets_one_placement_only() {
         let mut a = Arrangement::default();
-        a.insert(2, 0, Clip { asset: 7, pos: 0 });
-        a.insert(2, 0, Clip { asset: 8, pos: 48_000 });
-        a.insert(2, 1, Clip { asset: 9, pos: 0 });
+        a.insert(2, 0, Clip::new(7, 0));
+        a.insert(2, 0, Clip::new(8, 48_000));
+        a.insert(2, 1, Clip::new(9, 0));
         let gone = a.remove_clip(2, 0, 0).expect("clip at index 0");
         assert_eq!(gone.asset, 7);
         // The other lane is untouched, and the sibling clip shifts to 0.

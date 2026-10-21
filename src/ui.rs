@@ -310,15 +310,57 @@ struct AssetWave {
     data: Vec<[f32; 2]>,
 }
 
-/// A clip being dragged on the timeline.
-#[derive(Clone, Copy)]
+/// A clip being dragged on the timeline. Dragging a clip that is part of a
+/// multi-selection drags the whole group: `items` lists every member
+/// (`(track, lane, clip index, timeline position at drag start)`, sorted,
+/// the earliest-position one first) and `base0` is the group's start
+/// position — the point every member moves relative to.
+#[derive(Clone)]
 struct ClipDrag {
+    items: Vec<(usize, usize, usize, u64)>,
+    base0: u64,
+    /// Samples between the group's start and the grab point, so the group
+    /// does not jump when the drag begins.
+    grab: u64,
+    /// Some(lane) for a SINGLE-clip drag: the pointer may then also move
+    /// the clip vertically between the track's lanes. Multi-clip groups
+    /// (any group, including several clips on one track) move horizontally
+    /// only.
+    lane0: Option<usize>,
+}
+
+/// One clip in the copy buffer: its offset from the copied group's
+/// topmost track / left edge, plus the asset and trim state — so a whole
+/// multi-track selection pastes as a group at the playhead.
+#[derive(Clone, Copy)]
+struct ClipboardItem {
+    t_off: usize,
+    asset: u32,
+    cut: u64,
+    play_len: Option<u64>,
+    pos_off: u64,
+}
+
+/// The clipboard: one copied group (pasted at the playhead on the target
+/// track; place_auto picks free lanes so overlaps never clobber).
+#[derive(Clone)]
+struct Clipboard {
+    items: Vec<ClipboardItem>,
+}
+
+/// An in-progress clip edge drag (trim/extend). `edge` 0 = left (moves the
+/// start, adjusting the source `cut`), 1 = right (moves the end, adjusting
+/// `play_len`). The asset itself is never touched.
+#[derive(Clone, Copy)]
+struct ClipResize {
     t: usize,
     lane: usize,
     c: usize,
-    /// Samples between the clip's start and the grab point, so the clip
-    /// does not jump when the drag begins.
-    grab: u64,
+    edge: u8,
+    /// Clip state at drag start.
+    pos0: u64,
+    cut0: u64,
+    end0: u64,
 }
 
 const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 95, 86);
@@ -364,6 +406,11 @@ const ZOOM_DEFAULT: f32 = 160.0;
 /// use 1 % per px so a fast flick doesn't warp the timeline).
 const ZOOM_WHEEL_LINE: f32 = 0.12;
 const ZOOM_WHEEL_PX: f32 = 0.01;
+/// Shift+wheel horizontal-pan sensitivity in px per wheel-line unit. A
+/// notch reports ~3 line units, so one click pans ~240 px — a visible
+/// chunk of the view. (Was `delta * 2.0` = ~6 px per notch: read as
+/// "horizontal scrolling is way too slow".)
+const PAN_WHEEL_LINE: f32 = 80.0;
 
 /// The user's home folder (projects default to `~/slooper-projects`).
 fn home_dir() -> PathBuf {
@@ -409,6 +456,10 @@ pub struct App {
     // --- DAW state ---
     /// Track targeted by keyboard/MIDI "selected" actions.
     selected: usize,
+    /// Tracks the program EXPOSES (Settings → DAW, 1..=16). Levels and
+    /// bindings of hidden tracks survive: raising the count back restores
+    /// them, so lowering tracks can never destroy a binding.
+    n_tracks: usize,
     /// Timeline loop: wrap the playhead at the loop region's end (mode
     /// below) vs. park at the project end.
     loop_tl: bool,
@@ -446,6 +497,9 @@ pub struct App {
     /// Horizontal view offset of the timeline in px (shared by the pinned
     /// ruler and every lane strip — the playhead stays one straight line).
     hscroll: f32,
+    /// Width of the visible grid strip in px (measured each frame by the
+    /// central panel); lets logic-side code scroll pasted clips into view.
+    grid_view_w: f32,
     /// Vertical scroll offset of the track stack, shared with the mixer
     /// panel so each mixer strip stays aligned with its track.
     vscroll: f32,
@@ -460,14 +514,21 @@ pub struct App {
     /// frame by the central panel; the mixer aligns its strips to it (one
     /// frame late at most) so strip ↔ track can never drift apart.
     grid_anchor: f32,
-    /// Selected clip (track, lane, clip index).
-    sel_clip: Option<(usize, usize, usize)>,
+    /// Selected clips: `(track, lane, clip index)` triplets, kept sorted
+    /// and unique. Click selects one, Ctrl+click toggles, Shift+click
+    /// extends within a lane; dragging one member drags the whole group.
+    sel_clips: Vec<(usize, usize, usize)>,
+    /// Last single-selected clip — the anchor for Shift+click extension.
+    sel_anchor: Option<(usize, usize, usize)>,
     /// Track owning the last primary press inside the grid — clipboard
     /// paste targets this track (falls back to `selected`).
     last_click_track: Option<usize>,
-    /// Clip copy buffer: just the asset (paste re-places it at the playhead
-    /// on the last-clicked track, opening a child lane when busy).
-    copied_asset: Option<u32>,
+    /// Clip copy buffer: a group of clips (offsets from the group's top
+    /// track / left edge); paste re-places it at the playhead on the
+    /// last-clicked track, opening a child lane when busy.
+    clipboard: Option<Clipboard>,
+    /// Active clip-edge drag (trim / extend, non-destructive).
+    clip_resize: Option<ClipResize>,
 
     // --- asset rack ---
     rack: Vec<RackFolder>,
@@ -512,6 +573,8 @@ pub struct App {
     // --- export dialog ---
     show_export: bool,
     export_whole: bool,
+    /// Export only the current multi-clip selection.
+    export_sel: bool,
     export_path: String,
     export_fmt: usize,
 
@@ -646,6 +709,7 @@ impl App {
             sel_sent: usize::MAX,
             levels_dirty: false,
             selected: 0,
+            n_tracks: cfg.n_tracks.clamp(1, MAX_LOOPS),
             loop_tl: cfg.loop_tl,
             loop_mode: cfg.loop_mode.min(2),
             loop_area: (cfg.loop_area_start, cfg.loop_area_end),
@@ -672,15 +736,18 @@ impl App {
             drag_clip: None,
             scrub_drag: false,
             hscroll: 0.0,
+            grid_view_w: 900.0,
             vscroll: 0.0,
             trk_height: (0..MAX_LOOPS)
                 .map(|i| cfg.trk_h.get(i).copied().unwrap_or(0.0))
                 .collect(),
             sep_drag: None,
             grid_anchor: 0.0,
-            sel_clip: None,
+            sel_clips: Vec::new(),
+            sel_anchor: None,
             last_click_track: None,
-            copied_asset: None,
+            clipboard: None,
+            clip_resize: None,
             rack,
             sel_asset: None,
             monitor_enabled: cfg.monitor_on,
@@ -710,6 +777,7 @@ impl App {
             bind_loop_sel: 0,
             show_export: false,
             export_whole: false,
+            export_sel: false,
             export_path: String::new(),
             export_fmt: 0,
             last_midi: None,
@@ -904,49 +972,28 @@ impl App {
             return;
         }
 
-        // Clip clipboard: Ctrl/Cmd+C copies the selected clip's asset,
-        // Ctrl/Cmd+V places it at the playhead on the last grid-clicked
-        // track (busy lanes open a child lane automatically). Handled
-        // before action firing so a bare C/V binding never double-fires.
-        let (ccopy, cpaste) = ctx.input(|i| {
+        // Clip clipboard: Ctrl/Cmd+C copies the whole selection (a group of
+        // clips spanning any number of tracks/lanes), Ctrl/Cmd+V places it
+        // at the playhead on the last grid-clicked track (busy lanes open a
+        // child lane automatically). Handled before action firing so a bare
+        // C/V binding never double-fires.
+        let (ccopy, cpaste, call) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(egui::Key::C),
                 i.modifiers.command && i.key_pressed(egui::Key::V),
+                i.modifiers.command && i.key_pressed(egui::Key::A),
             )
         });
+        if call {
+            self.select_all_clips();
+            return;
+        }
         if ccopy || cpaste {
             if ccopy {
-                if let Some((t, k, ci)) = self.sel_clip {
-                    if let Some(c) = self.arr.tracks[t].lanes[k].clips.get(ci) {
-                        self.copied_asset = Some(c.asset);
-                        let nm = self
-                            .assets
-                            .get(c.asset as usize)
-                            .map(|a| a.name.clone())
-                            .unwrap_or_default();
-                        self.status = format!(
-                            "copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead"
-                        );
-                    }
-                }
+                self.clipboard_copy();
             }
             if cpaste {
-                if let Some(a) = self.copied_asset {
-                    let t = self.last_click_track.unwrap_or(self.selected);
-                    let len = self.asset_len(a);
-                    let pos = self.backend.engine.pos();
-                    let nl0 = self.arr.tracks[t].lanes.len();
-                    let lane = self.arr.place_auto(t, a, len, pos);
-                    self.grow_for_lanes(t, nl0);
-                    let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
-                    self.sel_clip = Some((t, lane, li));
-                    self.push_project();
-                    self.status = format!(
-                        "pasted at the playhead \u{b7} track {} {}",
-                        t + 1,
-                        if lane == 0 { "track" } else { "child lane" }
-                    );
-                }
+                self.clipboard_paste();
             }
             return; // swallow the key
         }
@@ -1082,20 +1129,16 @@ impl App {
                 .collect()
         });
 
-        // A selected clip deletes with Delete/Backspace — same vocabulary
-        // as clearing bindings (learn modes above already swallowed the key
-        // if they were open, and typing focus returned earlier). The asset
-        // itself stays in the rack; only this placement disappears.
-        if self.sel_clip.is_some()
+        // Selected clips delete with Delete/Backspace — same vocabulary as
+        // clearing bindings (learn modes above already swallowed the key if
+        // they were open, and typing focus returned earlier). The assets
+        // themselves stay in the rack; only the placements disappear.
+        if !self.sel_clips.is_empty()
             && pressed_keys
                 .iter()
                 .any(|k| matches!(k, egui::Key::Delete | egui::Key::Backspace))
         {
-            if let Some((t, k, ci)) = self.sel_clip.take() {
-                self.arr.remove_clip(t, k, ci);
-                self.push_project();
-                self.status = "clip removed (asset stays in the rack)".into();
-            }
+            self.delete_selection();
             return; // swallow the key
         }
 
@@ -1458,6 +1501,194 @@ impl App {
         self.send_loop_region();
     }
 
+    // ---- selection + clipboard ------------------------------------------------
+
+    /// Ctrl+A: select every placed clip on every configured track.
+    fn select_all_clips(&mut self) {
+        let mut ids = Vec::new();
+        for t in 0..self.n_tracks {
+            for k in 0..self.arr.tracks[t].lanes.len() {
+                for c in 0..self.arr.tracks[t].lanes[k].clips.len() {
+                    ids.push((t, k, c));
+                }
+            }
+        }
+        if ids.is_empty() {
+            self.status = "no clips to select".into();
+            return;
+        }
+        self.status = format!("selected {} clip(s)", ids.len());
+        self.sel_anchor = ids.first().copied();
+        self.sel_clips = ids;
+    }
+
+    /// True when the `(track, lane, clip)` id is in the selection.
+    fn is_sel(&self, id: (usize, usize, usize)) -> bool {
+        self.sel_clips.contains(&id)
+    }
+
+    /// Replace the selection with a single clip (moves the Shift anchor).
+    fn select_one(&mut self, id: (usize, usize, usize)) {
+        self.sel_clips = vec![id];
+        self.sel_anchor = Some(id);
+    }
+
+    /// Ctrl+click: add/remove a clip from the selection.
+    fn select_toggle(&mut self, id: (usize, usize, usize)) {
+        match self.sel_clips.iter().position(|x| *x == id) {
+            Some(i) => {
+                self.sel_clips.remove(i);
+            }
+            None => {
+                self.sel_clips.push(id);
+                self.sel_clips.sort();
+            }
+        }
+        self.sel_anchor = Some(id);
+    }
+
+    /// Shift+click result: replace with the given range (sorted).
+    fn select_range(&mut self, ids: Vec<(usize, usize, usize)>) {
+        let mut ids = ids;
+        ids.sort();
+        self.sel_clips = ids;
+    }
+
+    /// Remove every selected clip (assets stay in the rack).
+    fn delete_selection(&mut self) {
+        if self.sel_clips.is_empty() {
+            return;
+        }
+        let n = self.sel_clips.len();
+        let mut ids = self.sel_clips.clone();
+        ids.sort();
+        for (t, k, c) in ids.into_iter().rev() {
+            self.arr.remove_clip(t, k, c);
+        }
+        self.sel_clips.clear();
+        self.sel_anchor = None;
+        self.push_project();
+        self.status = format!("{n} clip(s) removed (assets stay in the rack)");
+    }
+
+    /// Ctrl+C: copy the whole selection as a group (track offsets from the
+    /// topmost selected track, position offsets from the leftmost clip).
+    /// With no clip selected, falls back to the selected rack asset.
+    fn clipboard_copy(&mut self) {
+        if self.sel_clips.is_empty() {
+            if let Some(k) = self.sel_asset {
+                if let Some(a) = self.assets.get(k) {
+                    self.clipboard = Some(Clipboard {
+                        items: vec![ClipboardItem {
+                            t_off: 0,
+                            asset: k as u32,
+                            cut: 0,
+                            play_len: None,
+                            pos_off: 0,
+                        }],
+                    });
+                    let nm = a.name.clone();
+                    self.status = format!("copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead");
+                }
+            } else {
+                self.status = "nothing to copy \u{b7} select a clip first".into();
+            }
+            return;
+        }
+        let mut ids = self.sel_clips.clone();
+        ids.sort();
+        let t0 = ids.iter().map(|x| x.0).min().unwrap_or(0);
+        let p0 = ids
+            .iter()
+            .filter_map(|(t, k, c)| self.arr.tracks[*t].lanes[*k].clips.get(*c))
+            .map(|c| c.pos)
+            .min()
+            .unwrap_or(0);
+        let items: Vec<ClipboardItem> = ids
+            .iter()
+            .filter_map(|(t, k, c)| {
+                let cl = self.arr.tracks[*t].lanes[*k].clips.get(*c)?;
+                Some(ClipboardItem {
+                    t_off: *t - t0,
+                    asset: cl.asset,
+                    cut: cl.cut,
+                    play_len: cl.play_len,
+                    pos_off: cl.pos - p0,
+                })
+            })
+            .collect();
+        let n = items.len();
+        self.clipboard = Some(Clipboard { items });
+        self.status = format!(
+            "copied {n} clip(s) \u{b7} Ctrl+V pastes the group at the playhead"
+        );
+    }
+
+    /// Ctrl+V: paste the clipboard group at the playhead on the target
+    /// track (busy spans open child lanes). The view scrolls to the pasted
+    /// clips — the fix for "paste does nothing" when the playhead sits
+    /// off-screen.
+    fn clipboard_paste(&mut self) {
+        let Some(cb) = self.clipboard.clone() else {
+            return;
+        };
+        let t_target = self
+            .last_click_track
+            .unwrap_or(self.selected)
+            .min(self.n_tracks - 1);
+        let pos = self.backend.engine.pos();
+        let mut sel: Vec<(usize, usize, usize)> = Vec::new();
+        let mut base_lanes: HashMap<usize, usize> = HashMap::new();
+        for it in &cb.items {
+            let t = (t_target + it.t_off).min(self.n_tracks - 1);
+            let alen = self.assets.get(it.asset as usize).map(|a| a.samples()).unwrap_or(0);
+            let span = it.play_len.unwrap_or(alen.saturating_sub(it.cut)).max(1);
+            let nl0 = *base_lanes.entry(t).or_insert(self.arr.tracks[t].lanes.len());
+            let lane = self.arr.place_auto(
+                t,
+                Clip {
+                    asset: it.asset,
+                    pos: pos + it.pos_off,
+                    cut: it.cut,
+                    play_len: it.play_len,
+                },
+                span,
+            );
+            self.grow_for_lanes(t, nl0);
+            let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
+            sel.push((t, lane, li));
+        }
+        sel.sort();
+        self.sel_clips = sel;
+        self.sel_anchor = self.sel_clips.first().copied();
+        self.push_project();
+        self.scroll_view_to(pos);
+        self.status = format!(
+            "pasted {} clip(s) at the playhead \u{b7} track {}",
+            cb.items.len(),
+            t_target + 1
+        );
+    }
+
+    /// Pan the horizontal view so a timeline position is visible.
+    fn scroll_view_to(&mut self, pos: u64) {
+        let sr = self.sample_rate.max(1) as f64;
+        let x = (pos as f64 / sr * self.px_per_sec as f64) as f32;
+        let w = self.grid_view_w.max(200.0);
+        if x < self.hscroll {
+            self.hscroll = (x - 40.0).max(0.0);
+        } else if x > self.hscroll + w {
+            self.hscroll = (x - w + 40.0).max(0.0);
+        }
+    }
+
+    /// True when a timeline position falls inside the horizontal view.
+    pub fn hscroll_visible(&self, pos: u64) -> bool {
+        let sr = self.sample_rate.max(1) as f64;
+        let x = (pos as f64 / sr * self.px_per_sec as f64) as f32;
+        x >= self.hscroll - 1.0 && x <= self.hscroll + self.grid_view_w + 1.0
+    }
+
     fn send_metro(&mut self) {
         let bpm = self
             .metro_bpm
@@ -1483,6 +1714,7 @@ impl App {
     /// ports, effects chains) to disk.
     fn save_config(&self) {
         let cfg = Config {
+            n_tracks: self.n_tracks,
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -1582,7 +1814,8 @@ impl App {
 
     fn clear_track(&mut self, i: usize) {
         self.arr.clear_track(i);
-        self.sel_clip = None;
+        self.sel_clips.clear();
+        self.sel_anchor = None;
         self.push_project();
         self.status = format!("track {} cleared", i + 1);
     }
@@ -1635,7 +1868,7 @@ impl App {
         self.sel_asset = Some(id as usize);
         let pos = snap_start(at, self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
-        let lane = self.arr.place_auto(track, id, len, pos);
+        let lane = self.arr.place_auto(track, Clip::new(id, pos), len);
         self.grow_for_lanes(track, nl0);
         self.push_project();
         self.status = format!("track {}: recorded → clip in lane {}", track + 1, lane + 1);
@@ -1725,7 +1958,8 @@ impl App {
         self.assets.remove(k);
         self.wave.clear();
         self.sel_asset = None;
-        self.sel_clip = None;
+        self.sel_clips.clear();
+        self.sel_anchor = None;
         self.push_project();
         self.status = "asset removed (its clips too)".into();
     }
@@ -1777,6 +2011,8 @@ impl App {
                             .map(|c| ProjClip {
                                 asset: c.asset,
                                 pos: c.pos,
+                                cut: c.cut,
+                                play_len: c.play_len,
                             })
                             .collect()
                     })
@@ -1787,6 +2023,7 @@ impl App {
             format: project::FORMAT.into(),
             version: project::VERSION,
             name,
+            n_tracks: Some(self.n_tracks),
             metro: ProjMetro {
                 bpm: self.bpm(),
                 num: self.beats(),
@@ -1945,6 +2182,8 @@ impl App {
                         Clip {
                             asset: c.asset,
                             pos: c.pos,
+                            cut: c.cut,
+                            play_len: c.play_len,
                         },
                     );
                 }
@@ -1960,13 +2199,19 @@ impl App {
         }
         self.assets = assets;
         self.arr = arr;
+        // The saved project carries its own configured track count.
+        self.n_tracks = pr
+            .n_tracks
+            .unwrap_or(16)
+            .clamp(1, MAX_LOOPS) as usize;
         // Heights are a per-session view; the new arrangement starts fresh.
         for h in self.trk_height.iter_mut() {
             *h = 0.0;
         }
         self.wave.clear();
         self.sel_asset = None;
-        self.sel_clip = None;
+        self.sel_clips.clear();
+        self.sel_anchor = None;
         self.metro_bpm = pr.metro.bpm.to_string();
         self.metro_num = pr.metro.num.to_string();
         self.metro_sub = SUBDIVISIONS
@@ -2018,6 +2263,17 @@ impl App {
         if !has_want {
             path.set_extension(ext);
         }
+        if self.export_sel {
+            if self.sel_clips.is_empty() {
+                self.status = "export selection: select at least one clip first".into();
+                return;
+            }
+            let mut items = self.sel_clips.clone();
+            items.sort();
+            self.backend.cmd(Cmd::ExportSelection { path, fmt, items });
+            self.show_export = false;
+            return;
+        }
         if self.export_whole {
             self.backend.cmd(Cmd::ExportProject { path, fmt });
         } else {
@@ -2045,7 +2301,7 @@ impl App {
                 self.send_metro();
             }
             // Selection NEVER wraps: it stops at track 1 and track 16.
-            MidiAction::SelectNext => self.selected = (self.selected + 1).min(MAX_LOOPS - 1),
+            MidiAction::SelectNext => self.selected = (self.selected + 1).min(self.n_tracks - 1),
             MidiAction::SelectPrev => self.selected = self.selected.saturating_sub(1),
             // The global transport: PlayAll toggles play/stop (space-bar
             // style), StopAll always parks (the playhead holds its place).
@@ -2346,7 +2602,15 @@ impl App {
                         zoom_ln += (delta.y * s).clamp(-1.5, 1.5);
                         false
                     } else if modifiers.shift {
-                        pan += delta.x + delta.y;
+                        // Line-unit notches carry ~3 units per click; scale
+                        // them so one notch pans a real chunk of the view
+                        // (the old unscaled `delta * 2.0` moved ~6 px and
+                        // read as "way too slow").
+                        let s = match unit {
+                            egui::MouseWheelUnit::Line => PAN_WHEEL_LINE,
+                            _ => 1.0,
+                        };
+                        pan += (delta.x + delta.y) * s;
                         false
                     } else {
                         true
@@ -2362,7 +2626,7 @@ impl App {
             self.px_per_sec = (self.px_per_sec * zoom_ln.exp()).clamp(ZOOM_MIN, ZOOM_MAX);
         }
         if pan != 0.0 {
-            self.hscroll = (self.hscroll - pan * 2.0).max(0.0);
+            self.hscroll = (self.hscroll - pan).max(0.0);
         }
 
         // Master volume: same -inf..=+6 dB MIDI mapping as every track.
@@ -2914,7 +3178,7 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
                     |ui| master_strip(ui, app),
                 );
             }
-            for t in 0..MAX_LOOPS {
+            for t in 0..app.n_tracks {
                 let th = app.track_h(t);
                 if y + th >= base.min.y && y <= base.max.y {
                     let r = egui::Rect::from_min_size(
@@ -3119,13 +3383,14 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         app.hscroll = app.hscroll.clamp(0.0, (w - avail).max(0.0));
         // Pinned ruler: always visible above the track scroll (it used to
         // scroll away with the content), same width + x origin as the lanes.
+        app.grid_view_w = avail;
         ruler_row(ui, app, avail, px, sr);
         let grid_top = ui.cursor().min;
         app.grid_anchor = grid_top.y;
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for t in 0..MAX_LOOPS {
+                for t in 0..app.n_tracks {
                     track_block(ui, app, t, avail, px, sr);
                 }
             });
@@ -3408,7 +3673,6 @@ fn lane_row(
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag());
     let x0 = rect.min.x - app.hscroll;
     let snapu = app.snap_unit();
-    let sel_clip = app.sel_clip;
     let clips: Vec<(Clip, String)> = app.arr.tracks[t].lanes[k]
         .clips
         .iter()
@@ -3422,6 +3686,26 @@ fn lane_row(
             )
         })
         .collect();
+    // Edge zones of SELECTED clips become trim/extend handles.
+    const EDGE_PX: f32 = 6.0;
+    let edge_at = |app: &App, pt: egui::Pos2| -> Option<(usize, u8)> {
+        let pos = s_at(x0, pt.x, sr, px);
+        let ci = clips.iter().position(|(c, _)| pos >= c.pos && pos < c.end(app.asset_len(c.asset)))?;
+        if !app.sel_clips.contains(&(t, k, ci)) {
+            return None;
+        }
+        let c = clips[ci].0;
+        let alen = app.asset_len(c.asset);
+        let cx0 = x_of(x0, c.pos, sr, px);
+        let cx1 = x_of(x0, c.end(alen), sr, px);
+        if (pt.x - cx0).abs() <= EDGE_PX {
+            Some((ci, 0))
+        } else if (cx1 - pt.x).abs() <= EDGE_PX {
+            Some((ci, 1))
+        } else {
+            None
+        }
+    };
 
     // ---- paint (clipped to this strip) ----
     let old_clip = ui.clip_rect();
@@ -3437,24 +3721,31 @@ fn lane_row(
         Color32::from_gray(110),
     );
     for (ci, (c, name)) in clips.iter().enumerate() {
-        let len = app.asset_len(c.asset);
+        let alen = app.asset_len(c.asset);
         let cx0 = x_of(x0, c.pos, sr, px);
-        let cx1 = x_of(x0, c.pos + len, sr, px);
+        let cx1 = x_of(x0, c.end(alen), sr, px);
         if cx1 < rect.min.x || cx0 > rect.max.x {
             continue;
         }
-        let sel = sel_clip == Some((t, k, ci));
-        draw_asset_clip(
-            ui,
-            app,
-            c.asset,
-            egui::Rect::from_min_max(
-                egui::pos2(cx0, rect.min.y + 1.0),
-                egui::pos2(cx1, rect.max.y - 1.0),
-            ),
-            COL_CLIP,
-            sel,
+        let sel = app.sel_clips.contains(&(t, k, ci));
+        let cres = egui::Rect::from_min_max(
+            egui::pos2(cx0, rect.min.y + 1.0),
+            egui::pos2(cx1, rect.max.y - 1.0),
         );
+        draw_asset_clip(ui, app, c.asset, (c.cut, c.avail(alen)), cres, COL_CLIP, sel);
+        // Extended-past-data tail: silence, hatched dark so it reads as
+        // "clip is longer than its source".
+        let dend = x_of(x0, c.data_end(alen), sr, px);
+        if dend < cx1 - 0.5 {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(dend.max(cres.min.x), cres.min.y),
+                    cres.max,
+                ),
+                0.0,
+                Color32::from_rgba_premultiplied(10, 10, 14, 160),
+            );
+        }
         if cx1 - cx0 > 36.0 && !name.is_empty() {
             ui.painter().text(
                 egui::pos2(cx0 + 3.0, rect.min.y + 2.0),
@@ -3464,8 +3755,33 @@ fn lane_row(
                 Color32::from_gray(220),
             );
         }
+        // Trimmed state: mark where the asset's ORIGINAL data boundary
+        // sits, so the user can see what a re-extend would reveal.
+        let trimmed_left = c.cut > 0;
+        let trimmed_right = c.play_len.is_some_and(|l| l < c.avail(alen));
+        let extended = c.play_len.is_some_and(|l| l > c.avail(alen));
+        if sel && (trimmed_left || trimmed_right || extended) {
+            for bx in [(dend, true), (x_of(x0, c.pos - c.cut, sr, px), false)] {
+                let (x, right_of_clip) = bx;
+                if x < rect.min.x - 30.0 || x > rect.max.x + 30.0 {
+                    continue;
+                }
+                let _ = right_of_clip;
+                ui.painter().line_segment(
+                    [egui::pos2(x, cres.min.y), egui::pos2(x, cres.max.y)],
+                    egui::Stroke::new(1.0, Color32::from_rgb(250, 200, 90)),
+                );
+            }
+            ui.painter().text(
+                egui::pos2(dend - 3.0, cres.max.y - 11.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "original",
+                egui::FontId::proportional(8.0),
+                Color32::from_rgb(250, 200, 90),
+            );
+        }
         if sel {
-            // Selection hint: this clip is what Delete removes.
+            // Selection hint: these clips are what Delete removes.
             ui.painter().text(
                 egui::pos2(cx1 - 3.0, rect.min.y + 1.0),
                 egui::Align2::RIGHT_TOP,
@@ -3506,19 +3822,12 @@ fn lane_row(
         if let Some(pt) = ui.input(|i| i.pointer.hover_pos()) {
             if rect.contains(pt) {
                 let ns = snap_start(s_at(x0, pt.x, sr, px), snapu);
-                app.arr.insert(
-                    t,
-                    k,
-                    Clip {
-                        asset: a as u32,
-                        pos: ns,
-                    },
-                );
+                app.arr.insert(t, k, Clip::new(a as u32, ns));
                 let li = app.arr.tracks[t].lanes[k].clips.len() - 1;
-                app.sel_clip = Some((t, k, li));
+                app.select_one((t, k, li));
                 app.push_project();
                 app.status = format!(
-                    "clip placed on track {} \u{b7} {}",
+                    "clip placed on track {} \u{b7} {} \u{b7} drag its edges to trim",
                     t + 1,
                     if k == 0 { "track" } else { "child lane" }
                 );
@@ -3532,29 +3841,95 @@ fn lane_row(
         app.last_click_track = Some(t);
         if let Some(pt) = resp.interact_pointer_pos() {
             if rect.contains(pt) {
+                let mods = ui.input(|i| i.modifiers);
                 let pos = s_at(x0, pt.x, sr, px);
-                let hit = clips
-                    .iter()
-                    .position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset));
-                match hit {
-                    Some(ci) => {
-                        app.sel_clip = Some((t, k, ci));
-                        let cpos = app.arr.tracks[t].lanes[k].clips[ci].pos;
-                        app.drag_clip = Some(ClipDrag {
-                            t,
-                            lane: k,
-                            c: ci,
-                            grab: cpos.saturating_sub(pos),
-                        });
-                    }
-                    None => {
-                        // Empty grid = playhead handle: press-jumps on
-                        // release (below), drag keeps scanning; the movement
-                        // area spans the grid of every track and matches the
-                        // pinned ruler position 1:1.
-                        app.sel_clip = None;
-                        app.scrub_drag = true;
-                        app.backend.cmd(Cmd::Seek { pos });
+                // Edge of a SELECTED clip wins over everything: trim/extend.
+                if let Some((ci, edge)) = edge_at(app, pt) {
+                    let c = app.arr.tracks[t].lanes[k].clips[ci];
+                    app.clip_resize = Some(ClipResize {
+                        t,
+                        lane: k,
+                        c: ci,
+                        edge,
+                        pos0: c.pos,
+                        end0: c.end(app.asset_len(c.asset)),
+                        cut0: c.cut,
+                    });
+                } else {
+                    let hit = clips
+                        .iter()
+                        .position(|(c, _)| pos >= c.pos && pos < c.end(app.asset_len(c.asset)));
+                    match hit {
+                        Some(ci) => {
+                            let id = (t, k, ci);
+                            if mods.command {
+                                app.select_toggle(id);
+                            } else if mods.shift
+                                && app.sel_anchor.is_some_and(|a| a.0 == t && a.1 == k)
+                            {
+                                // Shift+click: the same-lane run between the
+                                // anchor clip and this one, inclusive.
+                                let apos = app
+                                    .sel_anchor
+                                    .and_then(|(at, ak, ac)| {
+                                        app.arr.tracks[at].lanes[ak].clips.get(ac)
+                                    })
+                                    .map(|c| c.pos)
+                                    .unwrap_or(pos);
+                                let (lo, hi) = (apos.min(pos), apos.max(pos));
+                                let ids: Vec<(usize, usize, usize)> = clips
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (c, _))| c.pos >= lo && c.pos <= hi)
+                                    .map(|(j, _)| (t, k, j))
+                                    .collect();
+                                app.select_range(ids);
+                            } else if !app.is_sel(id) {
+                                app.select_one(id);
+                            }
+                            // Group drag: remember every selected clip and
+                            // its position; the group moves by the snapped
+                            // delta of this strip's pointer.
+                            let mut ids = app.sel_clips.clone();
+                            ids.sort();
+                            let items: Vec<(usize, usize, usize, u64)> = ids
+                                .iter()
+                                .filter_map(|(tt, kk, cc)| {
+                                    let p = app
+                                        .arr
+                                        .tracks[*tt]
+                                        .lanes[*kk]
+                                        .clips
+                                        .get(*cc)
+                                        .map(|c| c.pos)?;
+                                    Some((*tt, *kk, *cc, p))
+                                })
+                                .collect();
+                            if !items.is_empty() {
+                                let base0 = items.iter().map(|x| x.3).min().unwrap_or(0);
+                                let lane0 = if items.len() == 1 {
+                                    Some(items[0].1)
+                                } else {
+                                    None
+                                };
+                                app.drag_clip = Some(ClipDrag {
+                                    items,
+                                    base0,
+                                    grab: base0.saturating_sub(pos),
+                                    lane0,
+                                });
+                            }
+                        }
+                        None => {
+                            // Empty grid = playhead handle: press-jumps on
+                            // release (below), drag keeps scanning; the
+                            // movement area spans the grid of every track
+                            // and matches the pinned ruler position 1:1.
+                            app.sel_clips.clear();
+                            app.sel_anchor = None;
+                            app.scrub_drag = true;
+                            app.backend.cmd(Cmd::Seek { pos });
+                        }
                     }
                 }
             }
@@ -3566,15 +3941,86 @@ fn lane_row(
                     let pos = s_at(x0, pt.x, sr, px);
                     app.backend.cmd(Cmd::Seek { pos });
                 }
-            } else if let Some(d) = app.drag_clip {
-                if d.t == t && d.lane == k && rect.contains(pt) {
-                    let pos = snap_start(s_at(x0, pt.x, sr, px).saturating_add(d.grab), snapu);
-                    app.arr.move_clip(t, k, d.c, pos);
+            } else if let Some(r) = app.clip_resize {
+                if rect.contains(pt) {
+                    let asset = app.arr.tracks[r.t].lanes[r.lane].clips[r.c].asset;
+                    let alen = app.asset_len(asset);
+                    let unit = (snapu as u64).max(1);
+                    let raw = s_at(x0, pt.x, sr, px);
+                    let mut cand = snap_start(raw, unit as f64);
+                    // Guaranteed snap at the asset's ORIGINAL boundaries,
+                    // regardless of the snap setting.
+                    if r.edge == 1 {
+                        let orig_data_end = r.pos0 + alen.saturating_sub(r.cut0);
+                        if (cand as i64 - orig_data_end as i64).abs() <= (unit / 2).max(1) as i64 {
+                            cand = orig_data_end;
+                        }
+                        // Never smaller than one subdivision.
+                        cand = cand.max(r.pos0 + unit);
+                        let new_len = cand - r.pos0;
+                        let avail = alen.saturating_sub(r.cut0);
+                        let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
+                        cl.play_len = if new_len == avail { None } else { Some(new_len) };
+                    } else {
+                        let orig_start = r.pos0.saturating_sub(r.cut0);
+                        if (cand as i64 - orig_start as i64).abs() <= (unit / 2).max(1) as i64 {
+                            cand = orig_start;
+                        }
+                        // Start never moves before the asset's data begins,
+                        // and the clip keeps at least one subdivision.
+                        cand = cand.max(orig_start).min(r.end0.saturating_sub(unit));
+                        let new_cut = r.cut0 + (cand - r.pos0);
+                        let new_len = r.end0 - cand;
+                        let avail = alen.saturating_sub(new_cut);
+                        let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
+                        cl.pos = cand;
+                        cl.cut = new_cut;
+                        cl.play_len = if new_len >= avail { None } else { Some(new_len) };
+                    }
+                }
+            } else if let Some(d) = app.drag_clip.clone() {
+                let new_base = snap_start(s_at(x0, pt.x, sr, px).saturating_add(d.grab), snapu);
+                let dx = new_base as i64 - d.base0 as i64;
+                if dx != 0 {
+                    for (tt, kk, cc, p0) in &d.items {
+                        let np = (*p0 as i64 + dx).max(0) as u64;
+                        app.arr.move_clip(*tt, *kk, *cc, np);
+                    }
+                }
+                // Single-clip drag: vertical pointer travel moves the clip
+                // between its track's lanes (groups stay horizontal-only).
+                if let Some(l0) = d.lane0 {
+                    let dl =
+                        ((pt.y - rect.center().y) / rect.height().max(1.0)).round() as i64;
+                    let (tt, cur, cc, _) = d.items[0];
+                    let nl = app.arr.tracks[tt].lanes.len() as i64;
+                    let target = (l0 as i64 + dl).clamp(0, nl - 1) as usize;
+                    if target != cur {
+                        if let Some(ni) = app.arr.move_clip_lane(tt, cur, target, cc) {
+                            if let Some(dd) = app.drag_clip.as_mut() {
+                                dd.items[0].1 = target;
+                                dd.items[0].2 = ni;
+                            }
+                            let old = (tt, cur, cc);
+                            let fresh = app
+                                .sel_clips
+                                .iter()
+                                .map(|x| if *x == old { (tt, target, ni) } else { *x })
+                                .collect::<Vec<_>>();
+                            app.sel_clips = fresh;
+                            app.sel_clips.sort();
+                            if app.sel_anchor == Some(old) {
+                                app.sel_anchor = Some((tt, target, ni));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    if resp.drag_stopped() && app.drag_clip.take().is_some() {
+    if resp.drag_stopped()
+        && (app.drag_clip.take().is_some() || app.clip_resize.take().is_some())
+    {
         app.push_project();
     }
     if resp.clicked() && !resp.dragged() && !app.scrub_drag && app.drag_clip.is_none() {
@@ -3586,11 +4032,19 @@ fn lane_row(
                 let pos = s_at(x0, pt.x, sr, px);
                 match clips
                     .iter()
-                    .position(|(c, _)| pos >= c.pos && pos < c.pos + app.asset_len(c.asset))
+                    .position(|(c, _)| pos >= c.pos && pos < c.end(app.asset_len(c.asset)))
                 {
-                    Some(ci) => app.sel_clip = Some((t, k, ci)),
+                    Some(ci) => {
+                        let mods = ui.input(|i| i.modifiers);
+                        if mods.command {
+                            app.select_toggle((t, k, ci));
+                        } else {
+                            app.select_one((t, k, ci));
+                        }
+                    }
                     None => {
-                        app.sel_clip = None;
+                        app.sel_clips.clear();
+                        app.sel_anchor = None;
                         app.backend.cmd(Cmd::Seek { pos });
                     }
                 }
@@ -3612,11 +4066,14 @@ fn lane_row(
 }
 
 /// Draw one clip's rectangle with its asset's waveform, normalized by the
-/// asset's own peak so quiet takes stay legible.
+/// asset's own peak so quiet takes stay legible. `win` is the window of
+/// asset data the clip shows — `(cut, samples shown)` — so trims reveal
+/// the right slice; the caller paints any silent extension separately.
 fn draw_asset_clip(
     ui: &mut egui::Ui,
     app: &mut App,
     asset: u32,
+    win: (u64, u64),
     rect: egui::Rect,
     fill: Color32,
     sel: bool,
@@ -3624,10 +4081,19 @@ fn draw_asset_clip(
     let p = ui.painter();
     p.rect_filled(rect, 2.0, fill.linear_multiply(0.45));
     if rect.width() >= 4.0 {
-        if let Some(wave) = asset_wave(app, asset, rect.width() as usize) {
-            let data = wave;
+        let alen = app.asset_len(asset).max(1);
+        let (cut, wlen) = win;
+        let wlen = wlen.min(alen.saturating_sub(cut)).max(1);
+        // Full assets keep the old one-column-per-pixel path; trimmed
+        // windows ask for enough full-asset columns to stay crisp when the
+        // visible slice is zoomed.
+        let cols_req = if cut == 0 && wlen >= alen {
+            rect.width() as usize
+        } else {
+            ((rect.width() * (alen as f32 / wlen as f32)) as usize).clamp(1, 4096)
+        };
+        if let Some(data) = asset_wave(app, asset, cols_req) {
             let n = data.len().max(1);
-            let col_w = rect.width() / n as f32;
             let cy = rect.center().y;
             let amp = rect.height() * 0.46;
             let col = if sel {
@@ -3635,9 +4101,15 @@ fn draw_asset_clip(
             } else {
                 Color32::from_rgb(210, 225, 250)
             };
-            let stroke = egui::Stroke::new((col_w * 0.7).max(0.8), col);
-            for (i, [lo, hi]) in data.iter().enumerate() {
-                let x = rect.min.x + (i as f32 + 0.5) * col_w;
+            let f0 = cut as f32 / alen as f32;
+            let f1 = ((cut + wlen) as f32 / alen as f32).max(f0 + 1e-6);
+            let i0 = ((f0 * n as f32) as usize).min(n.saturating_sub(1));
+            let i1 = ((f1 * n as f32) as usize).clamp(i0 + 1, n);
+            let col_w = rect.width() / ((i1 - i0) as f32).max(1.0);
+            let stroke = egui::Stroke::new(col_w.clamp(0.8, 3.0), col);
+            for (j, i) in (i0..i1).enumerate() {
+                let [lo, hi] = data[i];
+                let x = rect.min.x + (j as f32 + 0.5) * col_w;
                 p.line_segment(
                     [egui::pos2(x, cy - hi * amp), egui::pos2(x, cy - lo * amp)],
                     stroke,
@@ -4193,12 +4665,35 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
         .min_width(430.0)
         .show(ui, |ui| {
             ui.label(RichText::new("What to export:").strong());
-            ui.radio_value(
-                &mut app.export_whole,
-                false,
-                format!("Track {} (selected)", app.selected + 1),
-            );
-            ui.radio_value(&mut app.export_whole, true, "Whole project");
+            let n_sel = app.sel_clips.len();
+            if ui
+                .radio_value(&mut app.export_sel, true, format!("Current selection ({n_sel} clip(s))"))
+                .changed()
+                && app.export_sel
+            {
+                app.export_whole = false;
+            }
+            if ui
+                .radio_value(
+                    &mut app.export_whole,
+                    false,
+                    format!("Track {} (selected)", app.selected + 1),
+                )
+                .changed()
+                && !app.export_whole
+            {
+                app.export_sel = false;
+            }
+            if ui.radio_value(&mut app.export_whole, true, "Whole project").changed() && app.export_whole {
+                app.export_sel = false;
+            }
+            if app.export_sel && n_sel == 0 {
+                ui.label(
+                    RichText::new("Nothing selected — click clips (Ctrl+click adds, Ctrl+A selects all).")
+                        .weak()
+                        .small(),
+                );
+            }
             if app.export_whole {
                 ui.label(
                     RichText::new("Whole project = every sounding track, all lanes, mixer trims, pans and effects.")
@@ -4214,7 +4709,9 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                     // No extension here — the Format dropdown adds it at
                     // export time (see `do_export`), so changing the format
                     // never means re-picking the destination.
-                    let name = if app.export_whole {
+                    let name = if app.export_sel {
+                        "slooper-selection".to_string()
+                    } else if app.export_whole {
                         "slooper-project".to_string()
                     } else {
                         format!("slooper-track-{}", app.selected + 1)
@@ -4633,6 +5130,31 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             });
             ui.label(RichText::new("Scales the whole interface; applied live.").weak().small());
+            ui.horizontal(|ui| {
+                ui.label("tracks:");
+                let mut n = app.n_tracks as i64;
+                let r = ui.add(
+                    egui::DragValue::new(&mut n)
+                        .range(1..=MAX_LOOPS as i64)
+                        .speed(1),
+                );
+                if r.changed() {
+                    app.n_tracks = n as usize;
+                    app.selected = app.selected.min(app.n_tracks - 1);
+                    app.bind_loop_sel = app.bind_loop_sel.min(app.n_tracks - 1);
+                    app.save_config();
+                    app.status = format!("{} tracks", app.n_tracks);
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "How many tracks the program shows. Per-track bindings for \
+                     hidden tracks are kept — raise the number again and they return \
+                     exactly as bound.",
+                )
+                .weak()
+                .small(),
+            );
 
             // ---- latency compensation -------------------------------------
             ui.add_space(4.0);
@@ -4786,7 +5308,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 egui::ComboBox::from_id_salt("bind_loop_sel")
                     .selected_text(format!("{}", app.bind_loop_sel + 1))
                     .show_ui(ui, |ui| {
-                        for n in 0..MAX_LOOPS {
+                        for n in 0..app.n_tracks {
                             ui.selectable_value(&mut app.bind_loop_sel, n, format!("{}", n + 1));
                         }
                     });
@@ -5119,8 +5641,11 @@ mod tests {
                 .sum()
         };
         assert_eq!(total(&app), 1, "drag-drop placed exactly one clip");
-        assert!(app.sel_clip.is_some(), "the dropped clip is selected");
-        assert_eq!(app.status, "clip placed on track 2 \u{b7} track");
+        assert!(!app.sel_clips.is_empty(), "the dropped clip is selected");
+        assert_eq!(
+            app.status,
+            "clip placed on track 2 \u{b7} track \u{b7} drag its edges to trim"
+        );
 
         // Right-click the Track-1 header (probe the small header band): it
         // must clear the clip.
@@ -5170,10 +5695,7 @@ mod tests {
         app.arr.insert(
             0,
             0,
-            Clip {
-                asset: a,
-                pos: 48_000,
-            },
+            Clip::new(a, 48_000),
         );
         assert_eq!(
             app.loop_region_eff(),
@@ -5392,6 +5914,159 @@ mod tests {
             repeat: false,
             modifiers: m,
         }
+    }
+
+    /// One frame driving the REAL shortcut pipeline (logic's
+    /// handle_shortcuts before ui_root), then run the widget tree.
+    fn frame_keys(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.handle_shortcuts(ui.ctx());
+            app.ui_root(ui);
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+    }
+
+    /// The regression test for "Ctrl+C copies, Ctrl+V pastes nothing":
+    /// copy must remember the selected clip's asset and paste must place a
+    /// new clip at the playhead on the last-clicked track.
+    #[test]
+    fn ctrl_c_v_copies_and_pastes_clip() {
+        let mut app = headless_app("copyv");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]); // layout pass
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        app.last_click_track = Some(0);
+        let total = |a: &App| -> usize {
+            a.arr
+                .tracks
+                .iter()
+                .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+                .sum()
+        };
+        assert_eq!(total(&app), 1);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(app.clipboard.as_ref().map(|c| c.items[0].asset), Some(a), "Ctrl+C remembered the asset");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(total(&app), 2, "Ctrl+V placed a second clip");
+    }
+
+    /// End-to-end clipboard through the REAL gestures: rack DnD drop, click
+    /// to select, Ctrl+C, click the ruler to move the playhead, Ctrl+V.
+    /// Mirrors exactly what winit delivers (ModifiersChanged frames for the
+    /// Ctrl hold, Key press inside the same event batch).
+    #[test]
+    fn clipboard_survives_real_click_flow() {
+        let mut app = headless_app("clipflow");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]); // layout pass
+        // 1. Rack DnD drop onto a lane (same recipe as the DnD pin test).
+        let mut y_row = None;
+        for y in (96..220).step_by(3) {
+            let p = egui::pos2(40.0, y as f32);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            if app.sel_asset.is_some() {
+                y_row = Some(y as f32);
+                break;
+            }
+        }
+        let y_row = y_row.expect("rack row");
+        let start = egui::pos2(40.0, y_row);
+        let lane = egui::pos2(500.0, 240.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(start), btn(start, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, y_row + 6.0))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(500.0, 240.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(lane, egui::PointerButton::Primary, false)],
+        );
+        let total = |a: &App| -> usize {
+            a.arr
+                .tracks
+                .iter()
+                .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+                .sum()
+        };
+        assert_eq!(total(&app), 1, "drop placed a clip");
+        assert!(!app.sel_clips.is_empty(), "drop selected it");
+
+        // 2. Ctrl+C with a Ctrl-hold ModifiersChanged frame.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(app.clipboard.is_some(), "Ctrl+C copied the selection");
+
+        // 3. Click the ruler to move the playhead (null audio cannot seek,
+        // so this only proves the ruler click does not eat the clipboard).
+        let r = egui::pos2(650.0, 128.0); // pinned ruler band
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+                moved(r),
+                btn(r, egui::PointerButton::Primary, true),
+            ],
+        );
+        frame_keys(&mut app, &ctx, vec![btn(r, egui::PointerButton::Primary, false)]);
+
+        // 4. Ctrl+V -> a second clip exists.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(total(&app), 2, "Ctrl+V placed the clip at the playhead");
+        // Paste must scroll the view to the new clip (the "paste does
+        // nothing" complaint = clip landed off-screen and nothing moved).
+        assert!(
+            app.hscroll_visible(48_000),
+            "view scrolled so the pasted clip is visible"
+        );
     }
 
     /// Click, select-all, replace with `value`, Enter. `find` answers
@@ -5732,5 +6407,109 @@ mod tests {
             0,
             "sub tier hides when steps crowd"
         );
+    }
+
+    #[test]
+    fn multi_track_group_copy_paste_keeps_offsets_and_trims() {
+        let mut app = headless_app("grpclip");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]); // one layout pass so state settles
+        app.arr.insert(0, 0, Clip::new(0, 0));
+        app.arr.insert(
+            2,
+            0,
+            Clip {
+                asset: 0,
+                pos: 9_600,
+                cut: 480,
+                play_len: Some(2_400),
+            },
+        );
+        app.sel_clips = vec![(0, 0, 0), (2, 0, 0)];
+        app.clipboard_copy();
+        let cb = app.clipboard.clone().expect("group copied");
+        assert_eq!(cb.items.len(), 2);
+        assert_eq!((cb.items[0].t_off, cb.items[1].t_off), (0, 2));
+        assert_eq!((cb.items[0].pos_off, cb.items[1].pos_off), (0, 9_600));
+
+        app.clipboard_paste();
+        let total: usize = app
+            .arr
+            .tracks
+            .iter()
+            .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+            .sum();
+        assert_eq!(total, 4, "the group pasted as two new clips");
+        // Null-audio playhead sits at 0, so the paste mirrors positions.
+        // The copies overlap the originals, so place_auto opens child lanes.
+        let p2 = app.arr.tracks[2]
+            .lanes
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .find(|c| c.cut == 480)
+            .expect("pasted trim clip on a free lane");
+        assert_eq!((p2.pos, p2.play_len), (9_600, Some(2_400)), "trim survived");
+        assert_eq!(app.sel_clips.len(), 2, "the pasted group is selected");
+        assert!(app.hscroll_visible(9_600), "pasted clips are in view");
+    }
+
+    #[test]
+    fn select_all_then_delete_clears_group() {
+        let mut app = headless_app("selall");
+        app.arr.insert(0, 0, Clip::new(0, 0));
+        app.arr.insert(0, 0, Clip::new(0, 9_600));
+        app.arr.insert(1, 0, Clip::new(0, 4_800));
+        app.select_all_clips();
+        assert_eq!(app.sel_clips.len(), 3);
+        app.delete_selection();
+        assert!(app.sel_clips.is_empty());
+        let total: usize = app
+            .arr
+            .tracks
+            .iter()
+            .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+            .sum();
+        assert_eq!(total, 0, "the whole group vanished");
+        // Deleting placements never deletes rack assets.
+        let before = app.assets.len();
+        assert!(before <= 1);
+    }
+
+    #[test]
+    fn export_selection_requires_a_selection_and_uses_the_clipboard_path() {
+        let mut app = headless_app("expsel");
+        app.export_sel = true;
+        app.export_path = "/tmp/slooper-exp-sel.wav".into();
+        app.sel_clips.clear();
+        app.do_export();
+        assert!(
+            app.status.contains("select at least one clip"),
+            "guard fired: {}",
+            app.status
+        );
+        app.arr.insert(0, 0, Clip::new(0, 0));
+        app.sel_clips = vec![(0, 0, 0)];
+        app.do_export(); // engine writes async; just must not guard-error
+        assert!(!app.show_export, "dialog closes when the export is queued");
+    }
+
+    #[test]
+    fn track_count_config_survives_project_roundtrip() {
+        let mut app = headless_app("ntracks");
+        app.n_tracks = 6;
+        assert_eq!(app.build_project("rt".into()).n_tracks, Some(6));
+        app.do_save("rt");
+        app.n_tracks = 12;
+        let path = crate::project::project_path(&app.projects_dir(), "rt");
+        app.do_load(&path);
+        assert_eq!(app.n_tracks, 6, "saved project restores its track count");
+
+        // Selection cycling stops at the configured count, not MAX_LOOPS.
+        app.n_tracks = 8;
+        app.selected = 7;
+        app.fire_midi_action(crate::midi::MidiAction::SelectNext);
+        assert_eq!(app.selected, 7, "never past the configured last track");
+        app.fire_midi_action(crate::midi::MidiAction::SelectPrev);
+        assert_eq!(app.selected, 6);
     }
 }

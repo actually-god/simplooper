@@ -24,8 +24,9 @@ use crate::config::TrackFxSave;
 pub const FORMAT: &str = "slooper-project";
 /// Format version written by this build. v2 (0.3.0) moved the mixer volume
 /// to the -inf..=+6 dB MIDI scale (115 = 0 dB, was 127 = 0 dB); v1 files are
-/// migrated on load.
-pub const VERSION: u32 = 2;
+/// migrated on load. v3 (0.6.0) adds non-destructive clip trims
+/// (`cut`/`play_len`, defaulted when absent) and the configured track count.
+pub const VERSION: u32 = 3;
 /// File extension (no dot) of project files.
 pub const EXT: &str = "slooper";
 
@@ -42,6 +43,12 @@ pub struct ProjClip {
     pub asset: u32,
     /// Timeline start in samples at the engine rate.
     pub pos: u64,
+    /// Source samples skipped at the start (left trim; v3, default 0).
+    #[serde(default)]
+    pub cut: u64,
+    /// Played length in samples; null/absent = rest of the source (v3).
+    #[serde(default)]
+    pub play_len: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +97,9 @@ pub struct Project {
     pub playhead: u64,
     pub tracks: Vec<ProjTrack>,
     pub assets: Vec<ProjAsset>,
+    /// Configured number of tracks (v3; absent on older files → default).
+    #[serde(default)]
+    pub n_tracks: Option<usize>,
 }
 
 impl Project {
@@ -188,6 +198,7 @@ mod tests {
 
     fn sample() -> Project {
         Project {
+            n_tracks: Some(16),
             format: FORMAT.into(),
             version: VERSION,
             name: "demo".into(),
@@ -200,7 +211,7 @@ mod tests {
                 pan: 64,
                 on: true,
                 fx: vec![TrackFxSave { stem: "template".into(), params: vec![1.0] }],
-                lanes: vec![vec![ProjClip { asset: 0, pos: 0 }], vec![]],
+                lanes: vec![vec![ProjClip { asset: 0, pos: 0, cut: 0, play_len: None }], vec![]],
             }],
             assets: vec![ProjAsset { name: "kick".into(), file: "/x/kick.wav".into() }],
         }
@@ -218,14 +229,14 @@ mod tests {
             "quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},
             "playhead":0,
             "tracks":[{"vol":127,"gain":80,"pan":64,"on":true,"fx":[],"lanes":[[],[]]}],
-            "assets":[]}"#).unwrap();
+            "n_tracks":null,"assets":[]}"#).unwrap();
         let loaded = load(&p).unwrap();
         assert_eq!(loaded.tracks[0].vol, crate::ui::VOL_UNITY_MIDI, "127 -> 0 dB");
         assert_eq!(loaded.tracks[0].gain, 80, "gain domain unchanged");
         assert_eq!(loaded.tracks[0].pan, 64);
         // Future versions are still refused.
         let bad = p.with_file_name("future.slooper");
-        std::fs::write(&bad, r#"{"format":"slooper-project","version":99,"name":"x","metro":{"bpm":120,"num":4,"sub":3},"quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},"playhead":0,"tracks":[],"assets":[]}"#).unwrap();
+        std::fs::write(&bad, r#"{"format":"slooper-project","version":99,"name":"x","metro":{"bpm":120,"num":4,"sub":3},"quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},"playhead":0,"tracks":[],"n_tracks":null,"assets":[]}"#).unwrap();
         assert!(load(&bad).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

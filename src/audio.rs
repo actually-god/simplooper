@@ -208,6 +208,14 @@ pub enum Cmd {
         path: std::path::PathBuf,
         fmt: crate::audio_io::ExportFormat,
     },
+    /// Render and write ONLY the listed clips — `(track, lane, clip index)`
+    /// into the current arrangement snapshot — time-aligned so the first
+    /// clip starts at sample 0. Selected tracks need not be sounding.
+    ExportSelection {
+        path: std::path::PathBuf,
+        fmt: crate::audio_io::ExportFormat,
+        items: Vec<(usize, usize, usize)>,
+    },
     /// The GUI replaced track `i`'s effect chain (order = audio order). The
     /// slots hold refcounted effect instances created on the GUI thread; the
     /// audio thread picks the new table up on the next cycle without locking.
@@ -888,10 +896,22 @@ impl Engine {
                         }
                         s
                     };
+                    // Trimmed start shifts the read offset; `play_len` past
+                    // the source contributes silence (nothing summed).
+                    let alen = data.len() as u64;
                     let start = cl.pos as usize;
-                    let end = (start + data.len()).min(len);
-                    for (o, k) in out[start..end].iter_mut().enumerate() {
-                        *k += mix(data[o]) * pdown;
+                    let dstart = (cl.pos + cl.cut).min(cl.pos + alen) as usize;
+                    let dend = cl
+                        .data_end(alen)
+                        .min(cl.end(alen))
+                        .min(len as u64)
+                        .max(cl.pos + cl.cut) as usize;
+                    let dend = dend.max(dstart);
+                    for k in start..dend {
+                        // `start` may sit left of dstart? never: dstart >= pos.
+                        if k >= dstart && k < data.len() + dstart {
+                            out[k] += mix(data[k - dstart]) * pdown;
+                        }
                     }
                 }
             }
@@ -901,6 +921,72 @@ impl Engine {
         } else {
             None
         }
+    }
+
+    /// Render ONLY the listed clips (`(track, lane, clip index)` into the
+    /// current snapshot), time-aligned so the earliest clip starts at
+    /// sample 0 — the export counterpart of multi-clip selection. Track
+    /// play/stop flags are ignored (an explicit selection always sounds).
+    /// Returns the timeline position the selection started at plus the
+    /// rendered mono mix, or `None` when no listed clip resolves to content.
+    pub fn render_selection(&self, items: &[(usize, usize, usize)]) -> Option<(u64, Vec<f32>)> {
+        let arr = self.arrangement();
+        let assets = self.assets();
+        let clips: Vec<(usize, crate::arrange::Clip)> = items
+            .iter()
+            .filter_map(|(t, k, c)| {
+                let cl = arr.tracks.get(*t)?.lanes.get(*k)?.clips.get(*c).copied()?;
+                if assets.get(cl.asset as usize).is_some() {
+                    Some((*t, cl))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let alen = |c: &crate::arrange::Clip| -> u64 {
+            assets.get(c.asset as usize).map(|d| d.len() as u64).unwrap_or(0)
+        };
+        let from = clips.iter().map(|(_, c)| c.pos).min()?;
+        let to = clips.iter().map(|(_, c)| c.end(alen(c))).max()?;
+        if to <= from {
+            return None;
+        }
+        let len = (to - from) as usize;
+        let mut out = vec![0.0f32; len];
+        let chains = self.fx.lock().unwrap().clone();
+        for (t, cl) in &clips {
+            let data = match assets.get(cl.asset as usize) {
+                Some(d) => d,
+                None => continue,
+            };
+            let tamp = self.loop_vol(*t) * self.loop_gain(*t);
+            let (pgl, pgr) = pan_gains(self.loop_pan(*t));
+            let pdown = (pgl + pgr) * F1S2;
+            let chain = chains[*t].clone();
+            let fx: Vec<Arc<crate::fx::Instance>> = chain
+                .slots()
+                .iter()
+                .filter_map(|s| s.inst.spawn_fresh(&s.desc))
+                .collect();
+            let mix = |x: f32| {
+                let mut s = x * tamp;
+                for f in &fx {
+                    s = f.process_private(s);
+                }
+                s
+            };
+            let alen_u = data.len() as u64;
+            let dstart = (cl.pos + cl.cut) as usize;
+            let dend = cl
+                .data_end(alen_u)
+                .min(cl.end(alen_u))
+                .min(cl.pos + alen_u);
+            for k in dstart..(dend as usize) {
+                let o = (k - from as usize).min(len - 1);
+                out[o] += mix(data[k - dstart]) * pdown;
+            }
+        }
+        Some((from, out))
     }
 }
 
@@ -1196,6 +1282,30 @@ fn run(
                     let _ = evt_tx.send(Evt::Error("export: no clips placed in any track".into()));
                 }
             },
+            Ok(Cmd::ExportSelection { path, fmt, items }) => {
+                match engine.render_selection(&items) {
+                    Some((_from, samples)) => {
+                        match crate::audio_io::export(&path, sample_rate, &samples, fmt) {
+                            Ok(()) => {
+                                let _ = evt_tx.send(Evt::Notice(format!(
+                                    "exported selection of {} clip(s) ({} samples) → {}",
+                                    items.len(),
+                                    samples.len(),
+                                    path.display()
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(format!("export: {e}")));
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = evt_tx.send(Evt::Error(
+                            "export: nothing to export (empty selection?)".into(),
+                        ));
+                    }
+                }
+            }
             Ok(Cmd::SetTrackEffects { i, chain }) => {
                 engine.set_track_fx(i.min(MAX_LOOPS - 1), chain);
             }
@@ -1724,21 +1834,31 @@ impl Proc {
                         Some(d) if !d.is_empty() => d,
                         _ => continue,
                     };
+                    let alen = data.len() as u64;
+                    // Clip window on the timeline vs. this block.
                     let c0 = cl.pos;
-                    let c1 = c0.saturating_add(data.len() as u64);
+                    let c1 = cl.end(alen);
                     let w0 = c0.max(p0);
                     let w1 = c1.min(span_end);
-                    if w0 < w1 {
+                    // Only the part backed by SOURCE data contributes; a
+                    // trimmed start (`cut`) shifts the read offset, and a
+                    // `play_len` past the data adds nothing (silence).
+                    let dstart = cl.pos;
+                    let dend = cl.data_end(alen).min(c1);
+                    let wd0 = w0.max(dstart);
+                    let wd1 = w1.min(dend);
+                    if wd0 < wd1 {
                         // The entry's pointer already includes the offset from
                         // the clip start to the window start, so the sample
                         // loop reads `ptr.add(i - i0)` with no per-sample math.
-                        let off = (w0 - cl.pos) as usize;
+                        let off = (cl.cut + (wd0 - dstart)) as usize;
+                        let off = off.min(data.len().saturating_sub(1));
                         let base = unsafe { data.as_ptr().add(off) };
                         entries.push(ClipEntry {
                             track: t as u8,
                             ptr: base,
-                            i0: (w0 - p0) as usize,
-                            i1: (w1 - p0) as usize,
+                            i0: (wd0 - p0) as usize,
+                            i1: (wd1 - p0) as usize,
                         });
                     }
                 }
@@ -2440,14 +2560,11 @@ mod tests {
         let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 2000]);
         let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 2000]);
         let mut arr = Arrangement::new();
-        arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+        arr.insert(0, 0, Clip::new(0, 0));
         arr.insert(
             1,
             0,
-            Clip {
-                asset: 1,
-                pos: 1000,
-            },
+            Clip::new(1, 1000),
         );
         let e = Engine::new();
         e.set_project(Arc::new(vec![a0.clone(), a1.clone()]), Arc::new(arr), 4000);
@@ -2491,8 +2608,8 @@ mod tests {
         let a: Arc<[f32]> = Arc::from(vec![0.5f32; 1000]);
         let mut arr = Arrangement::new();
         // Two clips of the same asset overlapping on different lanes.
-        arr.insert(4, 0, Clip { asset: 0, pos: 0 });
-        arr.insert(4, 1, Clip { asset: 0, pos: 500 });
+        arr.insert(4, 0, Clip::new(0, 0));
+        arr.insert(4, 1, Clip::new(0, 500));
         let e = Engine::new();
         e.set_project(Arc::new(vec![a]), Arc::new(arr), 2000);
         let out = e.render_project().unwrap();
@@ -2524,7 +2641,7 @@ mod tests {
         let e = Engine::new();
         let a: Arc<[f32]> = Arc::from(vec![0.5f32; 4000]);
         let mut arr = Arrangement::new();
-        arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+        arr.insert(0, 0, Clip::new(0, 0));
         e.set_project(Arc::new(vec![a]), Arc::new(arr), 4000);
         let desc = reg.desc("template").unwrap().clone();
 

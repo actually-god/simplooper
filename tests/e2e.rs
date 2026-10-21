@@ -588,7 +588,7 @@ fn e2e_transport_and_clips() {
     // ---- a project: one 0.5 asset on track 0 at t = 0 ----------------------
     let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 16_000]);
     let mut arr = Arrangement::new();
-    arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+    arr.insert(0, 0, Clip::new(0, 0));
     let clip_len = 16_000u64;
     let total = 32_000u64; // two clip lengths: a real "project end"
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0.clone()]);
@@ -1035,14 +1035,11 @@ fn e2e_export_writes_file() {
     let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 8_000]);
     let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 4_000]);
     let mut arr = Arrangement::new();
-    arr.insert(0, 0, Clip { asset: 0, pos: 0 });
+    arr.insert(0, 0, Clip::new(0, 0));
     arr.insert(
         0,
         1,
-        Clip {
-            asset: 1,
-            pos: 4_000,
-        },
+        Clip::new(1, 4_000),
     );
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0, a1]);
     b.cmd(Cmd::SetProject {

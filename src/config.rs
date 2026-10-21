@@ -159,6 +159,12 @@ pub struct Config {
     /// chain order (each stem + its slider values).
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
+    /// Number of tracks the program exposes (clamped 1..=16). Per-track
+    /// levels and bindings are kept for ALL 16 slots regardless, so raising
+    /// the count again restores everything that was configured while a
+    /// lower count hid the track.
+    #[serde(default = "default_n_tracks")]
+    pub n_tracks: usize,
 }
 
 impl Default for Config {
@@ -176,6 +182,7 @@ impl Default for Config {
             trk_h: Vec::new(),
             trk_gain: Vec::new(),
             trk_pan: Vec::new(),
+            n_tracks: default_n_tracks(),
             metro_bpm: default_metro_bpm(),
             metro_sub: default_metro_sub(),
             metro_num: default_metro_num(),
@@ -217,6 +224,11 @@ fn default_master_vol() -> u8 {
 /// Asset-preview length default: 5 seconds.
 fn default_preview_secs() -> f32 {
     5.0
+}
+
+/// Track-count default: the historical fixed 16 tracks.
+fn default_n_tracks() -> usize {
+    16
 }
 
 /// Convert a pre-0.3 MIDI-linear fader (0 = silence, 127 = 0 dB, plain
@@ -349,6 +361,7 @@ mod tests {
     #[test]
     fn config_roundtrip() {
         let cfg = Config {
+            n_tracks: 16,
             shortcuts: vec![Some("R".into()), None, Some("Space".into())],
             midi: vec![MidiBinding {
                 action: MidiAction::RecLoop(0),
