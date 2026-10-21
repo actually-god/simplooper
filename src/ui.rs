@@ -2194,8 +2194,8 @@ impl App {
         let mut bar_delta: i32 = 0;
         let mut open = true;
         let sr = self.sample_rate.max(1);
-        let q_step = SUBDIVISIONS[self.q_sub].0.max(1) as u32;
-        let snap_steps = SUBDIVISIONS[self.snap_sub].0.max(1) as u32;
+        let q_step = SUBDIVISIONS[self.q_sub].0.max(1);
+        let snap_steps = SUBDIVISIONS[self.snap_sub].0.max(1);
         let playhead = self.backend.engine.pos();
         let sel = self.selected;
         egui::Window::new("\u{266b} Piano roll")
@@ -2995,7 +2995,7 @@ impl App {
         for (i, pa) in pr.assets.iter().enumerate() {
             let found = project::resolve_asset(&pa.file, &dirs);
             // MIDI pattern assets have their own decoder (.mid).
-            if found.as_deref().is_some_and(|fp| crate::assets::is_midi_file(fp)) {
+            if found.as_deref().is_some_and(crate::assets::is_midi_file) {
                 let fp = found.unwrap_or_default();
                 match Pattern::load_mid(&fp) {
                     Ok(pat) => {
@@ -3399,10 +3399,8 @@ impl App {
                     }
                     // MIDI recording tap: a message NO binding claims is
                     // captured verbatim into every armed track's buffer.
-                    if self.midi_rec.iter().any(|r| r.armed) {
-                        if !self.midi_msg_is_bound(&msg) {
-                            self.capture_midi_msg(&msg);
-                        }
+                    if self.midi_rec.iter().any(|r| r.armed) && !self.midi_msg_is_bound(&msg) {
+                        self.capture_midi_msg(&msg);
                     }
                     let line = MidiLine {
                         ts: Self::now_stamp(),
@@ -4283,20 +4281,19 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                  it onto a track",
             )
             .clicked()
+            && app.piano_roll.is_none()
         {
-            if app.piano_roll.is_none() {
-                let mut pat = Pattern::new(app.bpm().clamp(20, 999) as u16);
-                pat.len_ticks = 4 * PPQ as u32;
-                app.piano_roll = Some(Box::new(PianoRoll {
-                    pat,
-                    px_per_beat: 90.0,
-                    row_h: 11.0,
-                    lo_note: 36,
-                    scroll_sec: 0.0,
-                    changed: false,
-                    drag: None,
-                }));
-            }
+            let mut pat = Pattern::new(app.bpm().clamp(20, 999) as u16);
+            pat.len_ticks = 4 * PPQ as u32;
+            app.piano_roll = Some(Box::new(PianoRoll {
+                pat,
+                px_per_beat: 90.0,
+                row_h: 11.0,
+                lo_note: 36,
+                scroll_sec: 0.0,
+                changed: false,
+                drag: None,
+            }));
         }
         ui.label(RichText::new("grid:").strong());
         if ui

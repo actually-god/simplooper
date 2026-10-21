@@ -99,7 +99,7 @@ impl Pattern {
         let step = step_ticks.max(1);
         if snap {
             for n in &mut self.notes {
-                n.start = (n.start.div_euclid(step) * step).max(0);
+                n.start = n.start.div_euclid(step) * step;
                 n.len = (n.len.div_euclid(step).max(1)) * step;
             }
         }
@@ -112,7 +112,7 @@ impl Pattern {
             .max()
             .unwrap_or(0);
         let bar = 4 * PPQ as u32;
-        self.len_ticks = end.div_euclid(bar).max(1) as u32 * bar + (end % bar != 0) as u32 * bar;
+        self.len_ticks = end.div_euclid(bar).max(1) * bar + (end % bar != 0) as u32 * bar;
         self.len_ticks = self.len_ticks.max(bar);
     }
 
@@ -149,7 +149,7 @@ impl Pattern {
         // Flatten to (tick, event-bytes) and diff-sort.
         let mut ev: Vec<(u32, Vec<u8>)> = Vec::new();
         for n in &self.notes {
-            ev.push((n.start, vec![0x90 | n.ch & 0xF, n.note & 0x7F, n.vel.max(1).min(127)]));
+            ev.push((n.start, vec![0x90 | n.ch & 0xF, n.note & 0x7F, n.vel.clamp(1, 127)]));
             ev.push((
                 (n.start + n.len.max(1)).min(u32::MAX - 1),
                 vec![0x80 | n.ch & 0xF, n.note & 0x7F, n.vel / 2],

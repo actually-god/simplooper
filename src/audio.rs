@@ -1992,7 +1992,7 @@ impl Proc {
         if !self.engine.transport_on() || self.midi_cache.is_empty() || block_n == 0 {
             return false;
         }
-        let sr = self.sr.max(1) as u32;
+        let sr = self.sr.max(1);
         let span_end = p0 + block_n as u64;
         let arr = self.arr.clone();
         let dflt = self.dflt_synth.clone();

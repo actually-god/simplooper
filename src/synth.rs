@@ -78,7 +78,8 @@ pub fn seed_folder(dir: &Path) {
         return; // read-only folder: the registry just lists fewer synths
     }
     let api = dir.join("synth_api.rs");
-    let want_api = API_SRC.replace("slooper-synth-version", "slooper-synth-version");
+    // The shipped API file already carries the current version marker.
+    let want_api = API_SRC.to_string();
     let stale_api = std::fs::read_to_string(&api).map(|s| s != want_api).unwrap_or(true);
     if stale_api && std::fs::write(&api, &want_api).is_ok() {
         // Version note only; scripts recompile on next rescan by mtime.
@@ -271,8 +272,8 @@ impl Instance {
     }
 
     pub fn read_params(&self, out: &mut [f32; MAX_PARAMS]) {
-        for k in 0..self.n_params {
-            out[k] = f32::from_bits(self.params[k].load(Ordering::Relaxed));
+        for (o, p) in out.iter_mut().zip(&self.params[..self.n_params]) {
+            *o = f32::from_bits(p.load(Ordering::Relaxed));
         }
     }
 
@@ -476,7 +477,7 @@ fn compile_synth(src: &Path, out: &Path) -> Result<(), String> {
         let err = String::from_utf8_lossy(&output.stderr);
         std::fs::write(out.with_extension("so.failed"), err.as_bytes()).ok();
         let mut err: String = err.trim().chars().take(1800).collect();
-        err.push_str("…");
+        err.push('…');
         return Err(format!("compile failed:\n{err}"));
     }
     std::fs::rename(&tmp, out).map_err(|e| format!("could not store {}: {e}", out.display()))
