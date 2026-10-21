@@ -71,7 +71,8 @@ shortcuts, per-track effects, and clean export.
   **pan** (−100…+100, equal power; editable dB / position text boxes, raw
   MIDI readout and a **0** reset button) and **FX…**, all scrolling in
   lockstep with the timeline. The
-  **master volume** (top bar) spans the same −∞…+6 dB range. Effects are
+  **master volume** (peak meter + one-row fader at the top of the mixer
+dock, above Track 1) spans the same −∞…+6 dB range. Effects are
   per-track runtime-compiled chains (Rust scripts hot-compiled with rustc,
   per-effect sliders, scripted custom GUIs, user presets) running after
   vol × gain, live and in export renders.

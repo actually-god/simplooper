@@ -130,6 +130,9 @@ pub struct Config {
     /// — the same `vol_amp` mapping every track volume uses).
     #[serde(default = "default_master_vol")]
     pub master_vol: u8,
+    /// Live input monitoring master switch (Settings checkbox). Default on.
+    #[serde(default = "default_true")]
+    pub monitor_on: bool,
     /// Audition rack entries on click (asset preview). Default on.
     #[serde(default = "default_true")]
     pub preview_on: bool,
@@ -184,6 +187,7 @@ impl Default for Config {
             loop_area_start: 0,
             loop_area_end: 0,
             master_vol: default_master_vol(),
+            monitor_on: true,
             preview_on: true,
             preview_secs: default_preview_secs(),
             vol_scale_v2: true,
@@ -371,6 +375,7 @@ mod tests {
             loop_area_start: 24,
             loop_area_end: 192_000,
             master_vol: 100,
+            monitor_on: false,
             preview_on: false,
             preview_secs: 2.5,
             vol_scale_v2: true,
@@ -397,6 +402,7 @@ mod tests {
         assert_eq!(back.metro_num, 7);
         assert_eq!(back.q_sub, 6);
         assert_eq!(back.snap_sub, 2);
+        assert!(!back.monitor_on, "monitoring toggle round-trips");
         assert!(!back.auto_quantize && !back.loop_tl);
         assert_eq!(back.project_dir, "/tmp/projects");
         assert_eq!(back.rack_folders, cfg.rack_folders);

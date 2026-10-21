@@ -5,8 +5,9 @@
 //!
 //! Layout:
 //! - top bar: hamburger (settings), status, transport, position readout,
-//!   tempo + metronome, Save / Save as / Load / Export, peak meter, master
-//!   volume (dB scale, −∞…+6)
+//!   tempo + metronome, Save / Save as / Load / Export
+//! - mixer dock header (above Track 1, level with the grid header): peak
+//!   meter + master volume row (dB scale, −∞…+6)
 //! - left panel: ASSET RACK — folder list (primary = recordings land there;
 //!   defaults to the seeded [`crate::samples808`] pack), one row per audio
 //!   file, project assets below
@@ -324,12 +325,17 @@ const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 95, 86);
 const COL_CLIP: Color32 = Color32::from_rgb(72, 118, 196);
 const COL_CLIP_SEL: Color32 = Color32::from_rgb(128, 200, 255);
 const COL_GHOST: Color32 = Color32::from_rgb(120, 160, 120);
-const COL_BAR_LINE: Color32 = Color32::from_gray(120);
-const COL_BEAT_LINE: Color32 = Color32::from_gray(68);
-/// Sub-beat snap lines: a third, even fainter tier drawn at the snap
+const COL_BAR_LINE: Color32 = Color32::from_gray(135);
+const COL_BEAT_LINE: Color32 = Color32::from_gray(78);
+/// Sub-beat snap lines: a third, dimmer tier drawn at the snap
 /// subdivision (grid-toolbar snap combo), so clip placement has a visible
-/// target without cluttering the bar/beat grid.
-const COL_SNAP_LINE: Color32 = Color32::from_rgba_premultiplied(120, 120, 128, 22);
+/// target without cluttering the bar/beat grid. MUST stay the darkest tier
+/// (brightness order bar > beat > snap — pinned by
+/// `grid_line_brightness_is_bar_beat_snap`). Deliberately an opaque dark
+/// gray: an alpha-blended stroke painted *opaque gray(120)* in the live
+/// glow build and out-shone the beat lines (the user's "swap downbeat and
+/// subdivision" report).
+const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
 /// Nominal lane-strip height in the grid. A track's block is
 /// `lanes × LANE_H`, never shorter than `TRACK_MIN_H` (the height its
 /// mixer strip needs), so clips get tall waveforms and the mixer stays
@@ -466,6 +472,8 @@ pub struct App {
     // --- asset rack ---
     rack: Vec<RackFolder>,
     sel_asset: Option<usize>,
+    /// Live input monitoring on/off (Settings → MONITORING, default on).
+    monitor_enabled: bool,
     /// Audition rack entries on click (Settings → ASSET PREVIEW).
     preview_enabled: bool,
     /// Text box value for the preview length in seconds.
@@ -675,6 +683,7 @@ impl App {
             copied_asset: None,
             rack,
             sel_asset: None,
+            monitor_enabled: cfg.monitor_on,
             preview_enabled: cfg.preview_on,
             preview_secs: cfg.preview_secs.max(0.0).to_string(),
             preview_playing: None,
@@ -1535,6 +1544,7 @@ impl App {
             loop_area_start: self.loop_area.0,
             loop_area_end: self.loop_area.1,
             master_vol: self.master_midi,
+            monitor_on: self.monitor_enabled,
             preview_on: self.preview_enabled,
             preview_secs: self.preview_secs_f(),
             vol_scale_v2: true,
@@ -2068,6 +2078,7 @@ impl App {
                     ms: self.latency_ms.trim().parse().unwrap_or(0.0),
                 });
                 self.backend.cmd(Cmd::SetLoop(self.loop_tl));
+                self.backend.cmd(Cmd::SetMonitor(self.monitor_enabled));
                 self.send_metro();
                 // Effect instances made before the backend was up were
                 // created with rate 0; rebuild every chain at the real rate.
@@ -2523,89 +2534,9 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 app.send_metro();
             }
 
+            // File actions; the master volume + peak meter moved to the top
+            // of the mixer dock (`master_strip`).
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Peak meter.
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 8.0), Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, 1.0, Color32::from_rgb(40, 40, 45));
-                let frac = (app.peak_disp * 0.9).clamp(0.0, 1.0);
-                let color = if app.peak_disp > 0.99 {
-                    Color32::RED
-                } else if app.peak_disp > 0.7 {
-                    Color32::YELLOW
-                } else {
-                    Color32::LIGHT_GREEN
-                };
-                if frac > 0.01 {
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            rect.min,
-                            egui::vec2(rect.width() * frac, rect.height()),
-                        ),
-                        1.0,
-                        color,
-                    );
-                }
-                ui.label(RichText::new("vol").strong().small());
-                // Master volume now mirrors the per-track rows: editable dB
-                // text box, slider, raw MIDI readout and a "0" zeroize
-                // button. The scratch edit lives in `lv_edit` under the
-                // sentinel track index so it can't collide with a track.
-                const MASTER_IDX: usize = usize::MAX;
-                let mut mtxt = app
-                    .lv_edit
-                    .get(&(KIND_VOL, MASTER_IDX))
-                    .cloned()
-                    .unwrap_or_else(|| db_num(vol_amp(app.master_midi)));
-                let mrt = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut mtxt)
-                            .desired_width(46.0)
-                            .horizontal_align(egui::Align::Center)
-                            .font(egui::TextStyle::Monospace),
-                    )
-                    .on_hover_text("Master level in dB (e.g. -6.5). Press Enter to apply.");
-                ui.add(
-                    egui::Label::new(RichText::new("dB").monospace().weak().small())
-                        .selectable(false),
-                );
-                if mrt.has_focus() {
-                    app.lv_edit.insert((KIND_VOL, MASTER_IDX), mtxt.clone());
-                } else {
-                    app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
-                }
-                if mrt.lost_focus() && ui.input(|u| u.key_pressed(egui::Key::Enter)) {
-                    if let Some(v) = level_parse(KIND_VOL, &mtxt) {
-                        app.master_midi = v;
-                        app.levels_dirty = true;
-                    }
-                    app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
-                }
-                let mut mv = app.master_midi as i16;
-                if ui
-                    .add_sized(
-                        egui::vec2(84.0, 18.0),
-                        Slider::new(&mut mv, 0..=127).show_value(false),
-                    )
-                    .on_hover_text("Master volume: -inf .. +6 dB")
-                    .changed()
-                {
-                    app.master_midi = mv.clamp(0, 127) as u8;
-                    app.levels_dirty = true;
-                }
-                ui.add(
-                    egui::Label::new(RichText::new(format!("{mv:>3}")).monospace().weak().small())
-                        .selectable(false),
-                )
-                .on_hover_text("Raw MIDI value (0..=127) of the master fader.");
-                if ui
-                    .small_button(RichText::new("0").monospace())
-                    .on_hover_text("Reset master volume to 0 dB")
-                    .clicked()
-                {
-                    app.master_midi = VOL_UNITY_MIDI;
-                    app.levels_dirty = true;
-                }
                 if ui.button("Export").clicked() {
                     app.show_export = true;
                 }
@@ -2858,6 +2789,89 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
 /// to the right like the asset rack. Strip heights come from [`App::track_h`]
 /// and the column is offset by the grid's scroll — so each strip sits exactly
 /// level with its track, and clips/waveforms get the grid's full height.
+/// Master output section at the TOP of the mixer dock — it lives in the
+/// band between the panel header and the Track 1 strip (level with the
+/// timeline grid header). ONE compact row: "master" label, peak meter,
+/// editable dB text box, slider, raw MIDI readout and a "0" zeroize
+/// button — the band is only ~30 px tall, so a second row would spill
+/// onto Track 1's widgets (a two-row version did: click stealing). The
+/// scratch edit lives in `lv_edit` under the sentinel track index so it
+/// can't collide with a track.
+fn master_strip(ui: &mut egui::Ui, app: &mut App) {
+    const MASTER_IDX: usize = usize::MAX;
+    ui.spacing_mut().item_spacing.x = 5.0;
+    ui.label(RichText::new("master").strong().small());
+    {
+        let mut mtxt = app
+            .lv_edit
+            .get(&(KIND_VOL, MASTER_IDX))
+            .cloned()
+            .unwrap_or_else(|| db_num(vol_amp(app.master_midi)));
+        let mrt = ui
+            .add(
+                egui::TextEdit::singleline(&mut mtxt)
+                    .desired_width(46.0)
+                    .horizontal_align(egui::Align::Center)
+                    .font(egui::TextStyle::Monospace),
+            )
+            .on_hover_text("Master level in dB (e.g. -6.5). Press Enter to apply.");
+        if mrt.has_focus() {
+            app.lv_edit.insert((KIND_VOL, MASTER_IDX), mtxt.clone());
+        } else {
+            app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
+        }
+        if mrt.lost_focus() && ui.input(|u| u.key_pressed(egui::Key::Enter)) {
+            if let Some(v) = level_parse(KIND_VOL, &mtxt) {
+                app.master_midi = v;
+                app.levels_dirty = true;
+            }
+            app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
+        }
+        let mut mv = app.master_midi as i16;
+        if ui
+            .add_sized(
+                egui::vec2(44.0, 18.0),
+                Slider::new(&mut mv, 0..=127).show_value(false),
+            )
+            .on_hover_text("Master volume: -inf .. +6 dB")
+            .changed()
+        {
+            app.master_midi = mv.clamp(0, 127) as u8;
+            app.levels_dirty = true;
+        }
+        if ui
+            .small_button(RichText::new("0").monospace())
+            .on_hover_text("Reset master volume to 0 dB")
+            .clicked()
+        {
+            app.master_midi = VOL_UNITY_MIDI;
+            app.levels_dirty = true;
+        }
+        // Peak meter last: it absorbs whatever width is left, so the fixed
+        // widgets (box, slider, zeroize) can never be clipped off the edge
+        // when the mixer dock is narrow.
+        let meter_w = (ui.available_width() - ui.spacing().item_spacing.x).max(12.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(meter_w, 8.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 1.0, Color32::from_rgb(40, 40, 45));
+        let frac = (app.peak_disp * 0.9).clamp(0.0, 1.0);
+        let color = if app.peak_disp > 0.99 {
+            Color32::RED
+        } else if app.peak_disp > 0.7 {
+            Color32::YELLOW
+        } else {
+            Color32::LIGHT_GREEN
+        };
+        if frac > 0.01 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height())),
+                1.0,
+                color,
+            );
+        }
+    }
+}
+
 fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::right("mixer")
         .resizable(true)
@@ -2881,6 +2895,25 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
                 base.min.y
             };
             let mut y = top - app.vscroll;
+            // Master strip in the header band: from the panel header down
+            // to where the track stack begins — the band level with the
+            // timeline grid header, directly above the Track 1 strip.
+            let band_bottom = top.max(base.min.y);
+            if band_bottom - base.min.y > 24.0 {
+                let band = egui::Rect::from_min_max(
+                    egui::pos2(base.min.x, base.min.y),
+                    egui::pos2(base.max.x, band_bottom),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt("masterstrip")
+                        .max_rect(band)
+                        .layout(
+                            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(false),
+                        ),
+                    |ui| master_strip(ui, app),
+                );
+            }
             for t in 0..MAX_LOOPS {
                 let th = app.track_h(t);
                 if y + th >= base.min.y && y <= base.max.y {
@@ -4626,6 +4659,23 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     .small(),
             );
 
+            // ---- monitoring -------------------------------------------------
+            ui.separator();
+            ui.label(RichText::new("MONITORING").strong());
+            if ui
+                .checkbox(&mut app.monitor_enabled, "live input monitoring")
+                .on_hover_text(
+                    "When on (default), the live input rides the SELECTED track's \
+                     chain: gain × volume × effects × pan. Turn off to silence the \
+                     input without touching any level — recording, playback and the \
+                     meter are unaffected.",
+                )
+                .changed()
+            {
+                app.backend.cmd(Cmd::SetMonitor(app.monitor_enabled));
+                app.save_config();
+            }
+
             // ---- asset preview --------------------------------------------
             ui.separator();
             ui.label(RichText::new("ASSET PREVIEW").strong());
@@ -4879,7 +4929,6 @@ fn load_window(ui: &mut egui::Ui, app: &mut App) {
     }
     app.show_load = open;
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5534,8 +5583,9 @@ mod tests {
         let ctx = egui::Context::default();
         app.master_midi = 50;
         frame(&mut app, &ctx, vec![]);
-        // Zeroize button (first painted "0" galley is the top bar's —
-        // panels draw in add order, and the top bar is first).
+        // Zeroize button: the first painted "0" galley is the mixer dock's
+        // master strip — panels draw in add order and the master strip
+        // precedes every track strip inside the mixer.
         let z = label_center(&mut app, &ctx, "0").expect("a \"0\" button is painted");
         frame(
             &mut app,
@@ -5575,6 +5625,60 @@ mod tests {
             app.master_midi,
             vol_midi(-12.0),
             "typed dB value applies to master"
+        );
+    }
+
+    /// Grid tier brightness: measure > beat > subdivision — the user's
+    /// legibility order. (The old alpha-blended snap color painted as an
+    /// opaque gray-120 on the live build and out-shone the beat lines.)
+
+    #[test]
+    fn grid_line_brightness_is_bar_beat_snap() {
+        let lum = |c: Color32| {
+            let a = c.to_array();
+            (a[0] as u32 + a[1] as u32 + a[2] as u32) / 3
+        };
+        assert!(lum(COL_BAR_LINE) > lum(COL_BEAT_LINE), "measure over beat");
+        assert!(
+            lum(COL_BEAT_LINE) > lum(COL_SNAP_LINE),
+            "beat over subdivision"
+        );
+    }
+
+    /// Settings → "live input monitoring": default on; the checkbox flips
+    /// the app state, pushes Cmd::SetMonitor to the engine and saves the
+    /// config.
+    #[test]
+    fn settings_monitoring_toggle() {
+        let mut app = headless_app("monitor");
+        let ctx = egui::Context::default();
+        assert!(
+            app.monitor_enabled,
+            "monitoring defaults on (current behavior)"
+        );
+        app.show_settings = true;
+        let p = label_center(&mut app, &ctx, "live input monitoring")
+            .expect("monitoring checkbox is painted in settings");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
+        assert!(!app.monitor_enabled, "click turns live monitoring off");
+        // (The engine-side gate of the same flag is pinned by
+        // `audio::tests::monitoring_toggle_gates_live_input`, and the RT
+        // pass-through muting by `e2e_selected_loop_monitoring` — headless
+        // lib tests run with no cmd consumer, so we assert app state +
+        // persisted config only here.)
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(
+            cfg_txt.contains("\"monitor_on\": false"),
+            "config: {cfg_txt}"
         );
     }
 

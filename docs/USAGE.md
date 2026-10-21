@@ -47,17 +47,19 @@ timeline while you play.
 5. Live input **monitoring** rides the *selected* track's chain: its gain ×
    volume × effects × pan shape the pass-through, so you hear exactly what
    that track will do to your signal. Takes always capture the raw,
-   unprocessed input.
+   unprocessed input. Switch the pass-through off entirely in the settings
+   panel (**MONITORING → live input monitoring**, default on) — levels,
+   recording and playback keep working.
 
 ## The window
 
 | Region | Contents |
 | --- | --- |
-| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** · peak meter · **master volume** (−∞…+6 dB; editable dB box, raw readout and a **0** zeroize button — same row widgets as per-track vol) |
+| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure + subdivision · **Load / Save as / Save / Export** |
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
 | **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** subdivision, zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles |
-| **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll; any header-height difference shows as empty room at the top of the strip column): **name · REC · PLAYED/muted · +child/−child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button) and **FX…**; strips scroll in lockstep with the timeline |
+| **Mixer** (right dock) | top band (level with the grid header, above Track 1): **master** peak meter + master volume row (−∞…+6 dB; editable dB box, slider and a **0** zeroize button); then one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll; any header-height difference shows as empty room at the top of the strip column): **name · REC · PLAYED/muted · +child/−child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button) and **FX…**; strips scroll in lockstep with the timeline |
 | **Bottom** | MIDI monitor (every event on `slooper:midi_in`) |
 
 Each **mixer strip** holds the track's whole control surface: the name row
@@ -218,10 +220,11 @@ checkbox. On the grid toolbar:
   eighth, triplet, sixteenth, triplet-eighths, thirty-second).
 - **snap** dropdown — the grid *clip placement* follows while dragging and
   when takes auto-place. The timeline also draws the snap grid: at
-  sub-beat settings a third, very faint hairline tier marks every snap
-  step (ruler and lanes); it vanishes when snap is the plain quarter note
-  (the beat line already is the grid) or when zoomed out so far the steps
-  would crowd.
+  sub-beat settings a third, clearly **dimmer** hairline tier marks every
+  snap step (ruler and lanes) — line brightness runs
+  **measure → beat → subdivision**; the tier vanishes when snap is the
+  plain quarter note (the beat line already is the grid) or when zoomed
+  out so far the steps would crowd.
 - **auto-quantize** — every fresh recording is quantized on the way into
   the rack.
 

@@ -24,7 +24,7 @@
 //! recording captures raw input into a take buffer and hands the finished
 //! take back to the GUI (as an asset + clip placement) when stopped.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 
@@ -177,6 +177,10 @@ pub enum Cmd {
     /// The active loop region in samples: wrap from `start` to `end`. The
     /// GUI computes `end` from the loop mode (area handles, current-longest
     /// track content, or whole-song end) on every edit; `end = 0` means
+    /// Master switch for live input monitoring (Settings checkbox, default
+    /// on). Off mutes the live pass-through of the selected track's chain
+    /// only — levels, recording, playback and the meter keep working.
+    SetMonitor(bool),
     /// "wrap at the project end". Only consulted while [`Cmd::SetLoop`] is
     /// on — with the loop off the transport still parks at the project end.
     SetLoopRegion {
@@ -448,6 +452,10 @@ pub struct Engine {
     /// GUI-selected track (0-based). Live input monitoring rides this
     /// track's gain x volume, effect chain and pan (see `Proc::process`).
     selected: AtomicU8,
+    /// Live input monitoring master switch (Settings checkbox; default on).
+    /// Off mutes the pass-through only — levels, recording and playback
+    /// are untouched. Gate on the RT thread via `monitor_amp`.
+    monitor_on: AtomicBool,
     /// Per-track live effect chains. The manager thread swaps the whole
     /// table on `SetTrackEffects`; the RT handler refreshes a cached Arc
     /// clone when `fx_gen` changes (try_lock — never blocks).
@@ -509,6 +517,7 @@ impl Engine {
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             selected: AtomicU8::new(0),
+            monitor_on: AtomicBool::new(true),
             fx: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| TrackFx::default()))),
             fx_gen: AtomicU64::new(0),
             assets: std::sync::Mutex::new(Arc::new(Vec::new())),
@@ -635,6 +644,25 @@ impl Engine {
             self.loop_start.load(Ordering::Relaxed),
             self.loop_end.load(Ordering::Relaxed),
         )
+    }
+
+    /// Live input monitoring master switch (Settings checkbox).
+    pub fn set_monitor_on(&self, on: bool) {
+        self.monitor_on.store(on, Ordering::Relaxed);
+    }
+    pub fn monitor_on(&self) -> bool {
+        self.monitor_on.load(Ordering::Relaxed)
+    }
+    /// The pass-through gain actually applied to live input: the selected
+    /// track's amp when monitoring is on, hard zero when off. The RT mix
+    /// gates through the same atomic — pinned by
+    /// `monitoring_toggle_gates_live_input`.
+    pub fn monitor_amp(&self, sel_amp: f32) -> f32 {
+        if self.monitor_on.load(Ordering::Relaxed) {
+            sel_amp
+        } else {
+            0.0
+        }
     }
 
     pub fn set_loop_tl(&self, on: bool) {
@@ -1120,6 +1148,7 @@ fn run(
             }
             Ok(Cmd::Seek { pos }) => engine.seek_to(pos),
             Ok(Cmd::SetLoop(on)) => engine.set_loop_tl(on),
+            Ok(Cmd::SetMonitor(on)) => engine.set_monitor_on(on),
             Ok(Cmd::SetLoopRegion { start, end }) => engine.set_loop_region(start, end),
             Ok(Cmd::SetProject { assets, arr, len }) => {
                 engine.set_project(assets, arr, len);
@@ -1819,7 +1848,10 @@ impl ProcessHandler for Proc {
         // effect chain and pan shape the live pass-through (takes capture
         // the raw, unprocessed `src_in`).
         let sel = (self.engine.selected.load(Ordering::Relaxed) as usize).min(MAX_LOOPS - 1);
-        let (mon_amp, mon_l, mon_r) = (amp[sel], pgl[sel], pgr[sel]);
+        let (mut mon_amp, mon_l, mon_r) = (amp[sel], pgl[sel], pgr[sel]);
+        if !self.engine.monitor_on.load(Ordering::Relaxed) {
+            mon_amp = 0.0; // Settings → live input monitoring off
+        }
 
         // Compact list of recording tracks: the sample loop iterates only
         // these instead of all MAX_LOOPS slots per sample.
@@ -2331,6 +2363,19 @@ mod tests {
     /// discards its first `latency` input samples (so the button click that
     /// started it — a few ms late through the mic — lands at content[0]),
     /// while everything after the skip is captured live.
+    /// Live input monitoring defaults on and mutes ONLY the pass-through
+    /// gain when switched off (regression pin for the Settings toggle).
+    #[test]
+    fn monitoring_toggle_gates_live_input() {
+        let e = Engine::new();
+        assert!(e.monitor_on(), "monitoring defaults on (current behavior)");
+        assert_eq!(e.monitor_amp(0.75), 0.75);
+        e.set_monitor_on(false);
+        assert_eq!(e.monitor_amp(0.75), 0.0, "off mutes the pass-through");
+        e.set_monitor_on(true);
+        assert_eq!(e.monitor_amp(0.75), 0.75, "back on restores it");
+    }
+
     #[test]
     fn latency_skips_silence_at_recording_start() {
         let e = Engine::new();

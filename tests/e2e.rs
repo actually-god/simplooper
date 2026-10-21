@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, Control, MidiOut, Port, ProcessHandler,
-    ProcessScope, RawMidi,
+    AudioIn, AudioOut, Client, ClientOptions, Control, MidiOut, Port, ProcessHandler, ProcessScope,
+    RawMidi,
 };
 
 use slooper::arrange::{Arrangement, Clip};
@@ -65,7 +65,10 @@ fn start_backend() -> Option<(Backend, String, u32)> {
         |e| matches!(e, Evt::Ready { .. } | Evt::Unavailable(_) | Evt::Error(_)),
         Duration::from_secs(5),
     ) {
-        Some(Evt::Ready { client_name, sample_rate }) => Some((b, client_name, sample_rate)),
+        Some(Evt::Ready {
+            client_name,
+            sample_rate,
+        }) => Some((b, client_name, sample_rate)),
         Some(other) => {
             eprintln!("skipping: backend not ready ({other:?})");
             None
@@ -84,7 +87,7 @@ struct MixProc {
     b: Port<AudioOut>,
     sink: Port<AudioIn>,
     last_sample: Arc<AtomicU32>, // f32 bits of the newest sink sample
-    frames: Arc<AtomicU64>,     // process cycles handled
+    frames: Arc<AtomicU64>,      // process cycles handled
 }
 
 impl ProcessHandler for MixProc {
@@ -100,7 +103,8 @@ impl ProcessHandler for MixProc {
             b[i] = -0.125;
         }
         let sink = self.sink.as_slice(ps);
-        self.last_sample.store(sink[n - 1].to_bits(), Ordering::Relaxed);
+        self.last_sample
+            .store(sink[n - 1].to_bits(), Ordering::Relaxed);
         self.frames.fetch_add(1, Ordering::Relaxed);
         Control::Continue
     }
@@ -114,8 +118,8 @@ fn e2e_audio_mixing() {
     };
 
     // Test source client: two constant sources + one sink.
-    let (client, _status) = Client::new("mixer_test", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
+    let (client, _status) =
+        Client::new("mixer_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
     let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
     let out_b = client.register_port("out_b", AudioOut::default()).unwrap();
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
@@ -124,19 +128,25 @@ fn e2e_audio_mixing() {
     let frames = Arc::new(AtomicU64::new(0));
     let client_name = client.name().to_string();
     let active = client
-        .activate_async((), MixProc {
-            a: out_a,
-            b: out_b,
-            sink,
-            last_sample: last_sample.clone(),
-            frames: frames.clone(),
-        })
+        .activate_async(
+            (),
+            MixProc {
+                a: out_a,
+                b: out_b,
+                sink,
+                last_sample: last_sample.clone(),
+                frames: frames.clone(),
+            },
+        )
         .unwrap();
 
     // Apply the layout through the backend's command channel.
     // Route 3 = mono downmix (the historical output behaviour).
     b.cmd(Cmd::Apply {
-        ins: vec![format!("{client_name}:out_a"), format!("{client_name}:out_b")],
+        ins: vec![
+            format!("{client_name}:out_a"),
+            format!("{client_name}:out_b"),
+        ],
         outs: vec![(format!("{client_name}:sink"), 3)],
     });
     assert!(
@@ -156,13 +166,20 @@ fn e2e_audio_mixing() {
         if (observed - 0.125).abs() < 1e-4 {
             break;
         }
-        assert!(Instant::now() < deadline, "sink never reached 0.125 (last: {observed}, frames: {})", frames.load(Ordering::Relaxed));
+        assert!(
+            Instant::now() < deadline,
+            "sink never reached 0.125 (last: {observed}, frames: {})",
+            frames.load(Ordering::Relaxed)
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(frames.load(Ordering::Relaxed) > 0);
 
     // Teardown: stop the backend's audio, drop clients.
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
     let _ = active;
 }
 
@@ -185,7 +202,10 @@ impl ProcessHandler for MidiSrcProc {
         let msg = MESSAGES[(self.step % MESSAGES.len() as u32) as usize];
         // One message per cycle at the cycle head; advance regardless so a
         // transient full buffer can't wedge us on one message.
-        let _ = self.out.writer(ps).write(&RawMidi { time: 0, bytes: msg });
+        let _ = self.out.writer(ps).write(&RawMidi {
+            time: 0,
+            bytes: msg,
+        });
         self.step += 1;
         Control::Continue
     }
@@ -199,15 +219,26 @@ fn e2e_midi_monitor() {
     };
 
     // Source client with a MIDI out wired to slooper:midi_in.
-    let (client, _status) = Client::new("midi_test", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
-    let midi_out = client.register_port("midi_out", MidiOut::default()).unwrap();
+    let (client, _status) =
+        Client::new("midi_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let midi_out = client
+        .register_port("midi_out", MidiOut::default())
+        .unwrap();
     let src_name = client.name().to_string();
     client
-        .connect_ports_by_name(&format!("{src_name}:midi_out"), &format!("{client_name}:midi_in"))
+        .connect_ports_by_name(
+            &format!("{src_name}:midi_out"),
+            &format!("{client_name}:midi_in"),
+        )
         .expect("connect to slooper:midi_in");
     let active = client
-        .activate_async((), MidiSrcProc { out: midi_out, step: 0 })
+        .activate_async(
+            (),
+            MidiSrcProc {
+                out: midi_out,
+                step: 0,
+            },
+        )
         .unwrap();
 
     // Collect events until every expected message has been seen (parsed).
@@ -236,23 +267,48 @@ fn e2e_midi_monitor() {
     let note_on = seen.iter().find(|m| matches!(m, MidiMsg::NoteOn { .. }));
     assert_eq!(
         note_on,
-        Some(&MidiMsg::NoteOn { channel: 0, note: 60, velocity: 100 })
+        Some(&MidiMsg::NoteOn {
+            channel: 0,
+            note: 60,
+            velocity: 100
+        })
     );
-    let cc = seen.iter().find(|m| matches!(m, MidiMsg::ControlChange { .. }));
+    let cc = seen
+        .iter()
+        .find(|m| matches!(m, MidiMsg::ControlChange { .. }));
     assert_eq!(
         cc,
-        Some(&MidiMsg::ControlChange { channel: 1, number: 7, value: 128 })
+        Some(&MidiMsg::ControlChange {
+            channel: 1,
+            number: 7,
+            value: 128
+        })
     );
-    let pc = seen.iter().find(|m| matches!(m, MidiMsg::ProgramChange { .. }));
-    assert_eq!(pc, Some(&MidiMsg::ProgramChange { channel: 2, program: 11 }));
+    let pc = seen
+        .iter()
+        .find(|m| matches!(m, MidiMsg::ProgramChange { .. }));
+    assert_eq!(
+        pc,
+        Some(&MidiMsg::ProgramChange {
+            channel: 2,
+            program: 11
+        })
+    );
 
     // Display formatting sanity (what the GUI shows).
     let note_on = note_on.unwrap();
     assert_eq!(note_on.type_name(), "NOTE ON");
-    assert!(note_on.describe().contains("ch 01"), "{}", note_on.describe());
+    assert!(
+        note_on.describe().contains("ch 01"),
+        "{}",
+        note_on.describe()
+    );
     assert!(note_on.describe().contains("C4"), "{}", note_on.describe());
 
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
     let _ = active;
 }
 
@@ -273,7 +329,10 @@ struct SincoSrcProc {
 impl ProcessHandler for SincoSrcProc {
     fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
         let msg = SINCO_MESSAGES[(self.step % SINCO_MESSAGES.len() as u32) as usize];
-        let _ = self.out.writer(ps).write(&RawMidi { time: 0, bytes: msg });
+        let _ = self.out.writer(ps).write(&RawMidi {
+            time: 0,
+            bytes: msg,
+        });
         self.step += 1;
         Control::Continue
     }
@@ -306,9 +365,11 @@ fn e2e_midi_capture_and_fire_sinco() {
     app.drain_events();
 
     // Source client emulating SINCO MIDI 1, wired to slooper:midi_in.
-    let (client, _status) = Client::new("sinco_emu", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
-    let midi_out = client.register_port("midi_out", MidiOut::default()).unwrap();
+    let (client, _status) =
+        Client::new("sinco_emu", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let midi_out = client
+        .register_port("midi_out", MidiOut::default())
+        .unwrap();
     let src_name = client.name().to_string();
     client
         .connect_ports_by_name(
@@ -317,7 +378,13 @@ fn e2e_midi_capture_and_fire_sinco() {
         )
         .expect("connect to slooper:midi_in");
     let active = client
-        .activate_async((), SincoSrcProc { out: midi_out, step: 0 })
+        .activate_async(
+            (),
+            SincoSrcProc {
+                out: midi_out,
+                step: 0,
+            },
+        )
         .unwrap();
 
     // Pump App events until the first PC is captured and a repeated PC fires.
@@ -335,14 +402,34 @@ fn e2e_midi_capture_and_fire_sinco() {
     // accept any PC with value 1 or 2 on channels 0–3 — exactly what the SINCO
     // MIDI 1 sends.
     let expected: &[slooper::midi::MidiBind] = &[
-        slooper::midi::MidiBind { ty: 2, ch: 0, d1: 1 },
-        slooper::midi::MidiBind { ty: 2, ch: 1, d1: 2 },
-        slooper::midi::MidiBind { ty: 2, ch: 2, d1: 1 },
-        slooper::midi::MidiBind { ty: 2, ch: 3, d1: 2 },
+        slooper::midi::MidiBind {
+            ty: 2,
+            ch: 0,
+            d1: 1,
+        },
+        slooper::midi::MidiBind {
+            ty: 2,
+            ch: 1,
+            d1: 2,
+        },
+        slooper::midi::MidiBind {
+            ty: 2,
+            ch: 2,
+            d1: 1,
+        },
+        slooper::midi::MidiBind {
+            ty: 2,
+            ch: 3,
+            d1: 2,
+        },
     ];
     let captured = app.midi_bind_at(slot);
     assert!(
-        expected.contains(&captured.unwrap_or(slooper::midi::MidiBind { ty: 0, ch: 99, d1: 99 })),
+        expected.contains(&captured.unwrap_or(slooper::midi::MidiBind {
+            ty: 0,
+            ch: 99,
+            d1: 99
+        })),
         "armed slot must capture one of the SINCO PC patterns, got {captured:?}"
     );
     assert_eq!(
@@ -351,7 +438,10 @@ fn e2e_midi_capture_and_fire_sinco() {
         "a repeated matching PC must fire the bound action (select loop 2)"
     );
 
-    app.backend().cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    app.backend().cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
     let _ = active;
 }
 
@@ -392,8 +482,7 @@ impl ProcessHandler for LoopSrcProc {
         let sink = self.sink.as_slice(ps);
         let base = self.widx.load(Ordering::Relaxed) as usize;
         for (i, s) in sink.iter().enumerate() {
-            self.ring[(base + i) % self.ring.len()]
-                .store(s.to_bits(), Ordering::Relaxed);
+            self.ring[(base + i) % self.ring.len()].store(s.to_bits(), Ordering::Relaxed);
         }
         self.widx.fetch_add(n as u64, Ordering::Relaxed);
         Control::Continue
@@ -425,9 +514,7 @@ fn read_ring(
         (0..need)
             .map(|i| {
                 f32::from_bits(
-                    ring
-                        [((end - need as u64 + i as u64) % n) as usize]
-                        .load(Ordering::Relaxed),
+                    ring[((end - need as u64 + i as u64) % n) as usize].load(Ordering::Relaxed),
                 )
             })
             .collect::<Vec<f32>>(),
@@ -436,8 +523,7 @@ fn read_ring(
 
 /// Mean of the most recent `n` captured sink samples.
 fn ring_mean(ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, n: usize) -> Option<f32> {
-    read_ring(ring, widx, n, Duration::from_millis(500))
-        .map(|x| x.iter().sum::<f32>() / n as f32)
+    read_ring(ring, widx, n, Duration::from_millis(500)).map(|x| x.iter().sum::<f32>() / n as f32)
 }
 
 /// Poll `pred` until true or the timeout expires (panics on timeout).
@@ -460,14 +546,13 @@ fn e2e_transport_and_clips() {
     };
 
     let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
     let widx = Arc::new(AtomicU64::new(0));
     let mode = Arc::new(AtomicU8::new(0));
     let const_val = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
-    let (client, _status) = Client::new("daw_test", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
+    let (client, _status) =
+        Client::new("daw_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
     let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
     let src_name = client.name().to_string();
@@ -491,8 +576,12 @@ fn e2e_transport_and_clips() {
         outs: vec![(format!("{src_name}:sink"), 3)],
     });
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }), Duration::from_secs(5))
-            .is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
         "backend did not apply the 1-in/1-out layout"
     );
 
@@ -503,13 +592,21 @@ fn e2e_transport_and_clips() {
     let clip_len = 16_000u64;
     let total = 32_000u64; // two clip lengths: a real "project end"
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0.clone()]);
-    b.cmd(Cmd::SetProject { assets: table, arr: Arc::new(arr), len: total });
+    b.cmd(Cmd::SetProject {
+        assets: table,
+        arr: Arc::new(arr),
+        len: total,
+    });
     b.cmd(Cmd::SetLoop(true));
 
     // The transport is the only thing that makes clip sound: silent before.
     std::thread::sleep(Duration::from_millis(150));
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| m.abs() < 0.02)
+                .unwrap_or(false)
+        },
         Duration::from_secs(2),
         "silence before the transport starts",
     );
@@ -517,22 +614,37 @@ fn e2e_transport_and_clips() {
     // ---- play: the clip plays from position 0 -------------------------------
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| (m - 0.5).abs() < 0.05)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "transport playing the 0.5 clip",
     );
-    assert!(b.engine.transport_on(), "PlayAll did not set the transport flag");
+    assert!(
+        b.engine.transport_on(),
+        "PlayAll did not set the transport flag"
+    );
 
     // ---- a stopped track contributes nothing (clips stay placed) ------------
     b.cmd(Cmd::ToggleTrackOn { i: 0 });
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| m.abs() < 0.02)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "muting track 0 silences the mix",
     );
     b.cmd(Cmd::ToggleTrackOn { i: 0 });
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| (m - 0.5).abs() < 0.05)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "un-muting track 0 restores the clip",
     );
@@ -540,12 +652,20 @@ fn e2e_transport_and_clips() {
     // ---- stop holds the position; play resumes from it ----------------------
     b.cmd(Cmd::StopAll);
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Transport { on: false }), Duration::from_secs(2))
-            .is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Transport { on: false }),
+            Duration::from_secs(2)
+        )
+        .is_some(),
         "no Transport(off) event from StopAll"
     );
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| m.abs() < 0.02)
+                .unwrap_or(false)
+        },
         Duration::from_secs(2),
         "silence after StopAll",
     );
@@ -554,22 +674,36 @@ fn e2e_transport_and_clips() {
     assert_eq!(b.engine.pos(), held, "position moved while stopped");
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| (m - 0.5).abs() < 0.05)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "play again resumes from the held position (still inside the clip)",
     );
 
     // ---- seek past the clip end: silence, playhead still running ------------
-    b.cmd(Cmd::Seek { pos: clip_len + 4_000 });
+    b.cmd(Cmd::Seek {
+        pos: clip_len + 4_000,
+    });
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| m.abs() < 0.02).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| m.abs() < 0.02)
+                .unwrap_or(false)
+        },
         Duration::from_secs(2),
         "silence after seeking past the clip end",
     );
     // Seek back inside: sound returns immediately (scrub-scan works).
     b.cmd(Cmd::Seek { pos: 2_000 });
     wait_until(
-        || ring_mean(&ring, &widx, 480).map(|m| (m - 0.5).abs() < 0.05).unwrap_or(false),
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| (m - 0.5).abs() < 0.05)
+                .unwrap_or(false)
+        },
         Duration::from_secs(2),
         "sound after scrubbing back into the clip",
     );
@@ -578,26 +712,40 @@ fn e2e_transport_and_clips() {
     // Leave ~125 ms of runway, give the Seek command time to land, then
     // sample: 250 ms later the playhead MUST have passed the end and
     // reappeared at the top.
-    b.cmd(Cmd::Seek { pos: total - sr as u64 / 8 });
+    b.cmd(Cmd::Seek {
+        pos: total - sr as u64 / 8,
+    });
     std::thread::sleep(Duration::from_millis(50));
     let p0 = b.engine.pos();
     std::thread::sleep(Duration::from_millis(250));
-    assert!(b.engine.transport_on(), "looping transport must not stop at the end");
+    assert!(
+        b.engine.transport_on(),
+        "looping transport must not stop at the end"
+    );
     let p1 = b.engine.pos();
     assert!(p1 < p0, "no wrap: pos went {p0} -> {p1} with loop on");
 
     // ---- loop off: park at the end and stop ---------------------------------
     b.cmd(Cmd::SetLoop(false));
-    b.cmd(Cmd::Seek { pos: total - sr as u64 / 4 });
+    b.cmd(Cmd::Seek {
+        pos: total - sr as u64 / 4,
+    });
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Transport { on: false }), Duration::from_secs(3))
-            .is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Transport { on: false }),
+            Duration::from_secs(3)
+        )
+        .is_some(),
         "non-looping transport did not stop at the project end"
     );
     let parked = b.engine.pos();
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(b.engine.pos(), parked, "parked playhead must hold");
-    assert!(parked >= total - sr as u64 / 2, "parked far before the end: {parked}");
+    assert!(
+        parked >= total - sr as u64 / 2,
+        "parked far before the end: {parked}"
+    );
     b.cmd(Cmd::SetLoop(true));
 
     // ---- recording produces a take (Evt::Take), not loop state --------------
@@ -621,11 +769,20 @@ fn e2e_transport_and_clips() {
         data.len()
     );
     let mean = data.iter().sum::<f32>() / data.len() as f32;
-    assert!((mean - 0.25).abs() < 0.03, "take captured mean {mean}, expected 0.25");
-    assert!(at.saturating_sub(at0) < sr as u64, "take start {at} far from playhead {at0}");
+    assert!(
+        (mean - 0.25).abs() < 0.03,
+        "take captured mean {mean}, expected 0.25"
+    );
+    assert!(
+        at.saturating_sub(at0) < sr as u64,
+        "take start {at} far from playhead {at0}"
+    );
 
     b.cmd(Cmd::StopAll);
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
     let _ = active;
 }
 
@@ -672,9 +829,17 @@ fn metro_clicks(x: &[f32], sr: u32) -> Vec<(usize, u8)> {
     while i < x.len() {
         if armed && x[i].abs() > thr {
             let end = (i + win).min(x.len());
-            let zc = (i + 1..end).filter(|&k| (x[k] >= 0.0) != (x[k - 1] >= 0.0)).count();
+            let zc = (i + 1..end)
+                .filter(|&k| (x[k] >= 0.0) != (x[k - 1] >= 0.0))
+                .count();
             let f = zc as f32 * sr as f32 / (2.0 * (end - i) as f32);
-            let tone = if f > 1450.0 { 0 } else if f > 1000.0 { 1 } else { 2 };
+            let tone = if f > 1450.0 {
+                0
+            } else if f > 1000.0 {
+                1
+            } else {
+                2
+            };
             out.push((i, tone));
             armed = false;
             quiet = 0;
@@ -704,22 +869,35 @@ fn e2e_metronome() {
     };
 
     let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
     let widx = Arc::new(AtomicU64::new(0));
 
-    let (client, _status) = Client::new("metro_test", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
+    let (client, _status) =
+        Client::new("metro_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
     let src_name = client.name().to_string();
     let active = client
-        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
         .unwrap();
 
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![(format!("{src_name}:sink"), 3)] });
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
-            .is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
         "metronome test: output not applied"
     );
     // Let the sink settle on silence before arming the click.
@@ -736,7 +914,12 @@ fn e2e_metronome() {
     // 120 BPM, eighth-note subdivision, 4 beats per measure.
     let beat = sr as usize / 2; // samples per quarter note
     let start = widx.load(Ordering::Relaxed);
-    b.cmd(Cmd::SetMetro { on: true, bpm: 120, sub: 2, num: 4 });
+    b.cmd(Cmd::SetMetro {
+        on: true,
+        bpm: 120,
+        sub: 2,
+        num: 4,
+    });
     std::thread::sleep(Duration::from_millis(2600)); // ~5 beats
     let x = read_range(start, widx.load(Ordering::Relaxed));
     let clicks = metro_clicks(&x, sr);
@@ -758,7 +941,8 @@ fn e2e_metronome() {
     );
     for (k, &want) in expect.iter().enumerate() {
         assert_eq!(
-            clicks[k].1, want,
+            clicks[k].1,
+            want,
             "click {k} has tone {} ({} Hz-class), expected {want} at {:.3} s",
             clicks[k].1,
             [1760, 1175, 880][clicks[k].1 as usize],
@@ -784,7 +968,12 @@ fn e2e_metronome() {
 
     // --- Phase 2: subdivision change applies on the next quarter note ------
     let start2 = widx.load(Ordering::Relaxed);
-    b.cmd(Cmd::SetMetro { on: true, bpm: 120, sub: 4, num: 4 });
+    b.cmd(Cmd::SetMetro {
+        on: true,
+        bpm: 120,
+        sub: 4,
+        num: 4,
+    });
     std::thread::sleep(Duration::from_millis(1500)); // 3 more beats
     let end2 = widx.load(Ordering::Relaxed);
     let x2 = read_range(start2, end2);
@@ -806,7 +995,12 @@ fn e2e_metronome() {
     }
 
     // --- Phase 3: stop silences the click -----------------------------------
-    b.cmd(Cmd::SetMetro { on: false, bpm: 120, sub: 4, num: 4 });
+    b.cmd(Cmd::SetMetro {
+        on: false,
+        bpm: 120,
+        sub: 4,
+        num: 4,
+    });
     std::thread::sleep(Duration::from_millis(400));
     let start3 = widx.load(Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(600));
@@ -816,7 +1010,10 @@ fn e2e_metronome() {
         "metronome still clicking after stop"
     );
 
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
     let _ = active;
 }
 
@@ -839,9 +1036,20 @@ fn e2e_export_writes_file() {
     let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 4_000]);
     let mut arr = Arrangement::new();
     arr.insert(0, 0, Clip { asset: 0, pos: 0 });
-    arr.insert(0, 1, Clip { asset: 1, pos: 4_000 });
+    arr.insert(
+        0,
+        1,
+        Clip {
+            asset: 1,
+            pos: 4_000,
+        },
+    );
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0, a1]);
-    b.cmd(Cmd::SetProject { assets: table, arr: Arc::new(arr), len: 12_000 });
+    b.cmd(Cmd::SetProject {
+        assets: table,
+        arr: Arc::new(arr),
+        len: 12_000,
+    });
 
     let dir = std::env::temp_dir().join(format!("slooper-e2e-export-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -849,7 +1057,11 @@ fn e2e_export_writes_file() {
     let stem = dir.join("mix");
 
     // Track export: both lanes of track 0, engine-rate mixdown.
-    b.cmd(Cmd::ExportTrack { i: 0, path: stem.clone(), fmt: ExportFormat::Wav });
+    b.cmd(Cmd::ExportTrack {
+        i: 0,
+        path: stem.clone(),
+        fmt: ExportFormat::Wav,
+    });
     let got = wait_for(
         &b,
         |e| matches!(e, Evt::Notice(m) if m.contains("exported")),
@@ -858,15 +1070,28 @@ fn e2e_export_writes_file() {
     assert!(got.is_some(), "no export Notice for a track with clips");
     let file = stem.with_extension("wav"); // extension from the format
     let samples = slooper::audio_io::decode_to_mono(&file, sr).expect("exported wav decodes");
-    assert!(samples.len() >= 12_000, "export shorter than the project: {}", samples.len());
+    assert!(
+        samples.len() >= 12_000,
+        "export shorter than the project: {}",
+        samples.len()
+    );
     // [0,4000): only the 0.5 clip; [4000,8000): both lanes summed; then silence.
     let seg = |a: usize, c: usize| samples[a..c].iter().sum::<f32>() / (c - a) as f32;
     assert!((seg(0, 4_000) - 0.5).abs() < 0.02, "lane 0 only");
-    assert!((seg(4_000, 8_000) - 0.75).abs() < 0.02, "lanes stack additively");
-    assert!(seg(8_000, 12_000).abs() < 1e-6, "silence past the last clip");
+    assert!(
+        (seg(4_000, 8_000) - 0.75).abs() < 0.02,
+        "lanes stack additively"
+    );
+    assert!(
+        seg(8_000, 12_000).abs() < 1e-6,
+        "silence past the last clip"
+    );
 
     // Whole-project export: nothing is playing, but placement is the truth.
-    b.cmd(Cmd::ExportProject { path: dir.join("whole"), fmt: ExportFormat::Wav });
+    b.cmd(Cmd::ExportProject {
+        path: dir.join("whole"),
+        fmt: ExportFormat::Wav,
+    });
     let got = wait_for(
         &b,
         |e| matches!(e, Evt::Notice(m) if m.contains("exported project")),
@@ -876,28 +1101,44 @@ fn e2e_export_writes_file() {
     assert!(dir.join("whole.wav").exists(), "project wav missing");
 
     // Empty track / empty project must fail loudly, not write silence.
-    b.cmd(Cmd::ExportTrack { i: 7, path: dir.join("none"), fmt: ExportFormat::Wav });
+    b.cmd(Cmd::ExportTrack {
+        i: 7,
+        path: dir.join("none"),
+        fmt: ExportFormat::Wav,
+    });
     let err = wait_for(
         &b,
         |e| matches!(e, Evt::Error(m) if m.contains("no placed clips")),
         Duration::from_secs(2),
     );
-    assert!(err.is_some(), "empty-track export must report 'no placed clips'");
-    assert!(!dir.join("none.wav").exists(), "no file may be written for an empty track");
+    assert!(
+        err.is_some(),
+        "empty-track export must report 'no placed clips'"
+    );
+    assert!(
+        !dir.join("none.wav").exists(),
+        "no file may be written for an empty track"
+    );
 
     b.cmd(Cmd::SetProject {
         assets: Arc::new(vec![]),
         arr: Arc::new(Arrangement::new()),
         len: 4_800,
     });
-    b.cmd(Cmd::ExportProject { path: dir.join("empty"), fmt: ExportFormat::Wav });
+    b.cmd(Cmd::ExportProject {
+        path: dir.join("empty"),
+        fmt: ExportFormat::Wav,
+    });
     let err = wait_for(
         &b,
         |e| matches!(e, Evt::Error(m) if m.contains("no clips placed")),
         Duration::from_secs(2),
     );
     assert!(err.is_some(), "empty-project export must report an error");
-    assert!(!dir.join("empty.wav").exists(), "no file for an empty project");
+    assert!(
+        !dir.join("empty.wav").exists(),
+        "no file for an empty project"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -916,10 +1157,8 @@ fn e2e_selected_loop_monitoring() {
     };
 
     let ring_n = 1usize << 16;
-    let ring_l: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_r: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_l: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_r: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
     let widx = Arc::new(AtomicU64::new(0));
 
     struct MonCapProc {
@@ -947,8 +1186,8 @@ fn e2e_selected_loop_monitoring() {
         }
     }
 
-    let (client, _status) = Client::new("mon_test", ClientOptions::NO_START_SERVER)
-        .expect("no JACK server");
+    let (client, _status) =
+        Client::new("mon_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
     let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
     let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
     let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
@@ -975,10 +1214,18 @@ fn e2e_selected_loop_monitoring() {
     b.cmd(Cmd::SetSelected(0));
     b.cmd(Cmd::Apply {
         ins: vec![format!("{src_name}:out_a")],
-        outs: vec![(format!("{src_name}:sink_l"), 1), (format!("{src_name}:sink_r"), 2)],
+        outs: vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
     });
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Applied { .. }), Duration::from_secs(5)).is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { .. }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
         "layout not applied"
     );
 
@@ -1009,6 +1256,16 @@ fn e2e_selected_loop_monitoring() {
     expect(&ring_l, want, "left bus after selection switch");
     expect(&ring_r, want, "right bus after selection switch");
 
+    // Settings → live input monitoring (Cmd::SetMonitor): off mutes the
+    // pass-through while every level stays put; on brings it straight back.
+    b.cmd(Cmd::SetMonitor(false));
+    expect(&ring_l, 0.0, "left bus after monitoring off");
+    expect(&ring_r, 0.0, "right bus after monitoring off");
+    b.cmd(Cmd::SetMonitor(true));
+    let want = 0.5f32 * std::f32::consts::FRAC_1_SQRT_2;
+    expect(&ring_l, want, "left bus after monitoring back on");
+    expect(&ring_r, want, "right bus after monitoring back on");
+
     // Silence via volume must silence monitoring too.
     b.engine.set_loop_vol(1, 0.0);
     expect(&ring_l, 0.0, "left bus after vol 0");
@@ -1016,6 +1273,9 @@ fn e2e_selected_loop_monitoring() {
 
     b.engine.set_loop_vol(0, 1.0);
     b.engine.set_loop_pan(0, 0.5);
-    b.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
     let _ = active;
 }
