@@ -42,7 +42,7 @@ use crate::assets::{Asset, RackFolder};
 use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS, TR_REC,
 };
-use crate::config::{Config, MidiAxisCal, MidiBinding, TrackFxSave};
+use crate::config::{Config, MidiAxisCal, MidiBinding, TrackFxSave, VstSave};
 use crate::fx;
 use crate::midipat::{Pattern, PPQ};
 use crate::midi::{hex, scale_axis, MidiAction, MidiBind, MidiMsg};
@@ -597,6 +597,21 @@ pub struct App {
     fx_entries: Vec<Vec<fx::UiEntry>>,
     fx_live: Vec<Vec<std::sync::Arc<fx::Instance>>>,
     fx_window: Option<usize>,
+    /// VST insert window (track index).
+    vst_window: Option<usize>,
+    /// Scan of all VST folders (lazy on first window open, manual Rescan).
+    vst_scan: Vec<crate::vsthost::VstEntry>,
+    vst_scanned: bool,
+    /// User-set extra VST folders (config); the system defaults are always
+    /// scanned on top of these.
+    vst_dirs: Vec<String>,
+    /// One-line feedback under the folder row.
+    vst_note: String,
+    /// Per-track live inserts (shared handles; params ride their atomics).
+    vst_slots: Vec<Option<std::sync::Arc<crate::vsthost::RtStageEntry>>>,
+    /// Per-track insert save metadata (path/kind/name; params are read from
+    /// the live slot at save time).
+    vst_saved: Vec<Option<VstSave>>,
     fx_editor: Option<Box<crate::fxgui::FxEditor>>,
     fx_dir_edit: String,
     fx_note: String,
@@ -822,6 +837,15 @@ impl App {
             fx_entries,
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
+            vst_window: None,
+            vst_scan: Vec::new(),
+            vst_scanned: false,
+            vst_dirs: cfg.vst_dirs.clone(),
+            vst_note: String::new(),
+            vst_slots: (0..MAX_LOOPS).map(|_| None).collect(),
+            vst_saved: (0..MAX_LOOPS)
+                .map(|i| cfg.track_vst.get(i).cloned().flatten())
+                .collect(),
             fx_editor: None,
             fx_dir_edit: fx_dir.display().to_string(),
             fx_note: String::new(),
@@ -1780,6 +1804,84 @@ impl App {
         self.save_config();
     }
 
+    /// Replace (or clear) a track's VST insert. Loading happens on this
+    /// (UI) thread — same as every other window action — and the entry is
+    /// handed to the engine, which runs it until the next replace.
+    fn set_track_vst(
+        &mut self,
+        t: usize,
+        entry: Option<std::sync::Arc<crate::vsthost::RtStageEntry>>,
+        save: Option<VstSave>,
+    ) {
+        self.vst_slots[t] = entry.clone();
+        self.vst_saved[t] = save;
+        self.backend.cmd(Cmd::SetTrackVst { i: t, entry });
+        self.save_config();
+    }
+
+    /// Open a plugin picked from the scan list.
+    fn pick_vst(&mut self, t: usize, e: &crate::vsthost::VstEntry) {
+        let sr = self.sample_rate.max(48_000);
+        match crate::vsthost::open(&e.path, e.kind, sr, None) {
+            Ok(load) => {
+                self.vst_note = format!("loaded {}", e.name);
+                let save = VstSave {
+                    path: e.path.to_string_lossy().into_owned(),
+                    kind: e.kind.tag().to_string(),
+                    name: e.name.clone(),
+                    params: Vec::new(),
+                };
+                self.set_track_vst(t, Some(load.entry), Some(save));
+            }
+            Err(err) => self.vst_note = format!("{}: {err}", e.name),
+        }
+    }
+
+    /// Reopen a persisted insert at startup (or after a failed start).
+    fn open_saved_vst(&mut self, t: usize, save: &VstSave) {
+        let Some(kind) = crate::vsthost::VstKind::parse(&save.kind) else {
+            return;
+        };
+        let path = std::path::Path::new(&save.path);
+        if !(path.is_file() || path.is_dir()) {
+            return;
+        }
+        let sr = self.sample_rate.max(48_000);
+        match crate::vsthost::open(path, kind, sr, Some(&save.params)) {
+            Ok(load) => {
+                let entry = load.entry.clone();
+                self.vst_slots[t] = Some(load.entry);
+                self.backend.cmd(Cmd::SetTrackVst { i: t, entry: Some(entry) });
+            }
+            Err(err) => {
+                self.vst_note = format!("{}: {err}", save.name);
+                self.vst_saved[t] = None;
+            }
+        }
+    }
+
+    /// Rescan the system folders plus the user's extra folders. Loads every
+    /// plugin once (metadata), so it runs on explicit click / first window
+    /// open, never per frame.
+    fn vst_rescan(&mut self) {
+        let mut dirs = crate::vsthost::default_vst_dirs();
+        for d in &self.vst_dirs {
+            let p = std::path::PathBuf::from(d);
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+        let t0 = std::time::Instant::now();
+        self.vst_scan = crate::vsthost::scan(&dirs);
+        self.vst_scanned = true;
+        let n = self.vst_scan.iter().filter(|e| e.error.is_none()).count();
+        self.vst_note = format!(
+            "{n} plugin(s) from {} folder(s) in {:.1}s",
+            dirs.len(),
+            t0.elapsed().as_secs_f32()
+        );
+    }
+
     /// Persist every user-facing setting (bindings, mixer, grid, rack,
     /// ports, effects chains) to disk.
     fn save_config(&self) {
@@ -1853,6 +1955,17 @@ impl App {
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
+            vst_dirs: self.vst_dirs.clone(),
+            track_vst: (0..MAX_LOOPS)
+                .map(|i| {
+                    let save = self.vst_saved[i].clone()?;
+                    let params = self.vst_slots[i]
+                        .as_ref()
+                        .map(|e| (0..e.params().len()).map(|k| e.params().get(k)).collect())
+                        .unwrap_or_default();
+                    Some(VstSave { params, ..save })
+                })
+                .collect(),
             track_fx: (0..MAX_LOOPS)
                 .map(|i| {
                     self.fx_entries[i]
@@ -3229,6 +3342,15 @@ impl App {
                         self.rebuild_fx(t);
                     }
                 }
+                // Saved VST inserts load now that the rate is known (a
+                // plugin whose file vanished simply stays unset).
+                for t in 0..MAX_LOOPS {
+                    if self.vst_slots[t].is_none() {
+                        if let Some(save) = self.vst_saved[t].clone() {
+                            self.open_saved_vst(t, &save);
+                        }
+                    }
+                }
                 // Re-apply the port bindings persisted from the previous
                 // session so audio flows on launch without re-clicking.
                 if let Some((ins, outs)) = &self.applied_ports {
@@ -3453,6 +3575,13 @@ impl eframe::App for App {
             changed = true;
         }
 
+        // Late VST releases: plugins replaced or removed since the last
+        // tick drop here, so destructors (and the VST3 teardown the runner
+        // hands off) run on the creating thread, never the audio thread.
+        for e in self.backend.engine.drain_vst_held() {
+            drop(e);
+        }
+
         let p = f32::from_bits(self.backend.peak.load(Ordering::Relaxed));
         self.peak_disp = p.max(self.peak_disp * 0.9);
 
@@ -3579,6 +3708,9 @@ impl App {
         knob_learn_window(ui, self);
         if self.fx_window.is_some() {
             effects_window(ui, self);
+        }
+        if self.vst_window.is_some() {
+            vst_window(ui, self);
         }
         if self.fx_editor.is_some() {
             self.fx_editor_window(ui);
@@ -4227,6 +4359,16 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             .clicked()
         {
             app.fx_window = Some(t);
+        }
+        if ui
+            .small_button("VST")
+            .on_hover_text(
+                "This track's VST insert: pick a plugin, adjust its sliders, \
+                 manage the scan folders",
+            )
+            .clicked()
+        {
+            app.vst_window = Some(t);
         }
         fx_buttons(ui, app, t);
     });
@@ -5819,6 +5961,158 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
 /// enabled ones (enabled effects snap to the top of the list, in chain
 /// order), plus rescan / add-template helpers. Rejected scripts are listed
 /// with their compile/load error so effect authors can fix them.
+/// VST insert window: per-track plugin pick + sliders, plus the folder
+/// manager that feeds the scan. Mirrors the effects window's layout.
+fn vst_window(ui: &mut egui::Ui, app: &mut App) {
+    let Some(track) = app.vst_window else { return };
+    if !app.vst_scanned {
+        app.vst_rescan();
+    }
+    let mut open = true;
+    egui::Window::new(RichText::new(format!("VST — track {}", track + 1)).strong())
+        .open(&mut open)
+        .min_width(560.0)
+        .default_height(440.0)
+        .show(ui, |ui| {
+            // --- folders ---------------------------------------------------
+            ui.label("VST folders:");
+            if app.vst_dirs.is_empty() {
+                ui.label(RichText::new("(standard system folders only)").weak().small());
+            }
+            for (i, d) in app.vst_dirs.clone().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(d).monospace().small());
+                    if ui.small_button("×").on_hover_text("Remove this folder").clicked() {
+                        app.vst_dirs.remove(i);
+                        app.vst_scanned = false;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Add folder…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().set_title("VST folder").pick_folder() {
+                        let d = p.to_string_lossy().into_owned();
+                        if !app.vst_dirs.contains(&d) {
+                            app.vst_dirs.push(d);
+                            app.vst_scanned = false;
+                        }
+                    }
+                }
+                if ui.button("Rescan").clicked() {
+                    app.vst_rescan();
+                }
+            });
+            if !app.vst_note.is_empty() {
+                ui.label(RichText::new(&app.vst_note).weak().small());
+            }
+            ui.separator();
+
+            // --- insert + sliders, or plugin picker --------------------------
+            match app.vst_slots[track].clone() {
+                Some(slot) => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(slot.name()).strong());
+                        if ui
+                            .small_button("Remove")
+                            .on_hover_text("Drop the insert from this track")
+                            .clicked()
+                        {
+                            app.set_track_vst(track, None, None);
+                        }
+                    });
+                    let writable: Vec<(usize, String)> = slot
+                        .descs()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.writable)
+                        .map(|(k, d)| (k, d.name.clone()))
+                        .collect();
+                    if writable.is_empty() {
+                        ui.label(RichText::new("(no controllable parameters)").weak().small());
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (k, name) in writable {
+                                let mut v = slot.params().get(k);
+                                let r = ui.add(
+                                    egui::Slider::new(&mut v, 0.0..=1.0)
+                                        .text(name)
+                                        .show_value(false)
+                                        .custom_formatter(|x, _| format!("{:.0}%", x * 100.0)),
+                                );
+                                if r.changed() {
+                                    slot.set_param(k, v);
+                                }
+                            }
+                        });
+                }
+                None => {
+                    if app.vst_scan.iter().all(|e| e.error.is_some()) {
+                        ui.label(
+                            RichText::new(
+                                "No plugins found — add the folder your plugins live in \
+                                 (drag-and-drop installs included) and press Rescan.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(330.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for e in app.vst_scan.clone() {
+                                if let Some(err) = &e.error {
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled_ui(false, |ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "[{}] {}",
+                                                    e.kind.tag(),
+                                                    e.name
+                                                ))
+                                                .weak(),
+                                            );
+                                        });
+                                        let short: String = err.chars().take(60).collect();
+                                        ui.label(
+                                            RichText::new(format!("× {}", short.replace('\n', " · ")))
+                                                .color(Color32::from_rgb(220, 120, 120))
+                                                .small(),
+                                        )
+                                        .on_hover_text(err.clone());
+                                    });
+                                } else if ui
+                                    .button(format!(
+                                        "[{}] {} — {}",
+                                        e.kind.tag(),
+                                        e.name,
+                                        e.vendor
+                                    ))
+                                    .clicked()
+                                {
+                                    app.pick_vst(track, &e);
+                                }
+                            }
+                        });
+                }
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(
+                    "The insert runs after this track's effects chain, before its pan/volume. \
+                     VST2 (`.so`) and VST3 (`.vst3`) instruments and effects are hosted \
+                     in-process; sliders control the plugin's own parameters.",
+                )
+                .weak()
+                .small(),
+            );
+        });
+    app.vst_window = if open { Some(track) } else { None };
+}
+
 fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     let Some(loop_i) = app.fx_window else { return };
     let mut open = true;
@@ -7695,4 +7989,80 @@ mod tests {
         app.save_piano_roll(&mut pat, 2);
         assert!(app.assets.last().unwrap().name.contains("roll-2"));
     }
+
+    /// VST insert regression pin: the mixer "VST" chip opens the per-track
+    /// window, the folder-scanned plugin list renders, and clicking a row
+    /// loads the plugin into App state (the same path hands it to the
+    /// engine) and persists it. Uses a private scan folder; skips without
+    /// a local plugin.
+    #[test]
+    fn vst_chip_opens_window_and_loads_picked_plugin() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plugin = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
+        if !plugin.is_file() {
+            eprintln!("skipping vst pin: no VST2 test plugin installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sp-vstpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&plugin, dir.join("dfhall.so")).unwrap();
+
+        let mut app = headless_app("vstpin");
+        // Isolate the default scan dirs (default_vst_dirs follows $HOME);
+        // the suite runs one-threaded and HOME is restored below.
+        std::env::set_var("HOME", &dir);
+        app.vst_dirs = vec![dir.to_string_lossy().into_owned()];
+        let ctx = egui::Context::default();
+
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "VST").expect("VST chip painted on the mixer");
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.vst_window, Some(0), "chip opens the track's VST window");
+
+        // The first window frame ran the sync scan; locate the plugin row.
+        let q = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let mut q = None;
+            for cs in &out.shapes {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text().contains("Dragonfly") {
+                        q = Some(t.pos + t.galley.rect.center().to_vec2());
+                        break;
+                    }
+                }
+            }
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            q
+        };
+        let q = q.expect("scanned plugin row listed in the window");
+        frame(&mut app, &ctx, vec![moved(q)]);
+        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        std::env::set_var("HOME", &home);
+        assert!(app.vst_slots[0].is_some(), "picked plugin loaded and wired to the track");
+        assert!(app.vst_note.contains("loaded"), "{}", app.vst_note);
+        // Persisted state must survive a config round-trip.
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        let saved = cfg.track_vst.first().and_then(|o| o.as_ref());
+        assert!(
+            saved.is_some_and(|s| s.path.contains("dfhall.so") && s.kind == "VST2"
+                && !s.name.is_empty()),
+            "saved insert round-trips: "
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

@@ -29,6 +29,7 @@ pub mod project;
 pub mod quantize;
 pub mod samples808;
 pub mod synth;
+pub mod vsthost;
 pub mod synth_api;
 pub mod ui;
 

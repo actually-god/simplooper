@@ -31,8 +31,23 @@ pub struct MidiAxisCal {
     pub hi: u8,
 }
 
+/// A track's VST insert: plugin path + kind, plus normalized slider values
+/// in load order. If the plugin file is gone at next start, the track
+/// simply comes up without the insert.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VstSave {
+    pub path: String,
+    /// "VST2" or "VST3".
+    pub kind: String,
+    /// Display name (UI only; the plugin file is authoritative).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub params: Vec<f32>,
+}
+
 /// One enabled effect in a track's saved chain (script stem + slider values,
-/// in chain order). The stem is the key: dropping scripts is always safe.
+/// in chain order). The stem is the key: dropping scripts are always safe.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackFxSave {
     pub stem: String,
@@ -159,6 +174,13 @@ pub struct Config {
     /// chain order (each stem + its slider values).
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
+    /// Extra VST search folders (user-set; the standard system folders are
+    /// always scanned on top of these).
+    #[serde(default)]
+    pub vst_dirs: Vec<String>,
+    /// Per-track VST insert, index = track (None = no insert).
+    #[serde(default)]
+    pub track_vst: Vec<Option<VstSave>>,
     /// Per-track synth bindings: script stem ("" / None = default piano)
     /// plus saved slider values, index = track. Tracks beyond the
     /// configured count keep their bindings untouched.
@@ -209,6 +231,8 @@ impl Default for Config {
             rack_folders: Vec::new(),
             fx_dir: String::new(),
             track_fx: Vec::new(),
+            vst_dirs: Vec::new(),
+            track_vst: Vec::new(),
             track_synth: Vec::new(),
             track_synth_params: Vec::new(),
         }
@@ -414,6 +438,13 @@ mod tests {
             trk_pan: vec![64, 20],
             track_synth: vec![None, Some("piano".into())],
             track_synth_params: vec![vec![], vec![0.2]],
+            vst_dirs: vec!["/tmp/vst".into()],
+            track_vst: vec![None, Some(VstSave {
+                path: "/tmp/vst/thing.vst3".into(),
+                kind: "VST3".into(),
+                name: "Thing".into(),
+                params: vec![0.4],
+            })],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -434,6 +465,10 @@ mod tests {
         assert_eq!(back.ports_out, cfg.ports_out);
         assert_eq!(back.ports_out_lr, cfg.ports_out_lr);
         assert_eq!(back.trk_vol, cfg.trk_vol);
+        assert_eq!(back.vst_dirs, cfg.vst_dirs);
+        assert_eq!(back.track_vst.len(), 2);
+        let v = back.track_vst[1].clone().unwrap();
+        assert_eq!((v.path.as_str(), v.kind.as_str(), v.params.as_slice()), ("/tmp/vst/thing.vst3", "VST3", &[0.4f32][..]));
         assert_eq!(back.trk_gain, cfg.trk_gain);
         assert_eq!(back.trk_pan, cfg.trk_pan);
         assert!(!back.preview_on, "preview toggle round-trips");

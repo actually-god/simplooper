@@ -53,6 +53,13 @@ rusty_flac = "0.2"
 # Native file dialogs for import/export (XDG portal / GTK / Qt on Linux).
 rfd = "0.17"
 libloading = "0.8"
+# VST hosting: VST3 backend (loaded plugins run through its realtime runner)
+# and the vendored, host-patched VST2 backend (vendor/vst2, see VENDOR-NOTES).
+vst3-host = { version = "0.10", default-features = false }
+vst2 = { path = "vendor/vst2" }
+
+[workspace]
+members = ["vendor/vst2"]
 
 [profile.release]
 lto = true

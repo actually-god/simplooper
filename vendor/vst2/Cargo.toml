@@ -1,0 +1,31 @@
+# Vendored vst-rs 0.4.0 (RustAudio/vst-rs, MIT) — see VENDOR-NOTES.md.
+# Patches over the released crate:
+#   * renamed to `vst2` (the published `vst` crate shares its name with a
+#     different archived project; a local name avoids any registry collision)
+#   * libloading 0.8 (was 0.7) so one libloading version rules the process
+#   * entry symbol: `VSTPluginMain` with a `main` fallback (DPF plugins only
+#     export `main`; the released loader rejects them)
+#   * PluginInstance::get_chunk / set_chunk (VST2.4 effGetChunk/effSetChunk)
+#     for host-side state persistence
+#   * deprecation warnings silenced by default (upstream archived 2023)
+# The plugin-side macro machinery and examples were dropped; slooper only
+# ever acts as a host.
+[package]
+edition = "2021"
+name = "vst2"
+version = "0.4.0"
+description = "VST 2.4 host API (vendored vst-rs, host-only patches)"
+license = "MIT"
+repository = "https://github.com/rustaudio/vst-rs"
+
+[dependencies]
+bitflags = "1"
+libc = "0.2"
+libloading = "0.8"
+log = "0.4"
+num-traits = "0.2"
+num_enum = "0.5.2"
+
+[features]
+default = ["disable_deprecation_warning"]
+disable_deprecation_warning = []

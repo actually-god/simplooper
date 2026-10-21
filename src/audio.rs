@@ -204,6 +204,12 @@ pub enum Cmd {
     /// Set the fallback synth (bundled piano) used by tracks with no
     /// explicit binding.
     SetDefaultSynth(Option<Arc<crate::synth::Instance>>),
+    /// Bind/unbind one track's VST stage entry (loaded on the UI thread;
+    /// the engine runs it until replaced).
+    SetTrackVst {
+        i: usize,
+        entry: Option<Arc<crate::vsthost::RtStageEntry>>,
+    },
     /// Write a track's rendered contribution (all its lanes, engine-rate
     /// mixdown of the current project) to `path` in format `fmt`. Runs on
     /// the manager thread; a Notice/Error event reports the outcome.
@@ -495,6 +501,15 @@ pub struct Engine {
     synths: std::sync::Mutex<Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]>>,
     synths_gen: AtomicU64,
     default_synth: std::sync::Mutex<Option<Arc<crate::synth::Instance>>>,
+    /// Per-track VST stage entries + generation (same shape as `synths`).
+    /// A displaced entry is *held* in `vst_held` instead of dropping where
+    /// the swap happened: plugin destructors (and the VST3 COM teardown the
+    /// runner hands off) must run on the creating (UI) thread. The UI drains
+    /// held entries once the audio cache has caught up (`vst_refreshed`).
+    vsts: std::sync::Mutex<Arc<[Option<Arc<crate::vsthost::RtStageEntry>>; MAX_LOOPS]>>,
+    vsts_gen: AtomicU64,
+    vst_refreshed: AtomicU64,
+    vst_held: std::sync::Mutex<Vec<Arc<crate::vsthost::RtStageEntry>>>,
     /// Jack rate, published once at connect (drives tick math + samplers).
     sample_rate: AtomicU32,
 
@@ -559,6 +574,10 @@ impl Engine {
             synths: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
             synths_gen: AtomicU64::new(0),
             default_synth: std::sync::Mutex::new(None),
+            vsts: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
+            vsts_gen: AtomicU64::new(0),
+            vst_refreshed: AtomicU64::new(0),
+            vst_held: std::sync::Mutex::new(Vec::new()),
             sample_rate: AtomicU32::new(0),
             metro_on: AtomicU8::new(0),
             metro_bpm: AtomicU32::new(120),
@@ -851,6 +870,41 @@ impl Engine {
         self.default_synth.lock().unwrap().clone()
     }
 
+    /// Bind/unbind one track's VST stage entry. The displaced entry is held
+    /// (not dropped) until the UI thread collects it via [`Self::drain_vst_held`].
+    pub fn set_track_vst(&self, i: usize, entry: Option<Arc<crate::vsthost::RtStageEntry>>) {
+        if i >= MAX_LOOPS {
+            return;
+        }
+        if let Ok(mut g) = self.vsts.lock() {
+            let mut next = g.clone();
+            let slot = &mut Arc::make_mut(&mut next)[i];
+            if let Some(old) = slot.take() {
+                self.vst_held.lock().unwrap().push(old);
+            }
+            *slot = entry;
+            *g = next;
+            self.vsts_gen.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn vsts(&self) -> Arc<[Option<Arc<crate::vsthost::RtStageEntry>>; MAX_LOOPS]> {
+        self.vsts.lock().unwrap().clone()
+    }
+    pub fn vst_gen(&self) -> u64 {
+        self.vsts_gen.load(Ordering::Relaxed)
+    }
+    /// Hand replaced entries back to the UI thread — but only once the audio
+    /// cache has caught up with every swap, so the final reference of each
+    /// plugin dies on the caller's (UI) thread rather than mid-swap on the
+    /// audio thread.
+    pub fn drain_vst_held(&self) -> Vec<Arc<crate::vsthost::RtStageEntry>> {
+        if self.vst_gen() == self.vst_refreshed.load(Ordering::Relaxed) {
+            core::mem::take(&mut *self.vst_held.lock().unwrap())
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The synth a track actually renders through (binding, else default).
     fn synth_for(&self, t: usize) -> Option<Arc<crate::synth::Instance>> {
         self.synths()
@@ -937,6 +991,19 @@ impl Engine {
 
     /// Render one track's contribution (all lanes; the track's play/stop
     /// flag is ignored when a track export is explicitly requested).
+    /// Open a *private* copy of a track's VST insert for offline rendering:
+    /// same path/kind, current slider values. The live instance is never
+    /// touched (the audio thread owns it), so exports and the running mix
+    /// cannot interfere.
+    pub fn spawn_vst_private(&self, t: usize) -> Option<Arc<crate::vsthost::RtStageEntry>> {
+        let live = self.vsts.lock().ok()?.get(t)?.clone()?;
+        let (path, kind) = live.spec().clone();
+        let params: Vec<f32> = (0..live.params().len()).map(|k| live.params().get(k)).collect();
+        crate::vsthost::open(&path, kind, self.sample_rate().max(1), Some(&params))
+            .ok()
+            .map(|l| l.entry)
+    }
+
     pub fn render_track(&self, t: usize) -> Option<Vec<f32>> {
         self.render_tracks(Some(t), self.proj_len() as usize)
     }
@@ -961,6 +1028,13 @@ impl Engine {
             let (pgl, pgr) = pan_gains(self.loop_pan(t));
             let pdown = (pgl + pgr) * F1S2;
             let chain = self.fx.lock().unwrap()[t].clone();
+            // With a VST insert, the track's full contribution (all clips)
+            // accumulates here first: the plugin must run continuously over
+            // the track span so tails ring past the last clip, exactly like
+            // the live mix. pdown/pan apply after the insert.
+            let pv = self.spawn_vst_private(t);
+            let mut trk: Vec<f32> =
+                if pv.is_some() { vec![0.0f32; len.max(1)] } else { Vec::new() };
             let midi = self.midi();
             // MIDI clips first: the whole track's patterns through one fresh
             // synth, then through the same track FX + gain as audio clips.
@@ -986,13 +1060,24 @@ impl Engine {
                         .iter()
                         .filter_map(|s| s.inst.spawn_fresh(&s.desc))
                         .collect();
-                    for (k, x) in buf.into_iter().enumerate().take(out.len()) {
+                    let sbuf: Vec<f32> = buf
+                        .into_iter()
+                        .take(out.len())
+                        .map(|x| {
+                            let mut s = x * tamp;
+                            for f in &fx {
+                                s = f.process_private(s);
+                            }
+                            s
+                        })
+                        .collect();
+                    for (k, s) in sbuf.into_iter().enumerate() {
                         any = true;
-                        let mut s = x * tamp;
-                        for f in &fx {
-                            s = f.process_private(s);
+                        if pv.is_some() {
+                            trk[k] += s;
+                        } else {
+                            out[k] += s * pdown;
                         }
-                        out[k] += s * pdown;
                     }
                 }
             }
@@ -1020,7 +1105,6 @@ impl Engine {
                     // Trimmed start shifts the read offset; `play_len` past
                     // the source contributes silence (nothing summed).
                     let alen = data.len() as u64;
-                    let start = cl.pos as usize;
                     let dstart = (cl.pos + cl.cut).min(cl.pos + alen) as usize;
                     let dend = cl
                         .data_end(alen)
@@ -1028,12 +1112,24 @@ impl Engine {
                         .min(len as u64)
                         .max(cl.pos + cl.cut) as usize;
                     let dend = dend.max(dstart);
-                    for k in start..dend {
-                        // `start` may sit left of dstart? never: dstart >= pos.
-                        if k >= dstart && k < data.len() + dstart {
-                            out[k] += mix(data[k - dstart]) * pdown;
+                    // `start` may sit left of dstart? never: dstart >= pos.
+                    let hi = dend.min(dstart + data.len());
+                    for (j, k) in (dstart..hi).enumerate() {
+                        any = true;
+                        let m = mix(data[j]);
+                        if pv.is_some() {
+                            trk[k] += m;
+                        } else {
+                            out[k] += m * pdown;
                         }
                     }
+                }
+            }
+            if pv.is_some() {
+                // Insert pass over the full track span (tails survive clips).
+                vst_chunk(pv.as_deref(), &mut trk);
+                for (k, s) in trk.into_iter().enumerate() {
+                    out[k] += s * pdown;
                 }
             }
         }
@@ -1088,6 +1184,7 @@ impl Engine {
             let (pgl, pgr) = pan_gains(self.loop_pan(*t));
             let pdown = (pgl + pgr) * F1S2;
             let chain = chains[*t].clone();
+            let pv = self.spawn_vst_private(*t);
             // MIDI clip: fresh synth copy + fresh chain, same treatment as
             // an audio clip (phase 0, live state untouched).
             if let Some(Some(pat)) = midi.get(cl.asset as usize) {
@@ -1101,11 +1198,18 @@ impl Engine {
                         .iter()
                         .filter_map(|s| s.inst.spawn_fresh(&s.desc))
                         .collect();
-                    for (k, x) in buf.into_iter().enumerate() {
-                        let mut s2 = x * tamp;
-                        for f in &fx {
-                            s2 = f.process_private(s2);
-                        }
+                    let mut sbuf: Vec<f32> = buf
+                        .into_iter()
+                        .map(|x| {
+                            let mut s2 = x * tamp;
+                            for f in &fx {
+                                s2 = f.process_private(s2);
+                            }
+                            s2
+                        })
+                        .collect();
+                    vst_chunk(pv.as_deref(), &mut sbuf);
+                    for (k, s2) in sbuf.into_iter().enumerate() {
                         out[k] += s2 * pdown;
                     }
                 }
@@ -1133,9 +1237,12 @@ impl Engine {
                 .data_end(alen_u)
                 .min(cl.end(alen_u))
                 .min(cl.pos + alen_u);
-            for k in dstart..(dend as usize) {
+            let hi = (dend as usize).min(dstart + data.len());
+            let mut chunk: Vec<f32> = data[..hi - dstart].iter().map(|x| mix(*x)).collect();
+            vst_chunk(pv.as_deref(), &mut chunk);
+            for (j, k) in (dstart..hi).enumerate() {
                 let o = (k - from as usize).min(len - 1);
-                out[o] += mix(data[k - dstart]) * pdown;
+                out[o] += chunk[j] * pdown;
             }
         }
         Some((from, out))
@@ -1314,6 +1421,13 @@ fn run(
         clip_buf: Vec::new(),
         synths_cache: engine.synths(),
         synths_cache_gen: engine.synths_gen(),
+        vsts_cache: engine.vsts(),
+        vsts_cache_gen: 0,
+        mix_l: Vec::new(),
+        mix_r: Vec::new(),
+        trk_bufs: vec![Vec::new(); MAX_LOOPS],
+        mon_buf: Vec::new(),
+        vst_tmp: Vec::new(),
         dflt_synth: engine.default_synth(),
         midi_cache: engine.midi(),
         midi_cache_gen: engine.midi_gen(),
@@ -1408,6 +1522,7 @@ fn run(
                 engine.set_track_synth(i.min(MAX_LOOPS - 1), synth)
             }
             Ok(Cmd::SetDefaultSynth(s)) => engine.set_default_synth(s),
+            Ok(Cmd::SetTrackVst { i, entry }) => engine.set_track_vst(i, entry),
             Ok(Cmd::ExportTrack { i, path, fmt }) => {
                 let i = i.min(MAX_LOOPS - 1);
                 match engine.render_track(i) {
@@ -1891,6 +2006,17 @@ unsafe impl Send for ClipEntry {}
 /// Stage one MIDI pattern clip's events into a shared list, keyed by
 /// ABSOLUTE timeline sample (kind: 0=note-off 1=CC 2=pressure 3=note-on).
 /// Shared by the offline renders; the RT path stages per block inline.
+/// Pass a render chunk through a track's private VST copy (offline export);
+/// a no-op when the track has no insert. Fresh per clip, mirroring the
+/// scripted-FX export rule (every clip starts at phase 0; the live chain is
+/// never advanced).
+fn vst_chunk(e: Option<&crate::vsthost::RtStageEntry>, chunk: &mut [f32]) {
+    if let Some(e) = e {
+        let src = chunk.to_vec();
+        e.process(&src, chunk);
+    }
+}
+
 fn stage_midi_events(
     pat: &crate::midipat::Pattern,
     cl: &crate::arrange::Clip,
@@ -2194,6 +2320,19 @@ struct Proc {
     synths_cache: Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]>,
     synths_cache_gen: u64,
     dflt_synth: Option<Arc<crate::synth::Instance>>,
+    // ---- VST inserts -------------------------------------------------------
+    vsts_cache: Arc<[Option<Arc<crate::vsthost::RtStageEntry>>; MAX_LOOPS]>,
+    vsts_cache_gen: u64,
+    /// Per-block pre-master mix. With VST inserts the sample loop cannot
+    /// write the ports directly any more (a track's sum has to pass through
+    /// its plugin before panning), so the block mix lands here and the port
+    /// writes move to a post-loop pass — for every block, uniform path.
+    mix_l: Vec<f32>,
+    mix_r: Vec<f32>,
+    /// Held-back track sums (tracks with a VST insert) and monitor tap.
+    trk_bufs: Vec<Vec<f32>>,
+    mon_buf: Vec<f32>,
+    vst_tmp: Vec<f32>,
     /// MIDI pattern table (parallel to `assets`; refreshed on `midi_gen`).
     midi_cache: Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>,
     midi_cache_gen: u64,
@@ -2386,6 +2525,15 @@ impl ProcessHandler for Proc {
         }
         self.preview_live = self.engine.preview_on.load(Ordering::Relaxed) != 0;
 
+        let vg = self.engine.vst_gen();
+        if vg != self.vsts_cache_gen {
+            if let Ok(g) = self.engine.vsts.try_lock() {
+                self.vsts_cache = g.clone();
+                self.vsts_cache_gen = vg;
+                self.engine.vst_refreshed.store(vg, Ordering::Relaxed);
+            }
+        }
+
         // Per-track output trim (volume x gain, linear) snapshotted once per
         // cycle; applied to each clip's PLAYBACK contribution only, so the
         // mix level rides the slider while recorded takes stay at raw input.
@@ -2459,6 +2607,9 @@ impl ProcessHandler for Proc {
             }
             if let Some(d) = &self.dflt_synth {
                 d.all_off();
+            }
+            for e in self.vsts_cache.iter().flatten() {
+                e.flush();
             }
         }
         let mut p0 = self.pos;
@@ -2612,11 +2763,46 @@ impl ProcessHandler for Proc {
         let has_entries = !entries.is_empty();
         let mut mixer_live = clip_sound;
         if transport && !mixer_live {
-            mixer_live =
-                (0..MAX_LOOPS).any(|t| self.engine.track_on(t) && !self.fx_cache[t].is_empty());
+            mixer_live = (0..MAX_LOOPS).any(|t| {
+                self.engine.track_on(t)
+                    && (!self.fx_cache[t].is_empty() || self.vsts_cache[t].is_some())
+            });
         }
         // Per-track sample accumulators for the clip mix.
         let mut acc = [0.0f32; MAX_LOOPS];
+
+        // Tracks whose sums must pass through a VST insert before the pan,
+        // plus the monitor tap when the monitored track has its own insert.
+        let mut vst_mask = [false; MAX_LOOPS];
+        for t in 0..MAX_LOOPS {
+            vst_mask[t] = audible[t] && self.vsts_cache[t].is_some();
+        }
+        let sel_vst = audible[sel] && self.vsts_cache[sel].is_some();
+        let has_vst = vst_mask.iter().any(|v| *v) || sel_vst;
+
+        // Per-block mix buffers (taken out of self so the sample loop can
+        // call `&mut self` effect code freely; `clip_buf` uses the same trick).
+        let mut mix_l = std::mem::take(&mut self.mix_l);
+        let mut mix_r = std::mem::take(&mut self.mix_r);
+        let mut trk_bufs = std::mem::take(&mut self.trk_bufs);
+        let mut mon_buf = std::mem::take(&mut self.mon_buf);
+        let mut vst_tmp = std::mem::take(&mut self.vst_tmp);
+        mix_l.clear();
+        mix_l.resize(n, 0.0);
+        mix_r.clear();
+        mix_r.resize(n, 0.0);
+        vst_tmp.clear();
+        vst_tmp.resize(n, 0.0);
+        for (t, buf) in trk_bufs.iter_mut().enumerate() {
+            buf.clear();
+            if vst_mask[t] {
+                buf.resize(n, 0.0);
+            }
+        }
+        if sel_vst {
+            mon_buf.clear();
+            mon_buf.resize(n, 0.0);
+        }
 
         let mut peak_val: u32 = 0;
         let mut pos_now = self.pos;
@@ -2678,8 +2864,14 @@ impl ProcessHandler for Proc {
                 for (t, &a) in acc.iter().enumerate() {
                     if audible[t] {
                         let m = self.fx_mix(t, a * amp[t]);
-                        play_l += m * pgl[t];
-                        play_r += m * pgr[t];
+                        if vst_mask[t] {
+                            // Held back: the plugin consumes this pre-pan
+                            // post-fx sum after the sample loop.
+                            trk_bufs[t][i] = m;
+                        } else {
+                            play_l += m * pgl[t];
+                            play_r += m * pgr[t];
+                        }
                     }
                 }
             }
@@ -2754,13 +2946,63 @@ impl ProcessHandler for Proc {
             // Live input rides the selected track's chain/trim/pan; the click
             // always sits dead centre. At unity trim and centre pan the L/R
             // pair still sums to the historical unity mono mix.
-            let mon = self.fx_mix(sel, src_in * mon_amp);
+            // The monitored chain still runs every sample (tails decay);
+            // with a VST insert on the monitored track its output is held
+            // back for the plugin instead of feeding the mix directly.
+            let mut mon = 0.0f32;
+            if sel_vst {
+                mon_buf[i] = self.fx_mix(sel, src_in * mon_amp);
+            } else {
+                mon = self.fx_mix(sel, src_in * mon_amp);
+            }
             let clickc = click * F1S2;
-            let v_l = (mon * mon_l + clickc + play_l + pvc) * g;
-            let v_r = (mon * mon_r + clickc + play_r + pvc) * g;
-            // The output mix is NEVER delayed: what the user hears stays
-            // exactly on the timeline grid (latency compensation only trims
-            // the start of a fresh take — see `Engine::rec_sample`).
+            // Pre-master, pre-gain mix; ports get written post-loop (once any
+            // VST inserts have run). The output mix is NEVER delayed: what
+            // the user hears stays exactly on the timeline grid (latency
+            // compensation only trims the start of a fresh take — see
+            // `Engine::rec_sample`).
+            mix_l[i] = mon * mon_l + clickc + play_l + pvc;
+            mix_r[i] = mon * mon_r + clickc + play_r + pvc;
+
+            // Advance the transport clock (only while running).
+            if live && advance {
+                pos_now += 1;
+            }
+        }
+
+        // VST inserts: process the held-back track sums (pre-pan) and the
+        // monitor tap, folding each plugin's mono output into the mix.
+        if has_vst {
+            for t in 0..MAX_LOOPS {
+                if !vst_mask[t] {
+                    continue;
+                }
+                if let Some(e) = &self.vsts_cache[t] {
+                    let (buf, tmp) = (&trk_bufs[t], &mut vst_tmp);
+                    e.process(buf, tmp);
+                    for i in 0..n {
+                        mix_l[i] += tmp[i] * pgl[t];
+                        mix_r[i] += tmp[i] * pgr[t];
+                    }
+                }
+            }
+            if sel_vst {
+                if let Some(e) = &self.vsts_cache[sel] {
+                    let tmp = &mut vst_tmp;
+                    e.process(&mon_buf, tmp);
+                    for i in 0..n {
+                        mix_l[i] += tmp[i] * mon_l;
+                        mix_r[i] += tmp[i] * mon_r;
+                    }
+                }
+            }
+        }
+
+        // Master gain + port writes (moved out of the sample loop so VST
+        // inserts can run before the mix leaves the callback).
+        for i in 0..n {
+            let v_l = mix_l[i] * g;
+            let v_r = mix_r[i] * g;
             let av = v_l.abs().max(v_r.abs());
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
@@ -2777,12 +3019,14 @@ impl ProcessHandler for Proc {
             for b in &out_bufs_r[..nr] {
                 unsafe { *b.add(i) = v_r };
             }
-
-            // Advance the transport clock (only while running).
-            if live && advance {
-                pos_now += 1;
-            }
         }
+
+        // Give the per-block buffers back for the next block.
+        self.mix_l = mix_l;
+        self.mix_r = mix_r;
+        self.trk_bufs = trk_bufs;
+        self.mon_buf = mon_buf;
+        self.vst_tmp = vst_tmp;
 
         // Give the clip window list back for the next block.
         self.clip_buf = entries;

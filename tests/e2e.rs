@@ -1276,3 +1276,97 @@ fn e2e_selected_loop_monitoring() {
     });
     let _ = active;
 }
+
+// ------------------------------------------------------------------- vst ---
+
+/// VST inserts on the export path. A constant burst on a track carrying a
+/// real reverb plugin must produce a tail after the clip end — exactly where
+/// the same render without the insert is silent — proving the private-copy
+/// render path opens, processes, and parameterises real VST2/VST3 binaries.
+/// Skips itself when no plugin is installed (CI).
+#[test]
+fn e2e_vst_insert_export() {
+    use slooper::audio_io::ExportFormat;
+    use slooper::vsthost::{open, VstKind};
+    let _g = e2e_lock();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let plugin = [
+        format!("{home}/.vst3/DragonflyHallReverb.vst3"),
+        format!("{home}/.vst/DragonflyHallReverb-vst.so"),
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .find(|p| p.exists());
+    let Some(plugin) = plugin else { return }; // no plugin installed: skip
+    let kind = if plugin.extension().is_some_and(|e| e == "vst3") {
+        VstKind::V3
+    } else {
+        VstKind::V2
+    };
+    let Some((b, _cn, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    // 4k-sample constant burst on track 0; 16k-sample project leaves a 12k
+    // tail window that is provably dry-silent without the insert.
+    let a0: Arc<[f32]> = Arc::from(vec![0.3f32; 4_000]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![a0]),
+        arr: Arc::new(arr),
+        len: 16_000,
+    });
+
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-vst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let export = |name: &str| {
+        b.cmd(Cmd::ExportTrack {
+            i: 0,
+            path: dir.join(name),
+            fmt: ExportFormat::Wav,
+        });
+        let got = wait_for(
+            &b,
+            |e| matches!(e, Evt::Notice(m) if m.contains("exported")),
+            Duration::from_secs(5),
+        );
+        assert!(got.is_some(), "no export Notice ({name})");
+        slooper::audio_io::decode_to_mono(&dir.join(format!("{name}.wav")), sr)
+            .expect("exported wav decodes")
+    };
+
+    let dry = export("dry");
+    let energy = |x: &[f32]| x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    assert!(energy(&dry[8_000..]) < 1e-9, "dry tail must be silence");
+
+    // Attach the reverb (same open path the UI uses) and export again.
+    let load = open(&plugin, kind, sr, None).expect("open reverb plugin");
+    b.cmd(Cmd::SetTrackVst {
+        i: 0,
+        entry: Some(load.entry.clone()),
+    });
+    // Same command queue: the export below necessarily runs after the swap.
+
+    let wet = export("wet");
+    assert!(wet.iter().all(|v| v.is_finite()), "non-finite samples");
+    assert!(energy(&wet[..4_000]) > 1e-4, "wet body must carry audio");
+    assert!(
+        energy(&wet[8_000..]) > 1e-8,
+        "reverb insert must leave a tail where the dry render is silent"
+    );
+
+    // Removing the insert restores the dry export.
+    b.cmd(Cmd::SetTrackVst { i: 0, entry: None });
+    drop(load);
+    let back = export("back");
+    assert!(energy(&back[8_000..]) < 1e-9, "tail gone after removing insert");
+
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(Arrangement::new()),
+        len: 4_800,
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
