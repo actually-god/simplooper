@@ -100,6 +100,11 @@ pub struct Project {
     /// Configured number of tracks (v3; absent on older files → default).
     #[serde(default)]
     pub n_tracks: Option<usize>,
+    /// Per-track synth stems + slider values (index = track).
+    #[serde(default)]
+    pub track_synths: Vec<Option<String>>,
+    #[serde(default)]
+    pub track_synth_params: Vec<Vec<f32>>,
 }
 
 impl Project {
@@ -214,6 +219,8 @@ mod tests {
                 lanes: vec![vec![ProjClip { asset: 0, pos: 0, cut: 0, play_len: None }], vec![]],
             }],
             assets: vec![ProjAsset { name: "kick".into(), file: "/x/kick.wav".into() }],
+            track_synths: vec![Some("piano".into())],
+            track_synth_params: vec![vec![0.5]],
         }
     }
 
@@ -255,6 +262,8 @@ mod tests {
         assert_eq!(back.tracks[0].lanes[0][0].pos, 0);
         assert_eq!(back.tracks[0].fx[0].stem, "template");
         assert_eq!(back.assets[0].file, "/x/kick.wav");
+        assert_eq!(back.n_tracks, Some(16));
+        assert_eq!(back.track_synths, vec![Some("piano".into())]);
         // Wrong magic is rejected with a clear message.
         let bad = dir.join("bad.slooper");
         std::fs::write(&bad, r#"{"format":"nope","version":1}"#).unwrap();

@@ -335,6 +335,11 @@ pub enum MidiAction {
     /// left, 64 = centre, 127 = hard right; equal-power law). Value
     /// semantics as [`MidiAction::VolLoop`].
     PanLoop(usize),
+    /// Toggle MIDI-pattern recording on track `i`: while armed, every
+    /// incoming MIDI message that is NOT bound to an action is captured
+    /// into a pattern; disarming bounces it to an asset + clip (like an
+    /// audio take).
+    MidiRec(usize),
     /// Catch-all for action names this build no longer knows (see the enum
     /// doc); never bindable, never fired.
     #[serde(other)]
@@ -351,9 +356,9 @@ impl MidiAction {
     /// v0.2 reshaped this table when overdub/import/dependent/undo/redo were
     /// removed; the old positional tables (length 140 / 25 / 9) are remapped
     /// on load (see `ui::migrate_shortcuts`). New actions must be APPENDED.
-    pub const ALL: [MidiAction; 121] = {
+    pub const ALL: [MidiAction; 137] = {
         // const-friendly construction: the layout is fully arithmetic.
-        let mut a = [MidiAction::Reserved; 121];
+        let mut a = [MidiAction::Reserved; 137];
         a[0] = MidiAction::RecSelected;
         a[1] = MidiAction::ClearSelected;
         a[2] = MidiAction::PlaySelected;
@@ -367,6 +372,8 @@ impl MidiAction {
             a[73 + i * 2] = MidiAction::VolLoop(i);
             a[74 + i * 2] = MidiAction::GainLoop(i);
             a[105 + i] = MidiAction::PanLoop(i);
+            // APPENDED family (old 121-entry tables stay valid unchanged).
+            a[121 + i] = MidiAction::MidiRec(i);
             i += 1;
         }
         a[68] = MidiAction::Metronome;
@@ -401,6 +408,7 @@ impl MidiAction {
             MidiAction::VolLoop(i) => format!("track {}: volume (knob)", i + 1),
             MidiAction::GainLoop(i) => format!("track {}: gain (knob)", i + 1),
             MidiAction::PanLoop(i) => format!("track {}: pan (knob)", i + 1),
+            MidiAction::MidiRec(i) => format!("track {}: MIDI record", i + 1),
             MidiAction::Reserved => String::new(),
         }
     }

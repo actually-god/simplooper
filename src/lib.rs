@@ -23,10 +23,13 @@ pub mod config;
 pub mod fx;
 pub mod fxgui;
 pub mod midi;
+pub mod midipat;
 pub mod ports;
 pub mod project;
 pub mod quantize;
 pub mod samples808;
+pub mod synth;
+pub mod synth_api;
 pub mod ui;
 
 pub use midi::{MidiAction, MidiBind, MidiMsg};

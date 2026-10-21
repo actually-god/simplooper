@@ -159,6 +159,13 @@ pub struct Config {
     /// chain order (each stem + its slider values).
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
+    /// Per-track synth bindings: script stem ("" / None = default piano)
+    /// plus saved slider values, index = track. Tracks beyond the
+    /// configured count keep their bindings untouched.
+    #[serde(default)]
+    pub track_synth: Vec<Option<String>>,
+    #[serde(default)]
+    pub track_synth_params: Vec<Vec<f32>>,
     /// Number of tracks the program exposes (clamped 1..=16). Per-track
     /// levels and bindings are kept for ALL 16 slots regardless, so raising
     /// the count again restores everything that was configured while a
@@ -202,6 +209,8 @@ impl Default for Config {
             rack_folders: Vec::new(),
             fx_dir: String::new(),
             track_fx: Vec::new(),
+            track_synth: Vec::new(),
+            track_synth_params: Vec::new(),
         }
     }
 }
@@ -403,6 +412,8 @@ mod tests {
             trk_h: vec![120.0],
             trk_gain: vec![80, 60],
             trk_pan: vec![64, 20],
+            track_synth: vec![None, Some("piano".into())],
+            track_synth_params: vec![vec![], vec![0.2]],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();

@@ -44,7 +44,9 @@ use crate::audio::{
 };
 use crate::config::{Config, MidiAxisCal, MidiBinding, TrackFxSave};
 use crate::fx;
+use crate::midipat::{Pattern, PPQ};
 use crate::midi::{hex, scale_axis, MidiAction, MidiBind, MidiMsg};
+use crate::synth;
 use crate::project::{self, ProjAsset, ProjClip, ProjMetro, ProjQuantize, ProjTrack, Project};
 use crate::quantize::{self, snap_start};
 
@@ -240,6 +242,34 @@ pub fn pan01(m: u8) -> f32 {
 /// L/R routing byte of output `i`, defaulting to the mono downmix.
 fn cfg_lr(v: &[u8], i: usize) -> u8 {
     *v.get(i).unwrap_or(&3)
+}
+
+/// Live MIDI-pattern recording state for one track. Events land in `evs`
+/// tagged with the ABSOLUTE engine position they arrived at; disarming
+/// rebases them into a pattern (kind: 0=note-off 1=CC 2=pressure 3=note-on).
+#[derive(Clone, Default)]
+struct MidiRecState {
+    armed: bool,
+    start: u64,
+    evs: Vec<(u64, u8, u8, u8, u8)>,
+}
+
+/// Floating piano-roll editor (the top-bar "Piano roll" window). Notes are
+/// drawn on a snap grid exactly like the timeline: drag on empty space draws
+/// a note, drag on a note moves it, right-click deletes.
+struct PianoRoll {
+    pat: Pattern,
+    /// Horizontal zoom (px per beat) and row height (px per semitone).
+    px_per_beat: f32,
+    row_h: f32,
+    /// Lowest visible piano key.
+    lo_note: u8,
+    /// Horizontal scroll in seconds.
+    scroll_sec: f64,
+    changed: bool,
+    /// In-flight note gesture: (note index, offset of the grab point
+    /// inside the note, seconds-per-snap at grab time).
+    drag: Option<(usize, f64)>,
 }
 
 /// In-flight three-step calibration for one continuous (knob) MIDI binding.
@@ -550,6 +580,18 @@ pub struct App {
     save_draft: String,
     show_load: bool,
 
+    // --- MIDI subsystem (patterns, synths, recording, piano roll) ---
+    synth_registry: synth::Registry,
+    /// Per-track bound synth stem (None/"" = default piano fallback).
+    track_synth: Vec<Option<String>>,
+    track_synth_params: Vec<Vec<f32>>,
+    /// Live instances (mirrors `track_synth`; also pushed into the engine).
+    track_synth_inst: Vec<Option<Arc<synth::Instance>>>,
+    /// Track whose synth sliders window is open.
+    synth_win: Option<usize>,
+    midi_rec: Vec<MidiRecState>,
+    piano_roll: Option<Box<PianoRoll>>,
+
     // --- per-track effects framework ---
     fx_registry: fx::Registry,
     fx_entries: Vec<Vec<fx::UiEntry>>,
@@ -688,6 +730,16 @@ impl App {
             f.rescan();
         }
         let sub_idx = |v: u32| SUBDIVISIONS.iter().position(|(c, _)| *c == v).unwrap_or(3);
+        let synth_registry = synth::Registry::open(synth::default_dir());
+        let mut track_synth: Vec<Option<String>> = Vec::with_capacity(MAX_LOOPS);
+        let mut track_synth_params: Vec<Vec<f32>> = Vec::with_capacity(MAX_LOOPS);
+        let mut track_synth_inst: Vec<Option<Arc<synth::Instance>>> = Vec::with_capacity(MAX_LOOPS);
+        for t in 0..MAX_LOOPS {
+            let stem = cfg.track_synth.get(t).cloned().flatten().filter(|s| !s.is_empty());
+            track_synth.push(stem);
+            track_synth_params.push(cfg.track_synth_params.get(t).cloned().unwrap_or_default());
+            track_synth_inst.push(None);
+        }
         Self {
             backend,
             status: "starting…".into(),
@@ -759,6 +811,13 @@ impl App {
             show_save_prompt: false,
             save_draft: String::new(),
             show_load: false,
+            synth_registry,
+            track_synth,
+            track_synth_params,
+            track_synth_inst,
+            synth_win: None,
+            midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
+            piano_roll: None,
             fx_registry,
             fx_entries,
             fx_live: vec![Vec::new(); MAX_LOOPS],
@@ -1349,7 +1408,10 @@ impl App {
     fn asset_len(&self, id: u32) -> u64 {
         self.assets
             .get(id as usize)
-            .map(|a| a.data.len() as u64)
+            .map(|a| match &a.pattern {
+                Some(pat) => pat.len_samples(self.sample_rate.max(1)),
+                None => a.data.len() as u64,
+            })
             .unwrap_or(0)
     }
 
@@ -1369,6 +1431,11 @@ impl App {
     /// already auditioning stops it. Engine-side the buffer auto-stops at
     /// its end, so `preview_playing` is only ever a hair stale.
     fn preview_asset(&mut self, k: usize) {
+        // MIDI patterns audition through the default synth instead.
+        if self.assets.get(k).is_some_and(|a| a.is_midi()) {
+            self.audition_pattern(k);
+            return;
+        }
         if !self.preview_enabled {
             return;
         }
@@ -1497,6 +1564,9 @@ impl App {
             arr,
             len,
         });
+        let midi: Arc<Vec<Option<Arc<Pattern>>>> =
+            Arc::new(self.assets.iter().map(|a| a.pattern.clone()).collect());
+        self.backend.cmd(Cmd::SetMidiAssets(midi));
         // "current longest" / "whole song" regions follow the arrangement.
         self.send_loop_region();
     }
@@ -1795,6 +1865,8 @@ impl App {
                         .collect()
                 })
                 .collect(),
+            track_synth: self.track_synth.clone(),
+            track_synth_params: self.track_synth_params.clone(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
@@ -1802,6 +1874,763 @@ impl App {
     }
 
     // ---- DAW actions -----------------------------------------------------
+
+    /// Primary rack folder (where recordings are written); "" when none.
+    fn primary_folder(&self) -> PathBuf {
+        PathBuf::from(self.rack.first().map(|f| f.path.trim()).unwrap_or("").to_string())
+    }
+
+    /// (Re)create track `t`'s synth instance from its binding and push it
+    /// into the engine. Empty binding = "no synth" (engine plays through
+    /// the default piano fallback). Returns success.
+    fn rebuild_track_synth(&mut self, t: usize) -> bool {
+        let inst = match self.track_synth[t].as_deref().filter(|s| !s.is_empty()) {
+            Some(stem) => {
+                let desc = match self.synth_registry.desc(stem) {
+                    Some(d) => d.clone(),
+                    None => {
+                        self.status = format!("synth: “{stem}” not loaded (see synths folder)");
+                        return false;
+                    }
+                };
+                let vals = synth::seed_values(&self.track_synth_params[t], &desc);
+                self.track_synth_params[t] = vals.clone();
+                self.synth_registry
+                    .create_instance(stem, self.sample_rate.max(1) as f64, &vals)
+            }
+            None => None,
+        };
+        self.backend.cmd(Cmd::SetTrackSynth { i: t, synth: inst.clone() });
+        self.track_synth_inst[t] = inst;
+        true
+    }
+
+    /// Bind a synth stem (or "" = default piano) to a track; persistent.
+    fn set_track_synth_stem(&mut self, t: usize, stem: &str) {
+        self.track_synth[t] = if stem.is_empty() { None } else { Some(stem.to_string()) };
+        self.track_synth_params[t].clear();
+        self.rebuild_track_synth(t);
+        self.save_config();
+        self.status = format!(
+            "track {}: synth {}",
+            t + 1,
+            if stem.is_empty() { "default (piano)" } else { stem }
+        );
+    }
+
+    /// Recreate every bound synth plus the shared default piano instance
+    /// (called once the sample rate is known, and after project loads).
+    fn rebuild_all_synths(&mut self) {
+        if self.sample_rate == 0 {
+            return; // instances are created at Evt::Ready
+        }
+        let dflt = self.synth_registry.create_instance("piano", self.sample_rate as f64, &[]);
+        self.backend.cmd(Cmd::SetDefaultSynth(dflt));
+        for t in 0..MAX_LOOPS {
+            self.rebuild_track_synth(t);
+        }
+    }
+
+    /// Arm/disarm MIDI pattern recording on a track. Arming starts the
+    /// transport (the pattern clock is the transport); disarming bounces
+    /// what was captured into an asset + clip, like an audio take.
+    fn toggle_midi_rec(&mut self, i: usize) {
+        if self.sample_rate == 0 {
+            self.status = "MIDI rec: wait for the audio engine".into();
+            return;
+        }
+        let armed = &mut self.midi_rec[i];
+        if armed.armed {
+            self.commit_midi_rec(i);
+        } else {
+            *armed = MidiRecState {
+                armed: true,
+                start: self.backend.engine.pos(),
+                evs: Vec::new(),
+            };
+            if !self.backend.engine.transport_on() {
+                self.backend.cmd(Cmd::PlayAll);
+            }
+            self.status = format!("track {}: MIDI recording…", i + 1);
+        }
+    }
+
+    /// True when some binding (keyboard slot or MIDI bind) would claim
+    /// `msg` — bound messages steer the app and are never recorded.
+    fn midi_msg_is_bound(&self, msg: &MidiMsg) -> bool {
+        let Some(bind) = MidiBind::from_msg(msg) else {
+            return false;
+        };
+        for (i, b) in self.midi_binds.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let hit = if MidiAction::ALL[i].is_continuous() {
+                b.same_axis(&bind)
+            } else {
+                *b == bind
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Push one live message into every armed track's buffer (stamped with
+    /// the engine position so the take lands exactly where it was played).
+    fn capture_midi_msg(&mut self, msg: &MidiMsg) {
+        let at = self.backend.engine.pos();
+        let mut evs: Vec<(u64, u8, u8, u8, u8)> = Vec::with_capacity(1);
+        match *msg {
+            MidiMsg::NoteOn { channel, note, velocity } if velocity > 0 => {
+                evs.push((at, 3, channel, note, velocity));
+            }
+            MidiMsg::NoteOn { channel, note, .. } | MidiMsg::NoteOff { channel, note, .. } => {
+                evs.push((at, 0, channel, note, 0));
+            }
+            MidiMsg::ControlChange { channel, number, value } => {
+                evs.push((at, 1, channel, number, value));
+            }
+            MidiMsg::ChannelPressure { channel, pressure } => {
+                evs.push((at, 2, channel, 0, pressure));
+            }
+            MidiMsg::PolyPressure { channel, note, pressure } => {
+                evs.push((at, 4, channel, note, pressure));
+            }
+            _ => return, // PC / pitch bend / sysex: not part of the pattern model
+        }
+        for r in self.midi_rec.iter_mut() {
+            if r.armed {
+                r.evs.extend(evs.iter().copied());
+            }
+        }
+    }
+
+    /// Bounce an armed track: build the pattern, save it to the primary
+    /// rack folder, add the asset and place a clip at the take position.
+    fn commit_midi_rec(&mut self, t: usize) {
+        let state = std::mem::take(&mut self.midi_rec[t]);
+        if state.evs.is_empty() {
+            self.status = format!("track {}: no MIDI captured", t + 1);
+            return;
+        }
+        let start = state.start;
+        let mut pat = Pattern::new(self.bpm().clamp(20, 999) as u16);
+        let mut open: std::collections::HashMap<(u8, u8), (u64, u8, u8)> =
+            std::collections::HashMap::new(); // (ch,note) -> (start, vel, press)
+        let mut end = 0u64;
+        let tick = |pat: &Pattern, at: u64| -> u32 {
+            pat.samples_to_ticks(at.saturating_sub(start), self.sample_rate.max(1))
+        };
+        for (at, kind, ch, d1, d2) in state.evs.iter().copied() {
+            end = end.max(at);
+            match kind {
+                3 => {
+                    open.insert((ch, d1), (at, d2, 0));
+                }
+                0 => {
+                    if let Some((s, vel, press)) = open.remove(&(ch, d1)) {
+                        let st = tick(&pat, s);
+                        let len = tick(&pat, at).saturating_sub(st).max(1);
+                        pat.notes.push(crate::midipat::Note {
+                            ch,
+                            note: d1,
+                            vel,
+                            press,
+                            start: st,
+                            len,
+                        });
+                    }
+                }
+                1 => pat.ccs.push(crate::midipat::Cc {
+                    at: tick(&pat, at),
+                    ch,
+                    num: d1,
+                    val: d2,
+                }),
+                2 => pat.press.push(crate::midipat::Press {
+                    at: tick(&pat, at),
+                    ch,
+                    val: d2,
+                }),
+                // Poly pressure: attach to the note that is still open.
+                _ => {
+                    if let Some(e) = open.get_mut(&(ch, d1)) {
+                        e.2 = d2;
+                    }
+                }
+            }
+        }
+        // Notes still held at stop ring to the end of the take.
+        let end_tick = tick(&pat, end);
+        for ((ch, note), (s, vel, press)) in open {
+            let st = tick(&pat, s);
+            pat.notes.push(crate::midipat::Note {
+                ch,
+                note,
+                vel,
+                press,
+                start: st,
+                len: end_tick.saturating_sub(st).max(1),
+            });
+        }
+        pat.sort();
+        // Pad the length to whole bars (min one bar).
+        let bar = 4 * PPQ as u32;
+        let used = pat
+            .notes
+            .iter()
+            .map(|n| n.start + n.len)
+            .chain(pat.ccs.iter().map(|m| m.at))
+            .chain(pat.press.iter().map(|m| m.at))
+            .max()
+            .unwrap_or(1);
+        pat.len_ticks = used.div_ceil(bar).max(1) * bar;
+        if pat.is_empty() {
+            self.status = format!("track {}: no MIDI captured", t + 1);
+            return;
+        }
+        // Unique name in the primary folder ("take", "take-2", …).
+        let dir = self.primary_folder();
+        let base = format!("midi-t{}", t + 1);
+        let mut n = 1u32;
+        let path = loop {
+            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+            let p = dir.join(format!("{name}.mid"));
+            if !p.exists() {
+                break p;
+            }
+            n += 1;
+        };
+        if let Err(e) = pat.save_mid(&path) {
+            self.status = format!("MIDI rec: {e}");
+            return;
+        }
+        let id = self.assets.len() as u32;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pat = Arc::new(pat);
+        let len = pat.len_samples(self.sample_rate.max(1));
+        self.assets.push(Asset::midi(id, name.clone(), path, pat, false));
+        let pos = snap_start(start, self.snap_unit());
+        let nl0 = self.arr.tracks[t].lanes.len();
+        let lane = self.arr.place_auto(t, Clip::new(id, pos), len);
+        self.grow_for_lanes(t, nl0);
+        // Re-scan so the rack shows the new file instantly.
+        if let Some(f) = self.rack.first_mut() {
+            f.rescan();
+        }
+        self.push_project();
+        self.save_config();
+        self.status = format!("track {}: MIDI take → clip in lane {} (“{name}”)", t + 1, lane + 1);
+    }
+
+    /// Render a pattern to a mono buffer through a throwaway piano copy
+    /// (shared by asset audition and the piano-roll preview).
+    fn render_pattern_preview(&mut self, pat: &Pattern) -> Option<Arc<[f32]>> {
+        let inst = self
+            .synth_registry
+            .create_instance("piano", self.sample_rate.max(1) as f64, &[])
+            .or_else(|| {
+                let alt = self.synth_registry.stems().into_iter().next()?;
+                self.synth_registry
+                    .create_instance(&alt, self.sample_rate.max(1) as f64, &[])
+            })?;
+        let sr = self.sample_rate.max(1);
+        let secs = self.preview_secs_f().min(30.0).min(pat.len_samples(sr) as f32 / sr as f32 + 2.0);
+        let n = (secs as usize) * sr as usize;
+        let mut buf = vec![0.0f32; n];
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+        for note in pat.notes.iter() {
+            let s0 = pat.ticks_to_samples(note.start, sr);
+            ev.push((s0, 3, note.ch, note.note, note.vel));
+            ev.push((s0 + pat.ticks_to_samples(note.len, sr).max(1), 0, note.ch, note.note, 0));
+        }
+        for m in pat.ccs.iter() {
+            ev.push((pat.ticks_to_samples(m.at, sr), 1, m.ch, m.num, m.val));
+        }
+        for m in pat.press.iter() {
+            ev.push((pat.ticks_to_samples(m.at, sr), 2, m.ch, 0, m.val));
+        }
+        crate::audio::render_midi_events(&inst, &mut ev, 0, n, &mut buf);
+        Some(Arc::from(buf))
+    }
+
+    /// Audition a MIDI asset through the default synth.
+    fn audition_pattern(&mut self, id: usize) {
+        if self.sample_rate == 0 || id >= self.assets.len() {
+            return;
+        }
+        if self.preview_playing.as_deref() == Some(self.assets[id].name.as_str()) {
+            self.backend.cmd(Cmd::PreviewStop);
+            self.preview_playing = None;
+            return;
+        }
+        let Some(pat) = self.assets[id].pattern.clone() else { return };
+        match self.render_pattern_preview(&pat) {
+            Some(buf) => {
+                let name = self.assets[id].name.clone();
+                self.backend.cmd(Cmd::PreviewPlay { samples: buf });
+                self.preview_playing = Some(name);
+            }
+            None => self.status = "preview: no synth available".into(),
+        }
+    }
+
+    /// The piano-roll editor window. Grid, snap and look follow the app's
+    /// timeline settings: drag empty space draws a snapped note (drag along
+    /// to lengthen it), drag a note moves it, right-click deletes it.
+    /// "save" bounces to a .mid in the primary folder, adds the asset and
+    /// places a clip on the selected track at the playhead.
+    fn piano_roll_window(&mut self, ui: &mut egui::Ui) {
+        let mut roll = match self.piano_roll.take() {
+            Some(r) => r,
+            None => return,
+        };
+        let mut save = false;
+        let mut clear = false;
+        let mut preview = false;
+        let mut bar_delta: i32 = 0;
+        let mut open = true;
+        let sr = self.sample_rate.max(1);
+        let q_step = SUBDIVISIONS[self.q_sub].0.max(1) as u32;
+        let snap_steps = SUBDIVISIONS[self.snap_sub].0.max(1) as u32;
+        let playhead = self.backend.engine.pos();
+        let sel = self.selected;
+        egui::Window::new("\u{266b} Piano roll")
+            .id(egui::Id::new("piano_roll_win"))
+            .open(&mut open)
+            .default_size([760.0, 430.0])
+            .show(ui, |ui| {
+                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                    // ---- toolbar ----
+                    ui.horizontal(|ui| {
+                        ui.label("bpm:");
+                        let mut b = roll.pat.bpm.to_string();
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut b))
+                            .changed()
+                        {
+                            if let Ok(v) = b.trim().parse::<u16>() {
+                                if (20..=999).contains(&v) {
+                                    roll.pat.bpm = v;
+                                    roll.changed = true;
+                                }
+                            }
+                        }
+                        if ui
+                            .small_button("-bar")
+                            .on_hover_text("One bar shorter (notes beyond it are dropped)")
+                            .clicked()
+                        {
+                            bar_delta = -1;
+                        }
+                        if ui
+                            .small_button("+bar")
+                            .on_hover_text("One bar longer")
+                            .clicked()
+                        {
+                            bar_delta = 1;
+                        }
+                        if ui
+                            .small_button("quantize")
+                            .on_hover_text("Snap every note onto the quantize grid")
+                            .clicked()
+                        {
+                            let step = (PPQ as u32 * 4 / q_step.max(1)).max(1);
+                            roll.pat.quantize_grid(step, true);
+                            roll.changed = true;
+                        }
+                        if ui
+                            .small_button(
+                                RichText::new("\u{25b6} preview")
+                                    .color(Color32::from_rgb(120, 220, 160)),
+                            )
+                            .on_hover_text("Audition through the default synth")
+                            .clicked()
+                        {
+                            preview = true;
+                        }
+                        if ui.small_button("clear").clicked() {
+                            clear = true;
+                        }
+                        if ui
+                            .small_button(RichText::new("save").strong())
+                            .on_hover_text(
+                                "Save as a MIDI asset in the primary folder and place \
+                                 a clip on the selected track at the playhead",
+                            )
+                            .clicked()
+                        {
+                            save = true;
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{} notes \u{b7} {} bars",
+                                roll.pat.notes.len(),
+                                (roll.pat.len_ticks / (4 * PPQ as u32)).max(1)
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    });
+                    // Pure time conversions (closures over roll.pat would
+                    // fight the borrow checker while editing notes).
+                    let sec_per_tick = 60.0 / (roll.pat.bpm.max(20) as f64 * PPQ as f64);
+                    let t_of = |tk: u32| -> f64 { tk as f64 * sec_per_tick };
+                    let tick_of = |t: f64| -> u32 { (t.max(0.0) / sec_per_tick).round() as u32 };
+                    // ---- canvas ----
+                    let rows: i32 = 49; // four octaves + C
+                    let sec_per_beat = 60.0 / roll.pat.bpm.max(20) as f64;
+                    let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
+                    let want = egui::vec2(
+                        (roll.pat.len_ticks as f64 / PPQ as f64 * roll.px_per_beat as f64)
+                            as f32
+                            + 80.0,
+                        (rows as f32 * roll.row_h + 6.0).max(220.0),
+                    );
+                    let (rect, resp) = ui.allocate_at_least(want, Sense::click_and_drag());
+                    let painter = ui.painter();
+                    if rect.width() <= 2.0 {
+                        return;
+                    }
+                    let keys_w = 58.0f32;
+                    let grid_x0 = rect.min.x + keys_w;
+                    painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
+                    let x_of = |t: f64| grid_x0 + ((t - roll.scroll_sec) * px_per_sec) as f32;
+                    let lo = roll.lo_note as i32;
+                    let hi = (lo + rows - 1).min(127);
+                    let y_of = |n: i32| rect.max.y - (n - lo) as f32 * roll.row_h - roll.row_h;
+                    let sec_at = |x: f32| {
+                        roll.scroll_sec + (x - grid_x0) as f64 / px_per_sec
+                    };
+                    // vertical grid: snap steps faint, beats medium, bars strong
+                    let step_sec = sec_per_beat / snap_steps as f64;
+                    let visible = (rect.width() - keys_w) as f64 / px_per_sec;
+                    let mut tt = (roll.scroll_sec / step_sec).floor() * step_sec;
+                    while tt < roll.scroll_sec + visible + step_sec {
+                        let x = x_of(tt);
+                        if x > grid_x0 {
+                            let beats = tt / sec_per_beat;
+                            let is_beat = (beats - beats.round()).abs() < 0.01;
+                            let is_bar = is_beat && ((beats.round() as i64) % 4 == 0);
+                            let col = if is_bar {
+                                Color32::from_gray(120)
+                            } else if is_beat {
+                                Color32::from_gray(75)
+                            } else {
+                                Color32::from_gray(45)
+                            };
+                            painter.line_segment(
+                                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                                egui::Stroke::new(if is_bar { 1.4f32 } else { 1.0f32 }, col),
+                            );
+                            if is_bar {
+                                painter.text(
+                                    egui::pos2(x + 2.0, rect.min.y + 6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{}", (beats.round() as i64) / 4 + 1),
+                                    egui::FontId::proportional(9.0),
+                                    Color32::from_gray(150),
+                                );
+                            }
+                        }
+                        tt += step_sec;
+                    }
+                    // keyboard strip + row lines
+                    for n in lo..=hi {
+                        let black = matches!((n.rem_euclid(12)) as u8, 1 | 3 | 6 | 8 | 10);
+                        let y = y_of(n);
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.min.x, y),
+                                egui::pos2(rect.min.x + keys_w - 1.0, y + roll.row_h),
+                            ),
+                            0.0,
+                            if black {
+                                Color32::from_gray(28)
+                            } else {
+                                Color32::from_gray(58)
+                            },
+                        );
+                        painter.line_segment(
+                            [
+                                egui::pos2(grid_x0, y + roll.row_h),
+                                egui::pos2(rect.max.x, y + roll.row_h),
+                            ],
+                            egui::Stroke::new(0.5f32, Color32::from_gray(40)),
+                        );
+                        if n.rem_euclid(12) == 0 {
+                            painter.text(
+                                egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
+                                egui::Align2::LEFT_CENTER,
+                                format!("C{}", n.div_euclid(12) - 1),
+                                egui::FontId::proportional(8.0),
+                                Color32::from_gray(225),
+                            );
+                        }
+                    }
+                    // pattern end + playhead markers
+                    let end_x = x_of(roll.pat.len_samples(sr) as f64 / sr as f64);
+                    if end_x > grid_x0 && end_x < rect.max.x + 2.0 {
+                        painter.line_segment(
+                            [egui::pos2(end_x, rect.min.y), egui::pos2(end_x, rect.max.y)],
+                            egui::Stroke::new(1.6f32, Color32::from_rgb(230, 180, 90)),
+                        );
+                    }
+                    let phx = x_of(playhead as f64 / sr as f64);
+                    if phx > grid_x0 && phx < rect.max.x {
+                        painter.line_segment(
+                            [egui::pos2(phx, rect.min.y), egui::pos2(phx, rect.max.y)],
+                            egui::Stroke::new(1.4f32, Color32::from_rgb(90, 220, 120)),
+                        );
+                    }
+                    // notes
+                    for (idx, note) in roll.pat.notes.iter().enumerate() {
+                        let n = note.note as i32;
+                        if n < lo || n > hi {
+                            continue;
+                        }
+                        let s0 = t_of(note.start);
+                        let dur = t_of(note.len.max(1));
+                        let x0 = x_of(s0).max(grid_x0);
+                        let x1 = x_of(s0 + dur).max(x0 + 2.0).min(rect.max.x);
+                        if x1 < grid_x0 {
+                            continue;
+                        }
+                        let y = y_of(n);
+                        let col = if roll.drag.is_some_and(|(d, _)| d == idx) {
+                            Color32::from_rgb(150, 200, 255)
+                        } else {
+                            Color32::from_rgb(80, 150, 245)
+                        };
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x0, y + 1.0),
+                                egui::pos2(x1, y + roll.row_h - 1.0),
+                            ),
+                            2.0,
+                            col,
+                        );
+                    }
+                    // ---- gesture ----
+                    let snap = |t: f64| (t / step_sec).floor() * step_sec;
+                    let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
+                    if let Some(pt) = resp.interact_pointer_pos() {
+                        if pt.x >= grid_x0 && pt.y > rect.min.y && pt.y < rect.max.y {
+                            let sec = sec_at(pt.x);
+                            let note_row =
+                                (((rect.max.y - pt.y) / roll.row_h).floor() as i32 + lo).clamp(0, 127) as u8;
+                            if resp.secondary_clicked() {
+                                let before = roll.pat.notes.len();
+                                roll.pat.notes.retain(|n| {
+                                    let n0 = t_of(n.start);
+                                    let n1 = n0 + t_of(n.len.max(1));
+                                    !(n.note == note_row && sec >= n0 - 0.001 && sec <= n1 + 0.001)
+                                });
+                                roll.changed |= roll.pat.notes.len() != before;
+                            } else if resp.drag_started() {
+                                // Grab an existing note? Move it. Else draw.
+                                let hit = roll.pat.notes.iter().position(|n| {
+                                    let n0 = t_of(n.start);
+                                    let n1 = n0 + t_of(n.len.max(1));
+                                    n.note == note_row && sec >= n0 - 0.001 && sec <= n1
+                                });
+                                match hit {
+                                    Some(idx) => {
+                                        let n0 = t_of(roll.pat.notes[idx].start);
+                                        roll.drag = Some((idx, sec - n0));
+                                    }
+                                    None => {
+                                        let st = snap(sec);
+                                        roll.pat.notes.push(crate::midipat::Note {
+                                            ch: 0,
+                                            note: note_row,
+                                            vel: 100,
+                                            press: 0,
+                                            start: tick_of(st),
+                                            len: (tick_of(snap_up(sec)) - tick_of(st))
+                                                .max(PPQ as u32 / 8),
+                                        });
+                                        roll.drag = Some((roll.pat.notes.len() - 1, 0.0));
+                                    }
+                                }
+                                roll.changed = true;
+                            } else if let Some((idx, off)) = roll.drag {
+                                                            if idx < roll.pat.notes.len() {
+                                                                let note = &mut roll.pat.notes[idx];
+                                                                if off == 0.0 {
+                                                                    // Fresh draw: stretch to the pointer.
+                                                                    let tail = tick_of(snap_up(sec)).max(note.start + 1);
+                                                                    note.len = tail - note.start;
+                                                                } else {
+                                                                    // Move: follow the pointer (snapped).
+                                                                    note.start = tick_of(snap(sec - off).max(0.0));
+                                                                    note.note = note_row;
+                                                                }
+                                                                roll.changed = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if resp.drag_stopped() {
+                                                    roll.drag = None;
+                                                    roll.pat.sort();
+                                                }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("- pitch").clicked() {
+                        roll.lo_note = roll.lo_note.saturating_sub(12);
+                    }
+                    if ui.button("+ pitch").clicked() {
+                        roll.lo_note = (roll.lo_note + 12).min(103);
+                    }
+                    ui.label("zoom:");
+                    ui.add(Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("px/beat"));
+                    ui.add(Slider::new(&mut roll.row_h, 6.0..=22.0).text("row px"));
+                });
+            });
+        // ---- toolbar actions deferred (need &mut self) ----
+        if bar_delta != 0 {
+            let bar = 4 * PPQ as u32;
+            let pat = &mut roll.pat;
+            if bar_delta > 0 {
+                pat.len_ticks += bar;
+            } else if pat.len_ticks > bar {
+                pat.len_ticks -= bar;
+                let lim = pat.len_ticks;
+                pat.notes.retain(|n| n.start < lim);
+                for n in pat.notes.iter_mut() {
+                    let end = (n.start + n.len).min(lim);
+                    n.len = end.saturating_sub(n.start).max(1);
+                }
+                pat.ccs.retain(|m| m.at < lim);
+                pat.press.retain(|m| m.at < lim);
+            }
+            roll.changed = true;
+        }
+        if clear {
+            roll.pat.notes.clear();
+            roll.pat.ccs.clear();
+            roll.pat.press.clear();
+            roll.changed = true;
+        }
+        if preview {
+            let pat = roll.pat.clone();
+            match self.render_pattern_preview(&pat) {
+                Some(buf) => {
+                    self.backend.cmd(Cmd::PreviewPlay { samples: buf });
+                    self.preview_playing = Some("piano roll".into());
+                }
+                None => self.status = "preview: no synth available".into(),
+            }
+        }
+        if save {
+            self.save_piano_roll(&mut roll.pat, sel);
+        }
+        if !open {
+            self.status = "piano roll closed (unsaved changes are kept until quit)".into();
+        }
+        self.piano_roll = Some(roll);
+    }
+
+    /// Bounce the piano roll: unique .mid in the primary folder, new asset,
+    /// clip on `track` at the playhead (snapped), rack refreshed.
+    fn save_piano_roll(&mut self, pat: &mut Pattern, track: usize) {
+        pat.sort();
+        let dir = self.primary_folder();
+        let mut n = 1u32;
+        let path = loop {
+            let name = if n == 1 {
+                "roll".to_string()
+            } else {
+                format!("roll-{n}")
+            };
+            let p = dir.join(format!("{name}.mid"));
+            if !p.exists() {
+                break p;
+            }
+            n += 1;
+        };
+        if let Err(e) = pat.save_mid(&path) {
+            self.status = format!("piano roll: {e}");
+            return;
+        }
+        let id = self.assets.len() as u32;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pat = Arc::new(pat.clone());
+        let len = pat.len_samples(self.sample_rate.max(1));
+        self.assets.push(Asset::midi(id, name.clone(), path, pat, false));
+        let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
+        let track = track.min(self.n_tracks - 1);
+        let nl0 = self.arr.tracks[track].lanes.len();
+        let lane = self.arr.place_auto(track, Clip::new(id, pos), len);
+        self.grow_for_lanes(track, nl0);
+        if let Some(f) = self.rack.first_mut() {
+            f.rescan();
+        }
+        self.push_project();
+        self.status = format!(
+            "piano roll: saved \u{201c}{name}\u{201d} \u{2192} track {}, lane {}",
+            track + 1,
+            lane + 1
+        );
+    }
+
+    /// Auto sliders for a track's live synth instance (values ride the
+    /// instance atomics, exactly like effect params).
+    fn synth_sliders_window(&mut self, ui: &mut egui::Ui, t: usize) {
+        let Some(stem) = self.track_synth[t].clone() else {
+            self.synth_win = None;
+            return;
+        };
+        let Some(desc) = self.synth_registry.desc(&stem).cloned() else {
+            self.synth_win = None;
+            return;
+        };
+        let Some(inst) = self.track_synth_inst[t].clone() else {
+            self.synth_win = None;
+            return;
+        };
+        let mut open = true;
+        let mut dirty = false;
+        egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
+            .id(egui::Id::new(("synthwin", t)))
+            .open(&mut open)
+            .default_size([280.0, 340.0])
+            .show(ui, |ui| {
+                if let Some(d) = &desc.description {
+                    ui.label(RichText::new(d).weak().small());
+                }
+                if let Some(a) = &desc.author {
+                    ui.label(RichText::new(format!("by {a}")).weak().small());
+                }
+                ui.separator();
+                let vals = inst.values();
+                for (k, pd) in desc.params.iter().enumerate() {
+                    let mut nv = vals.get(k).copied().unwrap_or(pd.default);
+                    if ui
+                        .add(Slider::new(&mut nv, pd.min..=pd.max).text(&pd.label))
+                        .changed()
+                    {
+                        inst.set_param(k, nv);
+                        dirty = true;
+                    }
+                }
+            });
+        if dirty {
+            self.track_synth_params[t] = inst.values();
+            self.save_config();
+        }
+        if !open {
+            self.synth_win = None;
+        }
+    }
+
     fn toggle_record(&mut self, i: usize) {
         if self.sample_rate == 0 {
             self.status = "record: wait for the audio engine".into();
@@ -1858,13 +2687,7 @@ impl App {
         }
         let id = self.assets.len() as u32;
         let len = data.len() as u64;
-        self.assets.push(Asset {
-            id,
-            name,
-            path,
-            data,
-            dirty,
-        });
+        self.assets.push(Asset::audio(id, name, path, data, dirty));
         self.sel_asset = Some(id as usize);
         let pos = snap_start(at, self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
@@ -1880,6 +2703,26 @@ impl App {
             self.sel_asset = Some(k);
             return Some(k);
         }
+        if crate::assets::is_midi_file(path) {
+            return match Pattern::load_mid(path) {
+                Ok(pat) => {
+                    let id = self.assets.len() as u32;
+                    let name = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.assets
+                        .push(Asset::midi(id, name, path.to_path_buf(), Arc::new(pat), false));
+                    self.sel_asset = Some(id as usize);
+                    self.push_project();
+                    Some(id as usize)
+                }
+                Err(e) => {
+                    self.status = e;
+                    None
+                }
+            };
+        }
         if self.sample_rate == 0 {
             self.status = "rack: wait for the audio engine".into();
             return None;
@@ -1891,13 +2734,13 @@ impl App {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let id = self.assets.len() as u32;
-                self.assets.push(Asset {
+                self.assets.push(Asset::audio(
                     id,
                     name,
-                    path: path.to_path_buf(),
-                    data: Arc::from(v),
-                    dirty: false,
-                });
+                    path.to_path_buf(),
+                    Arc::from(v),
+                    false,
+                ));
                 self.sel_asset = Some(id as usize);
                 Some(id as usize)
             }
@@ -2045,6 +2888,8 @@ impl App {
                     file: a.path.to_string_lossy().into_owned(),
                 })
                 .collect(),
+            track_synths: self.track_synth.clone(),
+            track_synth_params: self.track_synth_params.clone(),
         }
     }
 
@@ -2074,6 +2919,21 @@ impl App {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect();
+            if let Some(pat) = a.pattern.clone() {
+                // Pattern assets round-trip as Standard MIDI Files.
+                let p = audio_dir.join(format!(
+                    "{:03}-{}.mid",
+                    a.id,
+                    if stem.is_empty() { "pattern".to_string() } else { stem }
+                ));
+                if let Err(e) = pat.save_mid(&p) {
+                    self.status = format!("save: {e}");
+                    return;
+                }
+                a.path = p;
+                a.dirty = false;
+                continue;
+            }
             let p = audio_dir.join(format!(
                 "{:03}-{}.wav",
                 a.id,
@@ -2134,28 +2994,40 @@ impl App {
         let mut missing = 0usize;
         for (i, pa) in pr.assets.iter().enumerate() {
             let found = project::resolve_asset(&pa.file, &dirs);
-            match found
-                .as_ref()
-                .and_then(|p| crate::audio_io::decode_to_mono(p, sr).ok())
-            {
-                Some(v) => assets.push(Asset {
-                    id: i as u32,
-                    name: pa.name.clone(),
-                    path: found.unwrap_or_default(),
-                    data: Arc::from(v),
-                    dirty: false,
-                }),
-                None => {
-                    missing += 1;
-                    // Keep the id space intact: missing audio becomes a
-                    // silent placeholder (its clips simply play nothing).
-                    assets.push(Asset {
-                        id: i as u32,
-                        name: pa.name.clone(),
-                        path: PathBuf::new(),
-                        data: Arc::from(vec![]),
-                        dirty: false,
-                    });
+            // MIDI pattern assets have their own decoder (.mid).
+            if found.as_deref().is_some_and(|fp| crate::assets::is_midi_file(fp)) {
+                let fp = found.unwrap_or_default();
+                match Pattern::load_mid(&fp) {
+                    Ok(pat) => {
+                        assets.push(Asset::midi(i as u32, pa.name.clone(), fp, Arc::new(pat), false));
+                        continue;
+                    }
+                    Err(_) => missing += 1,
+                }
+            } else {
+                match found
+                    .as_ref()
+                    .and_then(|p| crate::audio_io::decode_to_mono(p, sr).ok())
+                {
+                    Some(v) => assets.push(Asset::audio(
+                        i as u32,
+                        pa.name.clone(),
+                        found.unwrap_or_default(),
+                        Arc::from(v),
+                        false,
+                    )),
+                    None => {
+                        missing += 1;
+                        // Keep the id space intact: missing audio becomes a
+                        // silent placeholder (its clips simply play nothing).
+                        assets.push(Asset::audio(
+                            i as u32,
+                            pa.name.clone(),
+                            PathBuf::new(),
+                            Arc::from(vec![]),
+                            false,
+                        ));
+                    }
                 }
             }
         }
@@ -2204,6 +3076,16 @@ impl App {
             .n_tracks
             .unwrap_or(16)
             .clamp(1, MAX_LOOPS) as usize;
+        // Per-track synths (missing slots fall back to the default piano).
+        for t in 0..MAX_LOOPS {
+            self.track_synth[t] = pr.track_synths.get(t).cloned().flatten();
+            self.track_synth_params[t] = pr
+                .track_synth_params
+                .get(t)
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.rebuild_all_synths();
         // Heights are a per-session view; the new arrangement starts fresh.
         for h in self.trk_height.iter_mut() {
             *h = 0.0;
@@ -2316,6 +3198,7 @@ impl App {
             // Value-driven knob actions fire only through the MIDI path
             // (handle_evt passes the CC value); a key press has no value.
             MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_) => {}
+            MidiAction::MidiRec(i) => self.toggle_midi_rec(i),
             MidiAction::Reserved => {}
         }
     }
@@ -2329,6 +3212,9 @@ impl App {
             } => {
                 self.client_name = Some(client_name.clone());
                 self.sample_rate = sample_rate;
+                // Synth instances need the rate: create the default piano
+                // and every bound track synth now.
+                self.rebuild_all_synths();
                 self.status = "JACK ready — select ports, then Apply".into();
                 self.backend.cmd(Cmd::SetLatency {
                     ms: self.latency_ms.trim().parse().unwrap_or(0.0),
@@ -2364,6 +3250,15 @@ impl App {
                 self.status = format!("applied: {} in / {} out", ins, outs);
             }
             Evt::Transport { on } => {
+                if !on {
+                    // An armed MIDI take ends with the transport (audio
+                    // takes stop for the same reason).
+                    for t in 0..self.n_tracks {
+                        if self.midi_rec[t].armed {
+                            self.commit_midi_rec(t);
+                        }
+                    }
+                }
                 self.status = if on {
                     "transport running".into()
                 } else {
@@ -2500,6 +3395,13 @@ impl App {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // MIDI recording tap: a message NO binding claims is
+                    // captured verbatim into every armed track's buffer.
+                    if self.midi_rec.iter().any(|r| r.armed) {
+                        if !self.midi_msg_is_bound(&msg) {
+                            self.capture_midi_msg(&msg);
                         }
                     }
                     let line = MidiLine {
@@ -2683,6 +3585,13 @@ impl App {
         if self.fx_editor.is_some() {
             self.fx_editor_window(ui);
         }
+        if self.piano_roll.is_some() {
+            self.piano_roll_window(ui);
+        }
+        let sw = self.synth_win;
+        if let Some(t) = sw {
+            self.synth_sliders_window(ui, t);
+        }
     }
 }
 
@@ -2850,8 +3759,45 @@ fn base_name(p: &str) -> String {
         .unwrap_or_else(|| p.trim().to_string())
 }
 
-/// Rack row snapshot: (folder path, [(file name, path)], scan error).
-type RackRow = (String, Vec<(String, PathBuf)>, Option<String>);
+/// Rack row snapshot: (folder path, [(file name, path, is_midi)], error).
+type RackRow = (String, Vec<(String, PathBuf, bool)>, Option<String>);
+
+/// One rack file row: click = load + audition, drag = place a clip.
+/// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
+fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &Path) {
+    let sel = app
+        .sel_asset
+        .is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
+    // Full-width row: a plain selectable_label shrink-wraps to the text,
+    // leaving most of the row dead to clicks; available_size() sizing made
+    // every row fill the panel (the "huge hat" bug).
+    let w = ui.available_width();
+    let row = ui.add_sized(
+        egui::vec2(w, 20.0),
+        egui::Button::selectable(sel, RichText::new(name).small()),
+    );
+    // ONE click_and_drag response for the row: a separate drag-sense
+    // overlay on top would CAPTURE the press and kill clicked().
+    let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, name)), Sense::click_and_drag());
+    if dr.clicked() {
+        // Click = select + audition (asset preview).
+        if let Some(k) = app.ensure_asset(fp) {
+            app.preview_asset(k);
+        }
+    }
+    if dr.drag_started() {
+        if let Some(k) = app.ensure_asset(fp) {
+            app.sel_asset = Some(k);
+            // egui-native drag: the payload travels with the gesture and
+            // lane strips receive the release themselves.
+            dr.dnd_set_drag_payload(k);
+        }
+    }
+    row.on_hover_text(format!(
+        "{} \u{b7} click to audition (preview), drag onto a lane to place a clip",
+        fp.display()
+    ));
+}
 
 /// The asset rack: folders (primary first = recordings land there), one
 /// draggable row per audio file, project-only assets below, and the
@@ -2892,7 +3838,14 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     .rack
                     .iter()
                     .map(|f| {
-                        (f.path.clone(), f.files.iter().map(|r| (r.name.clone(), r.path.clone())).collect(), f.err.clone())
+                        (
+                            f.path.clone(),
+                            f.files
+                                .iter()
+                                .map(|r| (r.name.clone(), r.path.clone(), r.is_midi))
+                                .collect(),
+                            f.err.clone(),
+                        )
                     })
                     .collect();
                 let mut rescan = None;
@@ -2922,43 +3875,29 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     if let Some(e) = err {
                         ui.label(RichText::new(format!("× {}", e)).color(Color32::from_rgb(220, 120, 120)).small());
                     }
-                    for (name, fp) in files {
-                        let sel = app.sel_asset.is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
-                        // Full-width row: a plain selectable_label shrink-wraps
-                        // to the text, leaving most of the row dead to clicks.
-                        // Fixed slim rows: sizing to available_size() made
-                        // every row fill the panel (the "huge hat" bug).
-                        let w = ui.available_width();
-                        let row = ui.add_sized(
-                            egui::vec2(w, 20.0),
-                            egui::Button::selectable(sel, RichText::new(&name).small()),
-                        );
-                        // ONE click_and_drag response for the row: a separate
-                        // drag-sense overlay on top would CAPTURE the press
-                        // and silently kill the row's own clicked().
-                        let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, &name)), Sense::click_and_drag());
-                        if dr.clicked() {
-                            // Click = select + audition (asset preview).
-                            if let Some(k) = app.ensure_asset(&fp) {
-                                app.preview_asset(k);
-                            }
-                        }
-                        if dr.drag_started() {
-                            if let Some(k) = app.ensure_asset(&fp) {
-                                app.sel_asset = Some(k);
-                                // egui-native drag: the payload travels with
-                                // the gesture and lane strips receive the
-                                // release themselves (a manual cross-panel
-                                // drag never landed — the rack owned it).
-                                // If the decode failed there is no payload
-                                // and the drop does nothing.
-                                dr.dnd_set_drag_payload(k);
-                            }
-                        }
-                        row.on_hover_text(format!(
-                            "{} \u{b7} click to audition (preview), drag onto a lane to place a clip",
-                            fp.display()
-                        ));
+                    // Two sections per folder: AUDIO then MIDI clips.
+                    let audio: Vec<(String, PathBuf)> = files
+                        .iter()
+                        .filter(|(_, _, m)| !*m)
+                        .map(|(n, p, _)| (n.clone(), p.clone()))
+                        .collect();
+                    let midis: Vec<(String, PathBuf)> = files
+                        .iter()
+                        .filter(|(_, _, m)| *m)
+                        .map(|(n, p, _)| (n.clone(), p.clone()))
+                        .collect();
+                    let mixed = !audio.is_empty() && !midis.is_empty();
+                    if mixed {
+                        ui.label(RichText::new("audio").weak().small());
+                    }
+                    for (name, fp) in audio {
+                        rack_file_row(ui, app, fi, &name, &fp);
+                    }
+                    if mixed {
+                        ui.label(RichText::new("MIDI").weak().small());
+                    }
+                    for (name, fp) in midis {
+                        rack_file_row(ui, app, fi, &name, &fp);
                     }
                 }
                 if let Some(fi) = rescan {
@@ -3026,7 +3965,10 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                 ui.separator();
                 match app.sel_asset {
                     Some(k) if k < app.assets.len() => {
-                        let (nm, secs) = (app.assets[k].name.clone(), app.assets[k].data.len() as f64 / app.sample_rate.max(1) as f64);
+                        let (nm, secs) = (
+                            app.assets[k].name.clone(),
+                            app.asset_len(k as u32) as f64 / app.sample_rate.max(1) as f64,
+                        );
                         ui.label(RichText::new(format!("asset: {}", nm)).small());
                         ui.label(RichText::new(format!("{:.2} s", secs)).weak().small());
                         ui.horizontal(|ui| {
@@ -3239,6 +4181,22 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         {
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
         }
+        let mrec = app.midi_rec[t].armed;
+        if ui
+            .small_button(RichText::new(if mrec { "M\u{25a0}" } else { "MREC" }).color(if mrec {
+                Color32::from_rgb(120, 220, 255)
+            } else {
+                Color32::from_rgb(160, 190, 220)
+            }))
+            .on_hover_text(
+                "MIDI record: captures every UNBOUND incoming MIDI message \
+                 while armed; stop (button again or stop the transport) and \
+                 the take becomes a MIDI asset + clip at the playhead",
+            )
+            .clicked()
+        {
+            app.toggle_midi_rec(t);
+        }
         if ui
             .small_button("+")
             .on_hover_text("Add a child lane (stacks additively)")
@@ -3274,12 +4232,72 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         }
         fx_buttons(ui, app, t);
     });
+    ui.horizontal(|ui| {
+        // Per-track synthesizer for MIDI clips (default: bundled piano).
+        let cur = app.track_synth[t].clone().unwrap_or_default();
+        let stems = app.synth_registry.stems();
+        let mut rescan = false;
+        egui::ComboBox::from_id_salt(("synthpick", t))
+            .selected_text(RichText::new(format!(
+                "\u{266a} {}",
+                if cur.is_empty() { "piano".to_string() } else { cur.clone() }
+            )))
+            .show_ui(ui, |ui| {
+                let mut tmp = cur.clone();
+                ui.selectable_value(&mut tmp, String::new(), "default (piano)");
+                for stem in &stems {
+                    ui.selectable_value(&mut tmp, stem.clone(), stem.as_str());
+                }
+                if ui.small_button("\u{21bb}").on_hover_text("Re-scan the synths folder").clicked()
+                {
+                    rescan = true;
+                }
+                if tmp != cur {
+                    app.set_track_synth_stem(t, &tmp);
+                }
+            });
+        if rescan {
+            app.synth_registry.rescan();
+            app.status = "synths re-scanned".into();
+        }
+        if app.track_synth_inst[t].is_some()
+            && ui
+                .small_button("sliders")
+                .on_hover_text("This synth's parameters")
+                .clicked()
+        {
+            app.synth_win = Some(t);
+        }
+    });
 }
 
 /// The toolbar row above the timeline: quantize / snap controls, asset
 /// actions, loop and zoom.
 fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
     ui.horizontal(|ui| {
+        if ui
+            .button(RichText::new("\u{266b} Piano roll").strong())
+            .on_hover_text(
+                "Open the piano-roll editor: draw notes on the snap grid, \
+                 save the pattern as a MIDI asset (primary folder) and drop \
+                 it onto a track",
+            )
+            .clicked()
+        {
+            if app.piano_roll.is_none() {
+                let mut pat = Pattern::new(app.bpm().clamp(20, 999) as u16);
+                pat.len_ticks = 4 * PPQ as u32;
+                app.piano_roll = Some(Box::new(PianoRoll {
+                    pat,
+                    px_per_beat: 90.0,
+                    row_h: 11.0,
+                    lo_note: 36,
+                    scroll_sec: 0.0,
+                    changed: false,
+                    drag: None,
+                }));
+            }
+        }
         ui.label(RichText::new("grid:").strong());
         if ui
             .checkbox(&mut app.auto_quantize, "auto-quantize new recordings")
@@ -4080,6 +5098,55 @@ fn draw_asset_clip(
 ) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, fill.linear_multiply(0.45));
+    // MIDI clips preview as an approximate piano roll (FL-style): every
+    // note is a small bar; pitch maps to the clip's vertical extent.
+    if let Some(pat) = app.assets.get(asset as usize).and_then(|a| a.pattern.clone()) {
+        if rect.width() >= 4.0 {
+            let (cut, wlen) = win;
+            let wlen = wlen.max(1);
+            let alen = app.asset_len(asset).max(1);
+            let lt = (pat.len_ticks.max(1)) as f64;
+            let (lo_n, hi_n) = (24i32, 108i32);
+            let h = rect.height().max(6.0);
+            let col = if sel {
+                Color32::from_rgb(180, 235, 255)
+            } else {
+                Color32::from_rgb(120, 205, 255)
+            };
+            for note in pat.notes.iter() {
+                let n = note.note as i32;
+                if n < lo_n || n > hi_n {
+                    continue;
+                }
+                let s0 = note.start as f64 / lt * alen as f64;
+                let s1 = (note.start + note.len.max(1)) as f64 / lt * alen as f64;
+                let x0 = rect.min.x + ((s0 - cut as f64).max(0.0) / wlen as f64 * rect.width() as f64) as f32;
+                let x1 = rect.min.x
+                    + ((s1.min((cut + wlen) as f64) - cut as f64).max(0.0) / wlen as f64
+                        * rect.width() as f64) as f32;
+                if x1 <= x0 + 0.5 && (x0 < rect.min.x || x0 > rect.max.x) {
+                    continue;
+                }
+                let y = rect.max.y - ((n - lo_n) as f32 / (hi_n - lo_n) as f32) * (h - 2.0) - 1.0;
+                let bar = (h / 28.0).clamp(1.2, 5.0);
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y - bar * 0.5),
+                        egui::pos2(x1.max(x0 + 1.0), y + bar * 0.5),
+                    ),
+                    1.0,
+                    col,
+                );
+            }
+        }
+        let stroke = if sel {
+            egui::Stroke::new(2.0, COL_CLIP_SEL)
+        } else {
+            egui::Stroke::new(1.0, fill)
+        };
+        p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+        return;
+    }
     if rect.width() >= 4.0 {
         let alen = app.asset_len(asset).max(1);
         let (cut, wlen) = win;
@@ -5313,7 +6380,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         }
                     });
             });
-            for off in 0..7usize {
+            for off in 0..8usize {
                 let a = match off {
                     0 => MidiAction::RecLoop(app.bind_loop_sel),
                     1 => MidiAction::ClearLoop(app.bind_loop_sel),
@@ -5321,7 +6388,8 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     3 => MidiAction::Select(app.bind_loop_sel),
                     4 => MidiAction::VolLoop(app.bind_loop_sel),
                     5 => MidiAction::GainLoop(app.bind_loop_sel),
-                    _ => MidiAction::PanLoop(app.bind_loop_sel),
+                    6 => MidiAction::PanLoop(app.bind_loop_sel),
+                    _ => MidiAction::MidiRec(app.bind_loop_sel),
                 };
                 bind_row(ui, app, a);
             }
@@ -5458,7 +6526,8 @@ mod tests {
     #[test]
     fn shortcut_table_matches_actions() {
         assert_eq!(SHORTCUT_DEFAULTS.len(), N_ACTIONS);
-        assert_eq!(N_ACTIONS, 121);
+        // 121 historical + 16 appended `MidiRec` slots.
+        assert_eq!(N_ACTIONS, 137);
         // Space is the global transport toggle; knob slots are never keyed.
         assert_eq!(
             SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PlayAll)],
@@ -6511,5 +7580,122 @@ mod tests {
         assert_eq!(app.selected, 7, "never past the configured last track");
         app.fire_midi_action(crate::midi::MidiAction::SelectPrev);
         assert_eq!(app.selected, 6);
+    }
+
+    #[test]
+    fn midi_rec_take_bounces_asset_and_places_clip() {
+        let mut app = headless_app("midirec");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sample_rate = 48_000;
+        let sel = app.selected;
+        assert!(!app.midi_msg_is_bound(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 60,
+            velocity: 100
+        }));
+
+        app.toggle_midi_rec(sel);
+        assert!(app.midi_rec[sel].armed);
+        // An unmapped note is captured, the matching off closes it.
+        app.capture_midi_msg(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 60,
+            velocity: 100,
+        });
+        app.capture_midi_msg(&MidiMsg::NoteOff {
+            channel: 1,
+            note: 60,
+            velocity: 0,
+        });
+        // A CC lands in the take too (nothing is bound to it).
+        app.capture_midi_msg(&MidiMsg::ControlChange {
+            channel: 1,
+            number: 7,
+            value: 90,
+        });
+        let before = app.assets.len();
+        app.toggle_midi_rec(sel); // second press = commit
+        assert!(!app.midi_rec[sel].armed);
+        let a = app.assets.last().expect("midi asset added");
+        assert_eq!(app.assets.len(), before + 1);
+        assert!(a.is_midi());
+        assert!(a.path.extension().is_some_and(|e| e == "mid"));
+        assert!(a.path.exists(), "take written to the primary folder");
+        let pat = a.pattern.clone().expect("pattern attached");
+        assert_eq!(pat.notes.len(), 1);
+        assert_eq!(pat.notes[0].note, 60);
+        assert_eq!(pat.ccs.len(), 1);
+        // Clip placed on the recorded track pointing at the new asset.
+        let id = a.id;
+        let hit = app.arr.tracks[sel]
+            .lanes
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .any(|c| c.asset == id);
+        assert!(hit, "clip placed at the playhead on the armed track");
+    }
+
+    #[test]
+    fn bound_midi_messages_are_not_recorded() {
+        let mut app = headless_app("midirecbound");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        // Bind NOTE ON note 61 (any velocity) to an action, like a pad.
+        let idx = MidiAction::ALL
+            .iter()
+            .position(|a| matches!(a, MidiAction::PlayLoop(0)))
+            .unwrap();
+        app.midi_binds[idx] = Some(crate::midi::MidiBind {
+            ty: 0,
+            ch: 1,
+            d1: 61,
+        });
+        let bound = app.midi_msg_is_bound(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 61,
+            velocity: 100,
+        });
+        assert!(bound, "mapped note counts as bound");
+        let free = app.midi_msg_is_bound(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 62,
+            velocity: 100,
+        });
+        assert!(!free);
+    }
+
+    #[test]
+    fn piano_roll_save_writes_asset_and_clip() {
+        let mut app = headless_app("rollsave");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sample_rate = 48_000;
+        let mut pat = Pattern::new(120);
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
+        pat.quantize_grid(480, false);
+        let before = app.assets.len();
+        app.save_piano_roll(&mut pat, 2);
+        assert_eq!(app.assets.len(), before + 1);
+        let a = app.assets.last().unwrap();
+        assert!(a.is_midi());
+        assert!(a.path.exists());
+        let id = a.id;
+        let hit = app.arr.tracks[2]
+            .lanes
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .any(|c| c.asset == id);
+        assert!(hit);
+        // Saving again bumps the name (roll-2.mid), never overwrites.
+        app.save_piano_roll(&mut pat, 2);
+        assert!(app.assets.last().unwrap().name.contains("roll-2"));
     }
 }

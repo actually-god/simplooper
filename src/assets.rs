@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audio_io::IMPORT_EXTENSIONS;
+use crate::midipat::Pattern;
 
 /// One decoded audio asset. `path` is where it is stored (or will be stored:
 /// a fresh recording with no folder yet has an empty path and `dirty = true`).
@@ -27,11 +28,39 @@ pub struct Asset {
     /// In-memory content no longer matches `path` (trim/derive): the next
     /// save writes it out before anything references the old file.
     pub dirty: bool,
+    /// MIDI patterns live here (`data` stays empty); audio assets are None.
+    pub pattern: Option<Arc<Pattern>>,
 }
 
 impl Asset {
     pub fn samples(&self) -> u64 {
         self.data.len() as u64
+    }
+
+    /// Mono audio asset bound to a file (fresh imports / recordings).
+    pub fn audio(
+        id: u32,
+        name: String,
+        path: PathBuf,
+        data: Arc<[f32]>,
+        dirty: bool,
+    ) -> Asset {
+        Asset { id, name, path, data, dirty, pattern: None }
+    }
+
+    /// MIDI pattern asset (imported .mid, MIDI recording, piano roll).
+    pub fn midi(
+        id: u32,
+        name: String,
+        path: PathBuf,
+        pattern: Arc<Pattern>,
+        dirty: bool,
+    ) -> Asset {
+        Asset { id, name, path, data: Arc::from(Vec::new().into_boxed_slice()), dirty, pattern: Some(pattern) }
+    }
+
+    pub fn is_midi(&self) -> bool {
+        self.pattern.is_some()
     }
 }
 
@@ -43,6 +72,8 @@ pub type AssetData = Arc<[f32]>;
 pub struct RackFile {
     pub name: String,
     pub path: PathBuf,
+    /// True for .mid/.midi entries (the rack's MIDI section).
+    pub is_midi: bool,
 }
 
 /// True when a file's extension is a format the import pipeline decodes.
@@ -50,6 +81,13 @@ pub fn is_audio_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| IMPORT_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// True when a file is a Standard MIDI File the pattern decoder accepts.
+pub fn is_midi_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"))
 }
 
 /// List the audio files directly inside `dir` (sorted by name, case-insensitive).
@@ -60,12 +98,13 @@ pub fn scan_folder(dir: &Path) -> Result<Vec<RackFile>, String> {
     let mut files: Vec<RackFile> = Vec::new();
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.is_file() && is_audio_file(&p) {
+        let is_midi = p.is_file() && is_midi_file(&p);
+        if p.is_file() && (is_audio_file(&p) || is_midi) {
             let name = p
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            files.push(RackFile { name, path: p });
+            files.push(RackFile { name, path: p, is_midi });
         }
     }
     files.sort_by_key(|f| f.name.to_lowercase());
@@ -111,11 +150,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rack_entry_construction_roundtrip() {
+        let rf = RackFile {
+            name: "a".into(),
+            path: PathBuf::from("/x/a.mid"),
+            is_midi: true,
+        };
+        assert!(rf.is_midi);
+    }
+
+    #[test]
     fn extension_filter() {
         assert!(is_audio_file(Path::new("/x/y.WAV")));
         assert!(is_audio_file(Path::new("/x/y.flac")));
         assert!(!is_audio_file(Path::new("/x/y.rs")));
         assert!(!is_audio_file(Path::new("/x/noext")));
+        assert!(is_midi_file(Path::new("/x/p.MID")));
+        assert!(is_midi_file(Path::new("/x/p.midi")));
+        assert!(!is_midi_file(Path::new("/x/p.wav")));
     }
 
     #[test]

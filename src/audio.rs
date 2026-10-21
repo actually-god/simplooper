@@ -194,6 +194,16 @@ pub enum Cmd {
         arr: Arc<Arrangement>,
         len: u64,
     },
+    /// Replace the MIDI pattern table (indexed in parallel with `assets`).
+    SetMidiAssets(Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>),
+    /// Bind/unbind one track's synthesizer instance.
+    SetTrackSynth {
+        i: usize,
+        synth: Option<Arc<crate::synth::Instance>>,
+    },
+    /// Set the fallback synth (bundled piano) used by tracks with no
+    /// explicit binding.
+    SetDefaultSynth(Option<Arc<crate::synth::Instance>>),
     /// Write a track's rendered contribution (all its lanes, engine-rate
     /// mixdown of the current project) to `path` in format `fmt`. Runs on
     /// the manager thread; a Notice/Error event reports the outcome.
@@ -475,6 +485,18 @@ pub struct Engine {
     assets_gen: AtomicU64,
     arr: std::sync::Mutex<Arc<Arrangement>>,
     arr_gen: AtomicU64,
+    // ---- MIDI snapshots ---------------------------------------------------
+    /// MIDI pattern table, indexed in parallel with `assets` (audio slots
+    /// hold `None`); pushed together with the project by the GUI.
+    midi: std::sync::Mutex<Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>>,
+    midi_gen: AtomicU64,
+    /// Per-track synth bindings + the fallback instance (bundled piano)
+    /// used by unbound tracks.
+    synths: std::sync::Mutex<Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]>>,
+    synths_gen: AtomicU64,
+    default_synth: std::sync::Mutex<Option<Arc<crate::synth::Instance>>>,
+    /// Jack rate, published once at connect (drives tick math + samplers).
+    sample_rate: AtomicU32,
 
     // ---- metronome ---------------------------------------------------------
     /// Metronome: 0 = off, 1 = on; tempo (BPM); clicks per beat; beats per
@@ -532,6 +554,12 @@ impl Engine {
             assets_gen: AtomicU64::new(0),
             arr: std::sync::Mutex::new(Arc::new(Arrangement::new())),
             arr_gen: AtomicU64::new(0),
+            midi: std::sync::Mutex::new(Arc::new(Vec::new())),
+            midi_gen: AtomicU64::new(0),
+            synths: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
+            synths_gen: AtomicU64::new(0),
+            default_synth: std::sync::Mutex::new(None),
+            sample_rate: AtomicU32::new(0),
             metro_on: AtomicU8::new(0),
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
@@ -777,10 +805,68 @@ impl Engine {
         self.arr_gen.fetch_add(1, Ordering::Relaxed);
         self.proj_len.store(len.max(1), Ordering::Relaxed);
         let pl = self.proj_len.load(Ordering::Relaxed);
-        // A project can shrink under the playhead — keep it in bounds.
+        // A project can shrink under the playhead â keep it in bounds.
         if self.pos.load(Ordering::Relaxed) > pl {
             self.seek_to(pl);
         }
+        // Samplers read the rack through the host table; refresh it with
+        // every project push (assets can change under the same gen).
+        crate::synth::set_host_assets(self.assets(), self.sample_rate.load(Ordering::Relaxed));
+    }
+
+    /// Replace the MIDI pattern table (parallel to `assets`).
+    pub fn set_midi_assets(&self, midi: Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>) {
+        *self.midi.lock().unwrap() = midi;
+        self.midi_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn midi(&self) -> Arc<Vec<Option<Arc<crate::midipat::Pattern>>>> {
+        self.midi.lock().unwrap().clone()
+    }
+    pub fn midi_gen(&self) -> u64 {
+        self.midi_gen.load(Ordering::Relaxed)
+    }
+
+    /// Bind/unbind one track's synthesizer (unbound tracks fall back to the
+    /// default synth — the bundled piano).
+    pub fn set_track_synth(&self, i: usize, synth: Option<Arc<crate::synth::Instance>>) {
+        if let Ok(mut g) = self.synths.try_lock() {
+            let mut next = g.clone();
+            if let Some(slot) = Arc::make_mut(&mut next).get_mut(i) {
+                *slot = synth;
+            }
+            *g = next;
+            self.synths_gen.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn synths(&self) -> Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]> {
+        self.synths.lock().unwrap().clone()
+    }
+    pub fn synths_gen(&self) -> u64 {
+        self.synths_gen.load(Ordering::Relaxed)
+    }
+    pub fn set_default_synth(&self, synth: Option<Arc<crate::synth::Instance>>) {
+        *self.default_synth.lock().unwrap() = synth;
+    }
+    pub fn default_synth(&self) -> Option<Arc<crate::synth::Instance>> {
+        self.default_synth.lock().unwrap().clone()
+    }
+
+    /// The synth a track actually renders through (binding, else default).
+    fn synth_for(&self, t: usize) -> Option<Arc<crate::synth::Instance>> {
+        self.synths()
+            .get(t)
+            .cloned()
+            .flatten()
+            .or_else(|| self.default_synth())
+    }
+
+    pub fn set_sample_rate(&self, sr: u32) {
+        self.sample_rate.store(sr, Ordering::Relaxed);
+        let assets = self.assets();
+        crate::synth::set_host_assets(assets, sr);
+    }
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Relaxed)
     }
 
     pub fn assets(&self) -> Arc<AssetTable> {
@@ -875,11 +961,46 @@ impl Engine {
             let (pgl, pgr) = pan_gains(self.loop_pan(t));
             let pdown = (pgl + pgr) * F1S2;
             let chain = self.fx.lock().unwrap()[t].clone();
+            let midi = self.midi();
+            // MIDI clips first: the whole track's patterns through one fresh
+            // synth, then through the same track FX + gain as audio clips.
+            if arr.tracks[t]
+                .lanes
+                .iter()
+                .any(|l| l.clips.iter().any(|c| matches!(midi.get(c.asset as usize), Some(Some(_)))))
+            {
+                if let Some(inst) = self.synth_for(t).and_then(|i| i.spawn_fresh()) {
+                    let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+                    for lane in &arr.tracks[t].lanes {
+                        for cl in &lane.clips {
+                            if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                                stage_midi_events(pat, cl, self.sample_rate().max(1), &mut ev);
+                            }
+                        }
+                    }
+                    let mut buf = vec![0.0f32; len.max(1)];
+                    render_midi_events(&inst, &mut ev, 0, len.max(1), &mut buf);
+                    let chain = self.fx.lock().unwrap()[t].clone();
+                    let fx: Vec<Arc<crate::fx::Instance>> = chain
+                        .slots()
+                        .iter()
+                        .filter_map(|s| s.inst.spawn_fresh(&s.desc))
+                        .collect();
+                    for (k, x) in buf.into_iter().enumerate().take(out.len()) {
+                        any = true;
+                        let mut s = x * tamp;
+                        for f in &fx {
+                            s = f.process_private(s);
+                        }
+                        out[k] += s * pdown;
+                    }
+                }
+            }
             for lane in &arr.tracks[t].lanes {
                 for cl in &lane.clips {
                     let data = match assets.get(cl.asset as usize) {
-                        Some(d) => d,
-                        None => continue,
+                        Some(d) if !d.is_empty() => d,
+                        _ => continue, // empty (MIDI) or dangling asset
                     };
                     any = true;
                     // Fresh private instances per clip: every clip starts at
@@ -932,6 +1053,8 @@ impl Engine {
     pub fn render_selection(&self, items: &[(usize, usize, usize)]) -> Option<(u64, Vec<f32>)> {
         let arr = self.arrangement();
         let assets = self.assets();
+        let midi = self.midi();
+        let sr = self.sample_rate().max(1);
         let clips: Vec<(usize, crate::arrange::Clip)> = items
             .iter()
             .filter_map(|(t, k, c)| {
@@ -944,7 +1067,13 @@ impl Engine {
             })
             .collect();
         let alen = |c: &crate::arrange::Clip| -> u64 {
-            assets.get(c.asset as usize).map(|d| d.len() as u64).unwrap_or(0)
+            match midi.get(c.asset as usize) {
+                Some(Some(pat)) => pat.len_samples(sr),
+                _ => assets
+                    .get(c.asset as usize)
+                    .map(|d| d.len() as u64)
+                    .unwrap_or(0),
+            }
         };
         let from = clips.iter().map(|(_, c)| c.pos).min()?;
         let to = clips.iter().map(|(_, c)| c.end(alen(c))).max()?;
@@ -955,14 +1084,37 @@ impl Engine {
         let mut out = vec![0.0f32; len];
         let chains = self.fx.lock().unwrap().clone();
         for (t, cl) in &clips {
-            let data = match assets.get(cl.asset as usize) {
-                Some(d) => d,
-                None => continue,
-            };
             let tamp = self.loop_vol(*t) * self.loop_gain(*t);
             let (pgl, pgr) = pan_gains(self.loop_pan(*t));
             let pdown = (pgl + pgr) * F1S2;
             let chain = chains[*t].clone();
+            // MIDI clip: fresh synth copy + fresh chain, same treatment as
+            // an audio clip (phase 0, live state untouched).
+            if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                if let Some(inst) = self.synth_for(*t).and_then(|i| i.spawn_fresh()) {
+                    let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+                    stage_midi_events(pat, cl, sr, &mut ev);
+                    let mut buf = vec![0.0f32; len];
+                    render_midi_events(&inst, &mut ev, from, len, &mut buf);
+                    let fx: Vec<Arc<crate::fx::Instance>> = chain
+                        .slots()
+                        .iter()
+                        .filter_map(|s| s.inst.spawn_fresh(&s.desc))
+                        .collect();
+                    for (k, x) in buf.into_iter().enumerate() {
+                        let mut s2 = x * tamp;
+                        for f in &fx {
+                            s2 = f.process_private(s2);
+                        }
+                        out[k] += s2 * pdown;
+                    }
+                }
+                continue;
+            }
+            let data = match assets.get(cl.asset as usize) {
+                Some(d) if !d.is_empty() => d,
+                _ => continue,
+            };
             let fx: Vec<Arc<crate::fx::Instance>> = chain
                 .slots()
                 .iter()
@@ -1118,6 +1270,7 @@ fn run(
     // Sample rate is queryable before activation; the metronome grid is
     // sized from it.
     let sr = client.sample_rate();
+    engine.set_sample_rate(sr);
     let proc = Proc {
         midi_in: midi_port,
         ports: RawPorts {
@@ -1159,6 +1312,17 @@ fn run(
         preview_idx: 0,
         preview_live: false,
         clip_buf: Vec::new(),
+        synths_cache: engine.synths(),
+        synths_cache_gen: engine.synths_gen(),
+        dflt_synth: engine.default_synth(),
+        midi_cache: engine.midi(),
+        midi_cache_gen: engine.midi_gen(),
+        midi_ev: Vec::new(),
+        midi_scratch: Vec::new(),
+        midi_live: [false; MAX_LOOPS],
+        synth_p: [0.0f32; crate::synth::MAX_PARAMS],
+        synth_pg: [0u64; MAX_LOOPS],
+        mono: Vec::new(),
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -1239,6 +1403,11 @@ fn run(
             Ok(Cmd::SetProject { assets, arr, len }) => {
                 engine.set_project(assets, arr, len);
             }
+            Ok(Cmd::SetMidiAssets(midi)) => engine.set_midi_assets(midi),
+            Ok(Cmd::SetTrackSynth { i, synth }) => {
+                engine.set_track_synth(i.min(MAX_LOOPS - 1), synth)
+            }
+            Ok(Cmd::SetDefaultSynth(s)) => engine.set_default_synth(s),
             Ok(Cmd::ExportTrack { i, path, fmt }) => {
                 let i = i.min(MAX_LOOPS - 1);
                 match engine.render_track(i) {
@@ -1719,6 +1888,240 @@ struct ClipEntry {
 
 unsafe impl Send for ClipEntry {}
 
+/// Stage one MIDI pattern clip's events into a shared list, keyed by
+/// ABSOLUTE timeline sample (kind: 0=note-off 1=CC 2=pressure 3=note-on).
+/// Shared by the offline renders; the RT path stages per block inline.
+fn stage_midi_events(
+    pat: &crate::midipat::Pattern,
+    cl: &crate::arrange::Clip,
+    sr: u32,
+    ev: &mut Vec<(u64, u8, u8, u8, u8)>,
+) {
+    let avail = pat.len_samples(sr);
+    let span = cl.span(avail);
+    let base = cl.pos.saturating_sub(cl.cut);
+    for note in pat.notes.iter() {
+        let s0 = pat.ticks_to_samples(note.start, sr);
+        if s0 < cl.cut || s0 - cl.cut >= span {
+            continue;
+        }
+        let on = base + s0;
+        ev.push((on, 3, note.ch, note.note, note.vel));
+        let len_s = pat.ticks_to_samples(note.len, sr).max(1);
+        ev.push((on + len_s, 0, note.ch, note.note, 0));
+    }
+    for m in pat.ccs.iter() {
+        let s = pat.ticks_to_samples(m.at, sr);
+        if s < cl.cut || s - cl.cut >= span {
+            continue;
+        }
+        ev.push((base + s, 1, m.ch, m.num, m.val));
+    }
+    for m in pat.press.iter() {
+        let s = pat.ticks_to_samples(m.at, sr);
+        if s < cl.cut || s - cl.cut >= span {
+            continue;
+        }
+        ev.push((base + s, 2, m.ch, 0, m.val));
+    }
+}
+
+/// Render staged absolute-sample events through `inst` into `len` samples
+/// of `out` (starting at timeline `from`). Events outside the window are
+/// ignored; notes ringing at `from` simply start ringing at sample 0 of
+/// this bounce (offline bounces are stateless).
+pub fn render_midi_events(
+    inst: &crate::synth::Instance,
+    ev: &mut [(u64, u8, u8, u8, u8)],
+    from: u64,
+    len: usize,
+    out: &mut [f32],
+) {
+    let mut p: [f32; crate::synth::MAX_PARAMS] = [0.0; crate::synth::MAX_PARAMS];
+    inst.read_params(&mut p);
+    let mut ev: Vec<(usize, u8, u8, u8, u8)> = ev
+        .iter()
+        .filter(|(at, ..)| *at >= from && *at - from < len as u64)
+        .map(|(at, k, c, d1, d2)| ((*at - from) as usize, *k, *c, *d1, *d2))
+        .collect();
+    // Note-offs (kind 0) before note-ons (kind 3) at one sample.
+    ev.sort_unstable();
+    let mut cur = 0usize;
+    let mut i = 0usize;
+    while i < ev.len() {
+        let off = ev[i].0.min(len);
+        if off > cur {
+            let end = off.min(out.len());
+            if end > cur {
+                unsafe { inst.process_into(&mut out[cur..end], &p) };
+                cur = end;
+            }
+        }
+        while i < ev.len() && ev[i].0 == off {
+            let (_, kind, ch, d1, d2) = ev[i];
+            match kind {
+                0 => inst.note_off(ch, d1),
+                1 => inst.cc(ch, d1, d2),
+                2 => inst.press(ch, d2),
+                _ => inst.note_on(ch, d1, d2),
+            }
+            i += 1;
+        }
+    }
+    if cur < out.len() {
+        unsafe { inst.process_into(&mut out[cur..], &p) };
+    }
+    inst.all_off();
+}
+
+impl Proc {
+    /// Render every MIDI pattern clip sounding this block through each
+    /// track's synth into `midi_scratch[t]` (mono). Notes are triggered by
+    /// the pattern; a note whose head was trimmed away (`cut`) stays silent,
+    /// one already ringing keeps ringing inside the synth until its off
+    /// event — contiguous blocks make that seamless, and a transport seek
+    /// `all_off`s everything. Returns whether any track produced sound.
+    fn render_midi_block(&mut self, p0: u64, block_n: usize) -> bool {
+        // Clear last block's scratch first (only rows that actually sounded).
+        for (t, live) in self.midi_live.iter_mut().enumerate() {
+            if *live {
+                self.midi_scratch[t].iter_mut().for_each(|x| *x = 0.0);
+                *live = false;
+            }
+        }
+        if !self.engine.transport_on() || self.midi_cache.is_empty() || block_n == 0 {
+            return false;
+        }
+        let sr = self.sr.max(1) as u32;
+        let span_end = p0 + block_n as u64;
+        let arr = self.arr.clone();
+        let dflt = self.dflt_synth.clone();
+        let engine = &self.engine;
+        let mut any = false;
+        let Proc {
+            midi_ev,
+            mono,
+            midi_scratch,
+            midi_live,
+            synth_p,
+            synth_pg,
+            synths_cache,
+            midi_cache,
+            ..
+        } = self;
+        for t in 0..MAX_LOOPS {
+            if !engine.track_on(t) {
+                continue;
+            }
+            let inst = match synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone()) {
+                Some(i) => i,
+                None => continue, // no synth loaded at all: silence
+            };
+            midi_ev.clear();
+            for l in arr.tracks[t].lanes.iter() {
+                for cl in l.clips.iter() {
+                    let Some(Some(pat)) = midi_cache.get(cl.asset as usize) else {
+                        continue;
+                    };
+                    let avail = pat.len_samples(sr);
+                    let span = cl.span(avail);
+                    // Clip timeline window vs this block.
+                    if cl.end(avail) <= p0 || cl.pos >= span_end {
+                        continue;
+                    }
+                    let base = cl.pos.saturating_sub(cl.cut);
+                    for note in pat.notes.iter() {
+                        let s0 = pat.ticks_to_samples(note.start, sr);
+                        if s0 < cl.cut || s0 - cl.cut >= span {
+                            continue; // head trimmed away or past clip end
+                        }
+                        let on = base + s0;
+                        let len_s = pat.ticks_to_samples(note.len, sr).max(1);
+                        if on >= p0 && on < span_end {
+                            midi_ev.push(((on - p0) as usize, 3, note.ch, note.note, note.vel));
+                            let off_tl = on + len_s;
+                            if off_tl >= p0 && off_tl < span_end {
+                                midi_ev.push(((off_tl - p0) as usize, 0, note.ch, note.note, 0));
+                            }
+                        } else if on < p0 && on + len_s > p0 && on + len_s <= span_end {
+                            // Rang in earlier; its off lands in this block.
+                            midi_ev.push(((on + len_s - p0) as usize, 0, note.ch, note.note, 0));
+                        }
+                    }
+                    for m in pat.ccs.iter() {
+                        let s = pat.ticks_to_samples(m.at, sr);
+                        if s < cl.cut || s - cl.cut >= span {
+                            continue;
+                        }
+                        let at = base + s;
+                        if at >= p0 && at < span_end {
+                            midi_ev.push(((at - p0) as usize, 1, m.ch, m.num, m.val));
+                        }
+                    }
+                    for m in pat.press.iter() {
+                        let s = pat.ticks_to_samples(m.at, sr);
+                        if s < cl.cut || s - cl.cut >= span {
+                            continue;
+                        }
+                        let at = base + s;
+                        if at >= p0 && at < span_end {
+                            midi_ev.push(((at - p0) as usize, 2, m.ch, 0, m.val));
+                        }
+                    }
+                }
+            }
+            if midi_ev.is_empty() {
+                continue;
+            }
+            // Sliders: only refetch when the GUI actually moved one.
+            let gen = inst.param_gen();
+            if gen != synth_pg[t] {
+                inst.read_params(synth_p);
+                synth_pg[t] = gen;
+            }
+            let row = &mut midi_scratch[t];
+            if row.len() < block_n {
+                row.clear();
+                row.resize(block_n, 0.0);
+            }
+            mono.clear();
+            mono.resize(block_n, 0.0);
+            // (offset, kind) ordering puts offs (kind 0) before ons (kind 3)
+            // at the same sample, so a retrigger never kills its own note.
+            midi_ev.sort_unstable();
+            let mut cur = 0usize;
+            let mut i = 0usize;
+            while i < midi_ev.len() {
+                let off = midi_ev[i].0.min(block_n);
+                if off > cur {
+                    // SAFETY: single-threaded here; one instance, one call.
+                    unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
+                    cur = off;
+                }
+                while i < midi_ev.len() && midi_ev[i].0 == off {
+                    let (_, kind, ch, d1, d2) = midi_ev[i];
+                    match kind {
+                        0 => inst.note_off(ch, d1),
+                        1 => inst.cc(ch, d1, d2),
+                        2 => inst.press(ch, d2),
+                        _ => inst.note_on(ch, d1, d2),
+                    }
+                    i += 1;
+                }
+            }
+            if cur < block_n {
+                unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
+            }
+            for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
+                *r += *m;
+            }
+            midi_live[t] = true;
+            any = true;
+        }
+        any
+    }
+}
+
 /// Realtime process handler. No allocation, no locks, no I/O: the slot pool
 /// is fixed at startup and its raw port pointers are cached here; per-cycle
 /// work is a handful of atomic loads plus one pass over the arrangement's
@@ -1787,6 +2190,24 @@ struct Proc {
     /// Reusable per-block clip window list (taken out of self during the
     /// block so the sample loop can call `&mut self` effect code freely).
     clip_buf: Vec<ClipEntry>,
+    // ---- MIDI playback ------------------------------------------------------
+    synths_cache: Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]>,
+    synths_cache_gen: u64,
+    dflt_synth: Option<Arc<crate::synth::Instance>>,
+    /// MIDI pattern table (parallel to `assets`; refreshed on `midi_gen`).
+    midi_cache: Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>,
+    midi_cache_gen: u64,
+    /// Events staged for the current block, sorted by (offset, kind):
+    /// (sample offset, kind 0=note-off 1=CC 2=pressure 3=note-on, ch, d1, d2).
+    midi_ev: Vec<(usize, u8, u8, u8, u8)>,
+    /// Per-track synth render output for this block (mixed into `acc`).
+    midi_scratch: Vec<Vec<f32>>,
+    midi_live: [bool; MAX_LOOPS],
+    /// Per-track cached synth param snapshot + change counter.
+    synth_p: [f32; crate::synth::MAX_PARAMS],
+    synth_pg: [u64; MAX_LOOPS],
+    /// Reusable mono render buffer for one track's synth block.
+    mono: Vec<f32>,
 }
 
 /// RT-side snapshot of one effect instance's sliders.
@@ -1910,6 +2331,26 @@ impl ProcessHandler for Proc {
                 self.assets_cache_gen = asg;
             }
         }
+        let sg = self.engine.synths_gen();
+        if sg != self.synths_cache_gen {
+            if let Ok(s) = self.engine.synths.try_lock() {
+                self.synths_cache = s.clone();
+                self.synths_cache_gen = sg;
+                self.dflt_synth = self
+                    .engine
+                    .default_synth
+                    .try_lock()
+                    .ok()
+                    .and_then(|d| d.clone());
+            }
+        }
+        let mg = self.engine.midi_gen();
+        if mg != self.midi_cache_gen {
+            if let Ok(m) = self.engine.midi.try_lock() {
+                self.midi_cache = m.clone();
+                self.midi_cache_gen = mg;
+            }
+        }
         // Pick up edited effect chains (user action only; try_lock so the
         // audio path can never block on the manager thread).
         let fxg = self.engine.fx_gen();
@@ -2011,6 +2452,15 @@ impl ProcessHandler for Proc {
         if let Some(p) = seek {
             self.pos = p.min(proj_len);
         }
+        if seek.is_some() {
+            // A jump in the timeline: nothing that was ringing still applies.
+            for inst in self.synths_cache.iter().flatten() {
+                inst.all_off();
+            }
+            if let Some(d) = &self.dflt_synth {
+                d.all_off();
+            }
+        }
         let mut p0 = self.pos;
         // Does the clock advance this block? ONLY the transport moves the
         // playhead — a bare metronome run ticks on its own free-running
@@ -2053,6 +2503,13 @@ impl ProcessHandler for Proc {
         if clip_sound {
             self.collect_clips(p0, block_n, &mut entries);
         }
+        // MIDI pattern clips of this block, rendered per track through the
+        // track's synth into `midi_scratch` (mixed in the sample loop).
+        let has_midi = if clip_sound {
+            self.render_midi_block(p0, block_n)
+        } else {
+            false
+        };
 
         // Cache this cycle's input buffers (raw pointers are stable). Only
         // the connected slots are kept, compacted to the front, so the sample
@@ -2203,11 +2660,18 @@ impl ProcessHandler for Proc {
             let mut play_l = 0.0f32;
             let mut play_r = 0.0f32;
             if live && mixer_live {
-                if has_entries {
+                if has_entries || has_midi {
                     acc.fill(0.0);
                     for e in entries.iter() {
                         if i >= e.i0 && i < e.i1 {
                             acc[e.track as usize] += unsafe { *e.ptr.add(i - e.i0) };
+                        }
+                    }
+                    if has_midi {
+                        for (t, ml) in self.midi_live.iter().enumerate() {
+                            if *ml && i < block_n {
+                                acc[t] += self.midi_scratch[t][i];
+                            }
                         }
                     }
                 }
