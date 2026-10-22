@@ -1173,6 +1173,33 @@ impl Engine {
         }
     }
 
+    /// Render staged MIDI events through a track's instrument AND its full
+    /// mixer chain — the piano roll's "preview through this track" voice,
+    /// so auditioning hears the same synth + effects the clip will play
+    /// through. Mono; the gain law mirrors the live order (track gain into
+    /// the chain; fader/pan belong to the mix, not the audition).
+    pub fn bounce_track_preview(
+        &self,
+        t: usize,
+        ev: &mut [(u64, u8, u8, u8, u8)],
+        len: usize,
+    ) -> Option<Vec<f32>> {
+        let h = self.synth_for(t)?;
+        let sr = self.sample_rate().max(1);
+        let n = len.max(1);
+        let mut buf = vec![0.0f32; n];
+        render_midi_any(&h, ev, 0, n, &mut buf, sr);
+        let tamp = self.loop_vol(t) * self.loop_gain(t);
+        if (tamp - 1.0).abs() > f32::EPSILON {
+            for x in buf.iter_mut() {
+                *x *= tamp;
+            }
+        }
+        let chain = self.fx.lock().unwrap()[t].clone();
+        run_chain_over(&chain, sr, &mut buf);
+        Some(buf)
+    }
+
     /// Render ONLY the listed clips (`(track, lane, clip index)` into the
     /// current snapshot), time-aligned so the earliest clip starts at
     /// sample 0 — the export counterpart of multi-clip selection. Track

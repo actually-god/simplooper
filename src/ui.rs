@@ -46,7 +46,7 @@ use crate::audio::{
 use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, TrackFxSave};
 use crate::fx;
 use crate::midipat::{Pattern, PPQ};
-use crate::midi::{hex, scale_axis, MidiAction, MidiBind, MidiMsg};
+use crate::midi::{hex, note_name, scale_axis, MidiAction, MidiBind, MidiMsg};
 use crate::synth;
 use crate::project::{self, ProjAsset, ProjClip, ProjMetro, ProjQuantize, ProjTrack, Project};
 use crate::quantize::{self, snap_start};
@@ -256,27 +256,68 @@ struct MidiRecState {
 }
 
 /// Floating piano-roll editor (the top-bar "Piano roll" window). Notes are
-/// drawn on a snap grid exactly like the timeline: drag on empty space draws
-/// a note, drag on a note moves it, right-click deletes.
+/// drawn on the metronome grid exactly like the timeline: drag on empty
+/// space draws a note, drag on a note moves its whole selection, drag a
+/// note's edges resizes it (loop-area-handle style), right-click deletes,
+/// Ctrl/Shift+drag on empty space rubber-band-selects. The window owns the
+/// full note-keyboard range through two scrollbars and closes with its X.
 struct PianoRoll {
     pat: Pattern,
     /// Horizontal zoom (px per beat) and row height (px per semitone).
     px_per_beat: f32,
     row_h: f32,
-    /// Lowest visible piano key.
-    lo_note: u8,
-    /// Horizontal scroll in seconds.
+    /// Pixels between the bottom of the canvas and the bottom of note 0 —
+    /// the vertical scroll position (driven by the vertical scrollbar and
+    /// the wheel). The lowest visible piano key is derived from it every
+    /// frame.
+    vscroll_px: f32,
+    /// Horizontal scroll in seconds (driven by the horizontal scrollbar).
     scroll_sec: f64,
     changed: bool,
-    /// In-flight note gesture: (note index, offset of the grab point
-    /// inside the note, seconds-per-snap at grab time).
-    drag: Option<(usize, f64)>,
+    /// In-flight canvas gesture (move / resize / marquee / fresh draw).
+    gesture: RollGesture,
     /// Canvas rect painted last frame (screen space) — the wheel router
     /// claims ctrl/alt-wheel gestures only while the pointer is over it.
     canvas_rect: Option<egui::Rect>,
     /// Velocity the next drawn note gets (FL carries a velocity knob in
     /// the roll toolbar instead of hard-coding one).
     new_vel: u8,
+    /// Selected note indices into `pat.notes`. The vec is only ever
+    /// REBUILT on selection gestures — `pat.sort()` runs at save only, so
+    /// indices stay valid while the window is open.
+    sel_notes: Vec<usize>,
+    /// Shift-range anchor note.
+    sel_anchor: Option<usize>,
+    /// Snapshot of the selected notes when a move-drag grabs: the group
+    /// moves rigidly from these bases regardless of what the selection
+    /// did mid-drag.
+    drag_notes: Vec<(usize, crate::midipat::Note)>,
+    /// True while the roll owns the keyboard: the roll then handles
+    /// Ctrl+C/V/A and Delete, and NO main-GUI shortcut fires (space must
+    /// not start the transport behind the roll).
+    focused: bool,
+    /// Full window frame (INCLUDING the title bar) from the last painted
+    /// frame. `WindowResponse.response.rect` excludes the title bar, so
+    /// anything that locates the title bar (tests, close logic) needs this.
+    win_rect: Option<egui::Rect>,
+}
+
+/// One in-flight piano-roll canvas gesture.
+#[derive(Clone, Copy)]
+enum RollGesture {
+    None,
+    /// Drag note bodies. `fresh` = the press drew a brand-new note (its
+    /// tail follows the pointer until release). `off` = seconds between
+    /// the grabbed point and the note start; `base` = that note's start
+    /// tick at grab time (the group moves by the pointer's snapped delta).
+    Move { idx: usize, off: f64, base: u32, fresh: bool },
+    /// Drag one note's edge: `edge` 0 = head (moves start, end pinned),
+    /// 1 = tail (end follows the pointer). `t0`/`end0` = note boundaries
+    /// in seconds at grab time.
+    Resize { idx: usize, edge: u8, t0: f64, end0: f64 },
+    /// Rubber-band box from `from` to the pointer. `add` keeps the
+    /// previous selection (Ctrl/Shift held at press).
+    Marquee { from: egui::Pos2, add: bool },
 }
 
 /// In-flight three-step calibration for one continuous (knob) MIDI binding.
@@ -493,6 +534,9 @@ fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str)> {
     }
 }
 
+/// A selected clip: (track, lane, index into the lane's clip list).
+type ClipId = (usize, usize, usize);
+
 /// The whole application: engine backend handle, persistent UI state, and
 /// the per-frame layout cache (`row_h` → [`App::track_rows`]) that keeps the
 /// timeline blocks and the Mixer dock strip-per-track aligned.
@@ -603,6 +647,14 @@ pub struct App {
     clipboard: Option<Clipboard>,
     /// Active clip-edge drag (trim / extend, non-destructive).
     clip_resize: Option<ClipResize>,
+    /// Rubber-band selection box in flight: (track, lane, x at press,
+    /// Ctrl/Shift held → keep the previous selection).
+    marquee: Option<(usize, usize, f32, bool)>,
+    /// Empty-grid press that may still become a marquee (before the drag
+    /// threshold): + selection snapshot taken at press.
+    marquee_pending: Option<(usize, usize, f32, bool, Vec<ClipId>)>,
+    /// The selection a marquee adds to (Ctrl/Shift box drag).
+    marquee_base: Vec<ClipId>,
 
     // --- asset rack ---
     rack: Vec<RackFolder>,
@@ -613,9 +665,14 @@ pub struct App {
     preview_enabled: bool,
     /// Text box value for the preview length in seconds.
     preview_secs: String,
-    /// Synth stem used to audition MIDI (piano roll picker); `None` = the
-    /// bundled fallback, `"__track__"` = the selected track's binding.
-    preview_synth: Option<String>,
+    /// Track whose instrument + mixer chain auditions MIDI (piano-roll
+    /// "preview through track" picker); `None` = the default synth script.
+    preview_track: Option<usize>,
+    /// Piano-roll note clipboard (Ctrl+C/V while the roll has focus).
+    roll_clip: Option<Vec<crate::midipat::Note>>,
+    /// Grid snap enable (main header checkbox). OFF = placement/resize
+    /// snaps to ONE SAMPLE — the program's minimum resolution.
+    snap_on: bool,
     /// Asset name currently auditioning (clicking it again toggles stop).
     preview_playing: Option<String>,
 
@@ -637,6 +694,10 @@ pub struct App {
     track_synth_inst: Vec<Option<Arc<crate::audio::SynthHandle>>>,
     /// Track whose synth sliders window is open.
     synth_win: Option<usize>,
+    /// Open VST2 custom editor windows, keyed by track. Closing (button,
+    /// window manager, or a plugin swap) dispatches `effEditClose` on the
+    /// editor thread before the plugin may be unloaded (`src/vstedit.rs`).
+    vst_editors: std::collections::HashMap<usize, crate::vstedit::EditorWindow>,
     midi_rec: Vec<MidiRecState>,
     piano_roll: Option<Box<PianoRoll>>,
 
@@ -876,12 +937,17 @@ impl App {
             last_click_track: None,
             clipboard: None,
             clip_resize: None,
+            marquee: None,
+            marquee_pending: None,
+            marquee_base: Vec::new(),
             rack,
             sel_asset: None,
             monitor_enabled: cfg.monitor_on,
             preview_enabled: cfg.preview_on,
             preview_secs: cfg.preview_secs.max(0.0).to_string(),
-            preview_synth: cfg.preview_synth.clone().filter(|s| !s.is_empty()),
+            preview_track: cfg.preview_track.map(|t| t as usize),
+            roll_clip: None,
+            snap_on: cfg.snap_on,
             preview_playing: None,
             proj_name: String::new(),
             project_dir: cfg.project_dir.clone(),
@@ -893,6 +959,7 @@ impl App {
             track_synth_params,
             track_synth_inst,
             synth_win: None,
+            vst_editors: std::collections::HashMap::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             piano_roll: None,
             fx_registry,
@@ -1109,34 +1176,52 @@ impl App {
             self.request_save(shift);
         }
 
-        if ctx.text_edit_focused() {
-            return;
-        }
-
         // Clip clipboard: Ctrl/Cmd+C copies the whole selection (a group of
         // clips spanning any number of tracks/lanes), Ctrl/Cmd+V places it
         // at the playhead on the last grid-clicked track (busy lanes open a
         // child lane automatically). Handled before action firing so a bare
-        // C/V binding never double-fires.
-        let (ccopy, cpaste, call) = ctx.input(|i| {
+        // C/V binding never double-fires — AND before the text-focus guard:
+        // egui keeps a TextEdit focused until another FOCUSABLE widget is
+        // clicked, and grid clips are plain painted rects, so the old
+        // "return early while any box has focus" meant Ctrl+C/V silently
+        // died the moment the user had ever touched the bpm/quantize/name
+        // boxes (the reported "copy/paste does nothing").
+        let (ccopy, cpaste) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(egui::Key::C),
                 i.modifiers.command && i.key_pressed(egui::Key::V),
-                i.modifiers.command && i.key_pressed(egui::Key::A),
             )
         });
+        if ccopy || cpaste {
+            // While the piano roll owns the keyboard these keys belong to
+            // the ROLL (handled in `piano_roll_window`) — never clips.
+            if !self.piano_roll.as_ref().is_some_and(|r| r.focused) {
+                if ccopy {
+                    self.clipboard_copy();
+                }
+                if cpaste {
+                    self.clipboard_paste();
+                }
+                return; // swallow the key
+            }
+        }
+
+        if ctx.text_edit_focused() {
+            return;
+        }
+
+        // The piano roll owns the keyboard while it has focus: no
+        // transport, no clip keys, no select-all behind it (space starting
+        // the transport mid-edit was the user complaint). The roll reads
+        // its own Ctrl+C/V/A/Delete inside its window code.
+        if self.piano_roll.as_ref().is_some_and(|r| r.focused) {
+            return;
+        }
+
+        let call = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A));
         if call {
             self.select_all_clips();
             return;
-        }
-        if ccopy || cpaste {
-            if ccopy {
-                self.clipboard_copy();
-            }
-            if cpaste {
-                self.clipboard_paste();
-            }
-            return; // swallow the key
         }
 
         // The knob wizard is its own learn mode: it does NOT set
@@ -1574,7 +1659,14 @@ impl App {
     }
 
     fn snap_unit(&self) -> f64 {
-        quantize::unit_samples(self.sample_rate, self.bpm(), SUBDIVISIONS[self.snap_sub].0)
+        // Snap OFF (main header checkbox) = the program's minimum
+        // resolution: one sample. Placement, drags and clip resize then
+        // land on any sample boundary, never the subdivision grid.
+        if self.snap_on {
+            quantize::unit_samples(self.sample_rate, self.bpm(), SUBDIVISIONS[self.snap_sub].0)
+        } else {
+            1.0
+        }
     }
 
     fn asset_len(&self, id: u32) -> u64 {
@@ -2043,7 +2135,8 @@ impl App {
             monitor_on: self.monitor_enabled,
             preview_on: self.preview_enabled,
             preview_secs: self.preview_secs_f(),
-            preview_synth: self.preview_synth.clone(),
+            preview_track: self.preview_track.map(|t| t as u32),
+            snap_on: self.snap_on,
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
@@ -2124,6 +2217,12 @@ impl App {
             }
             None => None,
         };
+        // A synth swap must close this track's editor synchronously: the
+        // engine may drop the old plugin the moment the command lands, and
+        // the editor thread must not outlive the AEffect it drives.
+        if let Some(mut w) = self.vst_editors.remove(&t) {
+            w.close();
+        }
         self.backend.cmd(Cmd::SetTrackSynth { i: t, synth: inst.clone() });
         self.track_synth_inst[t] = inst;
         true
@@ -2353,64 +2452,22 @@ impl App {
         self.status = format!("track {}: MIDI take → clip in lane {} (“{name}”)", t + 1, lane + 1);
     }
 
-    /// The synth used for every MIDI audition (piano roll PREVIEW, key
-    /// clicks, rack MIDI rows): the user's pick from the roll toolbar
-    /// (`config.preview_synth`; the `__track__` sentinel follows the
-    /// selected track's binding), then the bundled piano, then any stem.
+    /// The default script synth instance used when no track is picked for
+    /// auditioning: the bundled piano, then any stem.
     fn preview_synth_instance(&self) -> Option<std::sync::Arc<crate::synth::Instance>> {
         let reg = &self.synth_registry;
         let sr = self.sample_rate.max(1) as f64;
-        match self.preview_synth.as_deref() {
-            Some("__track__") => self
-                .track_synth_inst
-                .get(self.selected.min(self.n_tracks - 1))
-                .cloned()
-                .flatten()
-                // VSTi instruments preview through the fallback below;
-                // play them for real on their track's MIDI clips.
-                .and_then(|h| match h.as_ref() {
-                    SynthHandle::Script(i) => Some(i.clone()),
-                    SynthHandle::Vst(_) => None,
-                }),
-            Some(stem) => reg.create_instance(stem, sr, &[]),
-            None => None,
-        }
-        .or_else(|| reg.create_instance("piano", sr, &[]))
-        .or_else(|| {
+        reg.create_instance("piano", sr, &[]).or_else(|| {
             let alt = reg.stems().into_iter().next()?;
             reg.create_instance(&alt, sr, &[])
         })
     }
 
-    /// One short test note through the audition synth (piano-key click).
-    fn audition_note(&mut self, note: u8) {
-        let Some(inst) = self.preview_synth_instance() else {
-            self.status = "audition: no synth available".into();
-            return;
-        };
+    /// Stage a whole pattern as `(sample, kind, ch, d1, d2)` events for the
+    /// audition renderer (kind 3=note-on, 0=note-off, 1=CC, 2=pressure).
+    fn pattern_events(&self, pat: &Pattern) -> Vec<(u64, u8, u8, u8, u8)> {
         let sr = self.sample_rate.max(1);
-        let secs = 0.6f32;
-        let n = (secs * sr as f32) as usize;
-        let mut buf = vec![0.0f32; n];
-        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
-            (0, 3, 0, note, 100),
-            ((sr as u64) / 3, 0, 0, note, 0),
-        ];
-        crate::audio::render_midi_events(&inst, &mut ev, 0, n, &mut buf);
-        self.backend.cmd(Cmd::PreviewPlay {
-            samples: Arc::from(buf),
-        });
-        self.preview_playing = Some(format!("key {note}"));
-    }
-
-    /// Render a whole pattern through the audition synth for PREVIEW.
-    fn render_pattern_preview(&mut self, pat: &Pattern) -> Option<Arc<[f32]>> {
-        let inst = self.preview_synth_instance()?;
-        let sr = self.sample_rate.max(1);
-        let secs = self.preview_secs_f().min(30.0).min(pat.len_samples(sr) as f32 / sr as f32 + 2.0);
-        let n = (secs as usize) * sr as usize;
-        let mut buf = vec![0.0f32; n];
-        let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+        let mut ev = Vec::with_capacity(pat.notes.len() * 2 + pat.ccs.len() + pat.press.len());
         for note in pat.notes.iter() {
             let s0 = pat.ticks_to_samples(note.start, sr);
             ev.push((s0, 3, note.ch, note.note, note.vel));
@@ -2422,8 +2479,58 @@ impl App {
         for m in pat.press.iter() {
             ev.push((pat.ticks_to_samples(m.at, sr), 2, m.ch, 0, m.val));
         }
+        ev
+    }
+
+    /// Render staged events through the CURRENT audition target: when a
+    /// piano-roll track is picked, that track's instrument AND its whole
+    /// mixer chain (`bounce_track_preview`); otherwise the default script
+    /// synth. This is what makes "select a track to preview its synth +
+    /// effects" audible in the roll and every rack/key audition.
+    fn audition_render(&mut self, ev: &[(u64, u8, u8, u8, u8)], secs: f32) -> Option<Arc<[f32]>> {
+        let sr = self.sample_rate.max(1);
+        let n = ((secs.max(0.05)) as usize) * sr as usize;
+        if let Some(t) = self.preview_track {
+            let mut ev = ev.to_vec();
+            // None here only happens with no engine fallback voice yet
+            // (startup race) — degrade to the plain default synth rather
+            // than leave the user mute.
+            if let Some(buf) = self.backend.engine.bounce_track_preview(t, &mut ev, n) {
+                return Some(Arc::from(buf));
+            }
+        }
+        let inst = self.preview_synth_instance()?;
+        let mut ev = ev.to_vec();
+        let mut buf = vec![0.0f32; n];
         crate::audio::render_midi_events(&inst, &mut ev, 0, n, &mut buf);
         Some(Arc::from(buf))
+    }
+
+    /// One short test note through the audition target (piano-key click,
+    /// and the note-placement preview when the user drops a note).
+    fn audition_note(&mut self, note: u8) {
+        let sr = self.sample_rate.max(1);
+        let ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, note, 100),
+            ((sr as u64) / 3, 0, 0, note, 0),
+        ];
+        match self.audition_render(&ev, 0.6) {
+            Some(buf) => {
+                self.backend.cmd(Cmd::PreviewPlay { samples: buf });
+                self.preview_playing = Some(format!("key {note}"));
+            }
+            None => self.status = "audition: no synth available".into(),
+        }
+    }
+
+    /// Render a whole pattern through the audition target for PREVIEW.
+    fn render_pattern_preview(&mut self, pat: &Pattern) -> Option<Arc<[f32]>> {
+        let sr = self.sample_rate.max(1);
+        let secs = self
+            .preview_secs_f()
+            .min(30.0)
+            .min(pat.len_samples(sr) as f32 / sr as f32 + 2.0);
+        self.audition_render(&self.pattern_events(pat), secs)
     }
 
     /// Audition a MIDI asset through the default synth.
@@ -2447,35 +2554,129 @@ impl App {
         }
     }
 
-    /// The piano-roll editor window. Grid, snap and look follow the app's
-    /// timeline settings: drag empty space draws a snapped note (drag along
-    /// to lengthen it), drag a note moves it, right-click deletes it.
-    /// "save" bounces to a .mid in the primary folder, adds the asset and
-    /// places a clip on the selected track at the playhead.
+    /// The piano-roll editor window. Grid tempo is the MAIN metronome
+    /// bpm (the roll has no own bpm control); snap follows the main header
+    /// checkbox. Gestures: press empty = draw a note (drag = length),
+    /// press a note = select (+drag moves the whole selection, dragging
+    /// its yellow end caps resizes it, loop-area style), Ctrl/Shift+press
+    /// toggles / range-selects (notes) or rubber-band-selects (empty
+    /// space), right-click deletes. Two manual scrollbars cover the full
+    /// keyboard range and the pattern length; the window opens near
+    /// fullscreen, closes with its X, and owns the keyboard while focused
+    /// (space can never start the transport behind it).
     fn piano_roll_window(&mut self, ui: &mut egui::Ui) {
         let mut roll = match self.piano_roll.take() {
             Some(r) => r,
             None => return,
         };
+        // The roll has NO own tempo: the metronome bpm IS the project
+        // tempo, and the pattern grid follows it every frame.
+        roll.pat.bpm = self.bpm().clamp(20, 999) as u16;
+        let sr = self.sample_rate.max(1);
+        let sec_per_beat = 60.0 / roll.pat.bpm.max(20) as f64;
+        // Snap OFF (main header checkbox) = one sample, not a subdivision.
+        let step_sec = if self.snap_on {
+            sec_per_beat / SUBDIVISIONS[self.snap_sub].0.max(1) as f64
+        } else {
+            1.0 / sr as f64
+        };
+        let min_len_ticks = ((step_sec / sec_per_beat) * PPQ as f64).max(1.0) as u32;
+        let playhead = self.backend.engine.pos();
+        let sel = self.selected;
         let mut save = false;
         let mut clear = false;
         let mut preview = false;
         let mut bar_delta: i32 = 0;
-        let mut open = true;
-        let sr = self.sample_rate.max(1);
-        let q_step = SUBDIVISIONS[self.q_sub].0.max(1);
-        let snap_steps = SUBDIVISIONS[self.snap_sub].0.max(1);
-        let playhead = self.backend.engine.pos();
-        let sel = self.selected;
         let mut audition: Option<u8> = None;
+        // Preview fires when a NEW note lands (pointer released after a
+        // fresh draw) — immediate audible feedback while composing.
+        let mut placed: Option<u8> = None;
+        let mut open = true;
+
+        // ---- roll keyboard (only while the roll owns the keyboard;
+        // `handle_shortcuts` returns early for a focused roll, so these
+        // keys cannot double-fire on clips) ----
+        if roll.focused && !ui.ctx().text_edit_focused() {
+            let (c, v, a, d) = ui.ctx().input(|i| {
+                (
+                    i.modifiers.command && i.key_pressed(egui::Key::C),
+                    i.modifiers.command && i.key_pressed(egui::Key::V),
+                    i.modifiers.command && i.key_pressed(egui::Key::A),
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                )
+            });
+            if c {
+                let mut ns: Vec<crate::midipat::Note> = roll
+                    .sel_notes
+                    .iter()
+                    .filter_map(|i| roll.pat.notes.get(*i).copied())
+                    .collect();
+                if !ns.is_empty() {
+                    let m = ns.iter().map(|n| n.start).min().unwrap_or(0);
+                    for n in ns.iter_mut() {
+                        n.start -= m;
+                    }
+                    let k = ns.len();
+                    self.roll_clip = Some(ns);
+                    self.status =
+                        format!("copied {k} note(s) \u{b7} Ctrl+V pastes at the playhead");
+                }
+            }
+            if v {
+                if let Some(clip) = self.roll_clip.clone() {
+                    // Anchor the group's left edge at the playhead (the
+                    // same rule as the clip clipboard).
+                    let ph = (playhead as f64 / sr as f64
+                        * (roll.pat.bpm.max(20) as f64 / 60.0)
+                        * PPQ as f64)
+                        .round()
+                        .max(0.0) as u32;
+                    let mut idxs = Vec::with_capacity(clip.len());
+                    for n in clip.iter() {
+                        let mut n = *n;
+                        n.start += ph;
+                        roll.pat.notes.push(n);
+                        idxs.push(roll.pat.notes.len() - 1);
+                    }
+                    roll.sel_notes = idxs;
+                    roll.changed = true;
+                    self.status = format!("pasted {} note(s) at the playhead", clip.len());
+                }
+            }
+            if a {
+                roll.sel_notes = (0..roll.pat.notes.len()).collect();
+            }
+            if d && !roll.sel_notes.is_empty() {
+                let mut ids = roll.sel_notes.clone();
+                ids.sort_unstable();
+                ids.dedup();
+                for i in ids.into_iter().rev() {
+                    if i < roll.pat.notes.len() {
+                        roll.pat.notes.remove(i);
+                        // Indices after the hole shift down one.
+                        for s in roll.sel_notes.iter_mut() {
+                            if *s > i {
+                                *s -= 1;
+                            }
+                        }
+                    }
+                }
+                roll.sel_notes.clear();
+                roll.changed = true;
+            }
+        }
+
         // ---- roll wheel router ----
         // Pointer over the canvas: ctrl/cmd+wheel zooms time, alt+wheel
-        // zooms rows. The global filter left these events alone while
-        // over the roll; claim them before the ScrollArea reads the
-        // deltas (window content paints after the panels).
+        // zooms rows, PLAIN wheel scrolls the canvas (wheel-x horizontal,
+        // wheel-y vertical). The global filter left the ctrl/alt events
+        // alone while over the roll; claim them before anything else reads
+        // the deltas (window content paints after the panels).
         let over_canvas = roll
             .canvas_rect
             .is_some_and(|r| ui.ctx().pointer_hover_pos().is_some_and(|p| r.contains(p)));
+        let mut wheel_dx = 0.0f32;
+        let mut wheel_dy = 0.0f32;
         if over_canvas {
             let mut tz = 0.0f32;
             let mut rz = 0.0f32;
@@ -2498,14 +2699,14 @@ impl App {
                             tz += (delta.y * s).clamp(-1.5, 1.5);
                             false
                         } else {
-                            true
+                            wheel_dx += delta.x;
+                            wheel_dy += delta.y;
+                            false
                         }
                     }
                     _ => true,
                 });
-                if tz != 0.0 || rz != 0.0 {
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                }
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
             });
             if tz != 0.0 {
                 roll.px_per_beat = (roll.px_per_beat * tz.exp()).clamp(30.0, 400.0);
@@ -2514,365 +2715,743 @@ impl App {
                 roll.row_h = (roll.row_h * rz.exp()).clamp(6.0, 22.0);
             }
         }
-        egui::Window::new("\u{266b} Piano roll")
+        if wheel_dx != 0.0 {
+            // Plain wheel: horizontal = a quarter beat per line notch,
+            // vertical = two rows per notch (pitch scroll).
+            roll.scroll_sec =
+                (roll.scroll_sec - wheel_dx as f64 * 0.25 * sec_per_beat).max(0.0);
+        }
+        if wheel_dy != 0.0 {
+            roll.vscroll_px = (roll.vscroll_px + wheel_dy * roll.row_h * 2.0)
+                .clamp(0.0, (128.0 * roll.row_h - 40.0).max(0.0));
+        }
+
+        let screen = ui.ctx().viewport_rect();
+        let resp = egui::Window::new("\u{266b} Piano roll")
             .id(egui::Id::new("piano_roll_win"))
             .open(&mut open)
-            .default_size([760.0, 430.0])
+            // Fill the GUI: open near-fullscreen so composing gets room.
+            .default_pos(egui::pos2(36.0, 70.0))
+            .default_size([
+                (screen.width() - 64.0).clamp(560.0, 2600.0),
+                (screen.height() - 150.0).clamp(380.0, 2000.0),
+            ])
             .show(ui, |ui| {
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    // ---- toolbar ----
-                    ui.horizontal(|ui| {
-                        ui.label("bpm:");
-                        let mut b = roll.pat.bpm.to_string();
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut b))
-                            .changed()
-                        {
-                            if let Ok(v) = b.trim().parse::<u16>() {
-                                if (20..=999).contains(&v) {
-                                    roll.pat.bpm = v;
-                                    roll.changed = true;
-                                }
+                // ---- toolbar ----
+                ui.horizontal(|ui| {
+                    // FL-style routing: pick the TRACK whose instrument AND
+                    // mixer chain previews this pattern.
+                    ui.label("preview:");
+                    let cur_label = match self.preview_track {
+                        None => "\u{266a} default (piano)".to_string(),
+                        Some(t) => format!("\u{266a} track {}", t + 1),
+                    };
+                    let mut pick: Option<Option<usize>> = None;
+                    egui::ComboBox::from_id_salt("roll_track_pick")
+                        .width(150.0)
+                        .selected_text(RichText::new(cur_label).small())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.preview_track.is_none(), "default (piano)")
+                                .on_hover_text("Bundled piano script, no track chain")
+                                .clicked()
+                            {
+                                pick = Some(None);
                             }
-                        }
-                        // FL-style channel picker: which synth auditions
-                        // this pattern (PREVIEW button + piano-key clicks).
-                        ui.label("synth:");
-                        let stems = self.synth_registry.stems();
-                        let cur = self.preview_synth.clone();
-                        let cur_label = match cur.as_deref() {
-                            Some("__track__") => "track synth".to_string(),
-                            Some(s) => s.to_string(),
-                            None => "piano (default)".into(),
-                        };
-                        let mut pick: Option<Option<String>> = None;
-                        egui::ComboBox::from_id_salt("roll_synth_pick")
-                            .width(110.0)
-                            .selected_text(RichText::new(cur_label).small())
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(cur.is_none(), "piano (default)")
-                                    .clicked()
-                                {
-                                    pick = Some(None);
-                                }
+                            ui.separator();
+                            for t in 0..self.n_tracks {
+                                let lbl = self
+                                    .track_synth_inst
+                                    .get(t)
+                                    .and_then(|h| h.as_ref())
+                                    .map(|h| match h.as_ref() {
+                                        crate::audio::SynthHandle::Vst(e) => e.name().to_string(),
+                                        crate::audio::SynthHandle::Script(_) => {
+                                            self.track_synth[t].clone().unwrap_or_default()
+                                        }
+                                    })
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "piano (default)".into());
                                 if ui
                                     .selectable_label(
-                                        cur.as_deref() == Some("__track__"),
-                                        "track synth",
+                                        self.preview_track == Some(t),
+                                        format!("track {} \u{b7} {}", t + 1, lbl),
                                     )
+                                    .on_hover_text("Preview through this track's synth AND its effects chain")
                                     .clicked()
                                 {
-                                    pick = Some(Some("__track__".into()));
+                                    pick = Some(Some(t));
                                 }
-                                ui.separator();
-                                for s in &stems {
-                                    if ui
-                                        .selectable_label(cur.as_deref() == Some(s.as_str()), s)
-                                        .clicked()
-                                    {
-                                        pick = Some(Some(s.clone()));
-                                    }
-                                }
-                            });
-                        if let Some(v) = pick {
-                            self.preview_synth = v;
-                            self.save_config();
-                        }
-                        if ui
-                            .small_button("-bar")
-                            .on_hover_text("One bar shorter (notes beyond it are dropped)")
-                            .clicked()
-                        {
-                            bar_delta = -1;
-                        }
-                        if ui
-                            .small_button("+bar")
-                            .on_hover_text("One bar longer")
-                            .clicked()
-                        {
-                            bar_delta = 1;
-                        }
-                        if ui
-                            .small_button("quantize")
-                            .on_hover_text("Snap every note onto the quantize grid")
-                            .clicked()
-                        {
-                            let step = (PPQ as u32 * 4 / q_step.max(1)).max(1);
-                            roll.pat.quantize_grid(step, true);
-                            roll.changed = true;
-                        }
-                        if ui
-                            .small_button(
-                                RichText::new("\u{25b6} preview")
-                                    .color(Color32::from_rgb(120, 220, 160)),
-                            )
-                            .on_hover_text("Audition through the picked synth (toolbar 'synth:')")
-                            .clicked()
-                        {
-                            preview = true;
-                        }
-                        if ui.small_button("clear").clicked() {
-                            clear = true;
-                        }
-                        if ui
-                            .small_button(RichText::new("save").strong())
-                            .on_hover_text(
-                                "Save as a MIDI asset in the primary folder and place \
-                                 a clip on the selected track at the playhead",
-                            )
-                            .clicked()
-                        {
-                            save = true;
-                        }
-                        ui.label(
-                            RichText::new(format!(
-                                "{} notes \u{b7} {} bars",
-                                roll.pat.notes.len(),
-                                (roll.pat.len_ticks / (4 * PPQ as u32)).max(1)
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                    });
-                    // Pure time conversions (closures over roll.pat would
-                    // fight the borrow checker while editing notes).
-                    let sec_per_tick = 60.0 / (roll.pat.bpm.max(20) as f64 * PPQ as f64);
-                    let t_of = |tk: u32| -> f64 { tk as f64 * sec_per_tick };
-                    let tick_of = |t: f64| -> u32 { (t.max(0.0) / sec_per_tick).round() as u32 };
-                    // ---- canvas ----
-                    let rows: i32 = 49; // four octaves + C
-                    let sec_per_beat = 60.0 / roll.pat.bpm.max(20) as f64;
-                    let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
-                    let want = egui::vec2(
-                        (roll.pat.len_ticks as f64 / PPQ as f64 * roll.px_per_beat as f64)
-                            as f32
-                            + 80.0,
-                        (rows as f32 * roll.row_h + 6.0).max(220.0),
-                    );
-                    let (rect, resp) = ui.allocate_at_least(want, Sense::click_and_drag());
-                    let painter = ui.painter();
-                    if rect.width() <= 2.0 {
-                        return;
-                    }
-                    // Remembered for the wheel routers (global filter +
-                    // this window) on the NEXT frame.
-                    roll.canvas_rect = Some(rect);
-                    let keys_w = 58.0f32;
-                    let grid_x0 = rect.min.x + keys_w;
-                    painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
-                    let x_of = |t: f64| grid_x0 + ((t - roll.scroll_sec) * px_per_sec) as f32;
-                    let lo = roll.lo_note as i32;
-                    let hi = (lo + rows - 1).min(127);
-                    let y_of = |n: i32| rect.max.y - (n - lo) as f32 * roll.row_h - roll.row_h;
-                    let sec_at = |x: f32| {
-                        roll.scroll_sec + (x - grid_x0) as f64 / px_per_sec
-                    };
-                    // vertical grid: snap steps faint, beats medium, bars strong
-                    let step_sec = sec_per_beat / snap_steps as f64;
-                    let visible = (rect.width() - keys_w) as f64 / px_per_sec;
-                    let mut tt = (roll.scroll_sec / step_sec).floor() * step_sec;
-                    while tt < roll.scroll_sec + visible + step_sec {
-                        let x = x_of(tt);
-                        if x > grid_x0 {
-                            let beats = tt / sec_per_beat;
-                            let is_beat = (beats - beats.round()).abs() < 0.01;
-                            let is_bar = is_beat && ((beats.round() as i64) % 4 == 0);
-                            let col = if is_bar {
-                                Color32::from_gray(120)
-                            } else if is_beat {
-                                Color32::from_gray(75)
-                            } else {
-                                Color32::from_gray(45)
-                            };
-                            painter.line_segment(
-                                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
-                                egui::Stroke::new(if is_bar { 1.4f32 } else { 1.0f32 }, col),
-                            );
-                            if is_bar {
-                                painter.text(
-                                    egui::pos2(x + 2.0, rect.min.y + 6.0),
-                                    egui::Align2::LEFT_TOP,
-                                    format!("{}", (beats.round() as i64) / 4 + 1),
-                                    egui::FontId::proportional(9.0),
-                                    Color32::from_gray(150),
-                                );
                             }
-                        }
-                        tt += step_sec;
+                        });
+                    if let Some(v) = pick {
+                        self.preview_track = v;
+                        self.save_config();
                     }
-                    // keyboard strip + row lines
-                    for n in lo..=hi {
-                        let black = matches!((n.rem_euclid(12)) as u8, 1 | 3 | 6 | 8 | 10);
-                        let y = y_of(n);
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x, y),
-                                egui::pos2(rect.min.x + keys_w - 1.0, y + roll.row_h),
-                            ),
-                            0.0,
-                            if black {
-                                Color32::from_gray(28)
-                            } else {
-                                Color32::from_gray(58)
-                            },
-                        );
+                    if ui
+                        .small_button("-bar")
+                        .on_hover_text("One bar shorter (notes beyond it are dropped)")
+                        .clicked()
+                    {
+                        bar_delta = -1;
+                    }
+                    if ui
+                        .small_button("+bar")
+                        .on_hover_text("One bar longer")
+                        .clicked()
+                    {
+                        bar_delta = 1;
+                    }
+                    if ui
+                        .small_button("quantize")
+                        .on_hover_text("Snap every note onto the quantize grid")
+                        .clicked()
+                    {
+                        let q_step = SUBDIVISIONS[self.q_sub].0.max(1);
+                        let step = (PPQ as u32 * 4 / q_step.max(1)).max(1);
+                        roll.pat.quantize_grid(step, true);
+                        roll.changed = true;
+                    }
+                    if ui
+                        .small_button(
+                            RichText::new("\u{25b6} preview")
+                                .color(Color32::from_rgb(120, 220, 160)),
+                        )
+                        .on_hover_text(
+                            "Audition through the picked preview track (synth + chain)",
+                        )
+                        .clicked()
+                    {
+                        preview = true;
+                    }
+                    if ui.small_button("clear").clicked() {
+                        clear = true;
+                    }
+                    if ui
+                        .small_button(RichText::new("save").strong())
+                        .on_hover_text(
+                            "Save as a MIDI asset in the primary folder and place \
+                             a clip on the selected track at the playhead",
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{} notes \u{b7} {} bars \u{b7} {} bpm (metronome)",
+                            roll.pat.notes.len(),
+                            (roll.pat.len_ticks / (4 * PPQ as u32)).max(1),
+                            roll.pat.bpm
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                });
+                // Pure time conversions (closures over roll.pat would fight
+                // the borrow checker while editing notes).
+                let t_of = |tk: u32| -> f64 { tk as f64 * sec_per_beat / PPQ as f64 };
+                let tick_of = |t: f64| -> u32 { (t.max(0.0) * PPQ as f64 / sec_per_beat).round() as u32 };
+                let snap = |t: f64| (t / step_sec).floor() * step_sec;
+                let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
+
+                // ---- canvas (fills the rest of the window; the manual
+                // scrollbars painted on its edges own their pixels) ----
+                let avail = ui.available_size();
+                let (rect, resp) = ui.allocate_at_least(
+                    egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
+                    Sense::click_and_drag(),
+                );
+                if rect.width() <= 2.0 || rect.height() <= 2.0 {
+                    roll.canvas_rect = Some(rect);
+                    return;
+                }
+                // Remembered for the wheel routers on the NEXT frame.
+                roll.canvas_rect = Some(rect);
+                // Owned painter clipped to the canvas (painting before or
+                // after `ui`-mutating widgets never races).
+                let painter = ui.painter_at(rect);
+
+                const SB: f32 = 10.0; // scrollbar thickness
+                const KEYS_W: f32 = 58.0;
+                let grid_x0 = rect.min.x + KEYS_W;
+                let view_w = (rect.max.x - SB - grid_x0).max(40.0);
+                let view_h = (rect.height() - SB).max(40.0);
+                let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
+
+                // Keyboard range visible: derived from the vertical scroll.
+                let v_max = (128.0 * roll.row_h - view_h).max(0.0);
+                roll.vscroll_px = roll.vscroll_px.clamp(0.0, v_max);
+                let lo = ((roll.vscroll_px / roll.row_h).floor() as i32).clamp(0, 127) as u8;
+                let hi = (lo as i32 + (view_h / roll.row_h) as i32 + 2).min(127) as u8;
+                // Pixels from canvas bottom to the bottom of note 0.
+                let s_px = roll.vscroll_px;
+                painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
+                let x_of = |t: f64| grid_x0 + ((t - roll.scroll_sec) * px_per_sec) as f32;
+                let y_of = |n: i32| rect.max.y - SB - (s_px + n as f32 * roll.row_h) - roll.row_h;
+                let sec_at =
+                    |x: f32| roll.scroll_sec + (x - grid_x0) as f64 / px_per_sec;
+                let row_at = |y: f32| -> i32 {
+                    // Row n occupies y ∈ [B - n·r - r, B - n·r) where
+                    // B = bottom minus scrollbar minus vscroll, so the
+                    // exact inverse is ceil((B - y - r)/r). The old
+                    // floor(...)+lo floored to the row BELOW for any
+                    // interior click and double-counted the scroll
+                    // (s_px is already in B) — notes were only clickable
+                    // on their top pixel row.
+                    let b = rect.max.y - SB - s_px;
+                    (((b - y - roll.row_h) / roll.row_h).ceil() as i32).clamp(0, 127)
+                };
+
+                // vertical grid: snap steps faint, beats medium, bars strong
+                let visible = view_w as f64 / px_per_sec;
+                let mut tt = (roll.scroll_sec / step_sec).floor() * step_sec;
+                while tt < roll.scroll_sec + visible + step_sec {
+                    let x = x_of(tt);
+                    if x > grid_x0 {
+                        let beats = tt / sec_per_beat;
+                        let is_beat = (beats - beats.round()).abs() < 0.01;
+                        let is_bar = is_beat && ((beats.round() as i64) % 4 == 0);
+                        let col = if is_bar {
+                            Color32::from_gray(120)
+                        } else if is_beat {
+                            Color32::from_gray(75)
+                        } else {
+                            Color32::from_gray(45)
+                        };
                         painter.line_segment(
-                            [
-                                egui::pos2(grid_x0, y + roll.row_h),
-                                egui::pos2(rect.max.x, y + roll.row_h),
-                            ],
-                            egui::Stroke::new(0.5f32, Color32::from_gray(40)),
+                            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y - SB)],
+                            egui::Stroke::new(if is_bar { 1.4f32 } else { 1.0f32 }, col),
                         );
-                        if n.rem_euclid(12) == 0 {
+                        if is_bar {
                             painter.text(
-                                egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
-                                egui::Align2::LEFT_CENTER,
-                                format!("C{}", n.div_euclid(12) - 1),
-                                egui::FontId::proportional(8.0),
-                                Color32::from_gray(225),
+                                egui::pos2(x + 2.0, rect.min.y + 6.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{}", (beats.round() as i64) / 4 + 1),
+                                egui::FontId::proportional(9.0),
+                                Color32::from_gray(150),
                             );
                         }
                     }
-                    // pattern end + playhead markers
-                    let end_x = x_of(roll.pat.len_samples(sr) as f64 / sr as f64);
-                    if end_x > grid_x0 && end_x < rect.max.x + 2.0 {
-                        painter.line_segment(
-                            [egui::pos2(end_x, rect.min.y), egui::pos2(end_x, rect.max.y)],
-                            egui::Stroke::new(1.6f32, Color32::from_rgb(230, 180, 90)),
-                        );
+                    tt += step_sec;
+                }
+                // keyboard strip + row lines (only rows intersecting view)
+                for n in lo as i32..=hi as i32 {
+                    let black = matches!((n.rem_euclid(12)) as u8, 1 | 3 | 6 | 8 | 10);
+                    let y = y_of(n);
+                    if y > rect.max.y - SB || y + roll.row_h < rect.min.y {
+                        continue;
                     }
-                    let phx = x_of(playhead as f64 / sr as f64);
-                    if phx > grid_x0 && phx < rect.max.x {
-                        painter.line_segment(
-                            [egui::pos2(phx, rect.min.y), egui::pos2(phx, rect.max.y)],
-                            egui::Stroke::new(1.4f32, Color32::from_rgb(90, 220, 120)),
-                        );
-                    }
-                    // notes
-                    for (idx, note) in roll.pat.notes.iter().enumerate() {
-                        let n = note.note as i32;
-                        if n < lo || n > hi {
-                            continue;
-                        }
-                        let s0 = t_of(note.start);
-                        let dur = t_of(note.len.max(1));
-                        let x0 = x_of(s0).max(grid_x0);
-                        let x1 = x_of(s0 + dur).max(x0 + 2.0).min(rect.max.x);
-                        if x1 < grid_x0 {
-                            continue;
-                        }
-                        let y = y_of(n);
-                        let col = if roll.drag.is_some_and(|(d, _)| d == idx) {
-                            Color32::from_rgb(150, 200, 255)
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.min.x, y),
+                            egui::pos2(rect.min.x + KEYS_W - 1.0, y + roll.row_h),
+                        ),
+                        0.0,
+                        if black {
+                            Color32::from_gray(28)
                         } else {
-                            Color32::from_rgb(80, 150, 245)
-                        };
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(x0, y + 1.0),
-                                egui::pos2(x1, y + roll.row_h - 1.0),
-                            ),
-                            2.0,
-                            col,
+                            Color32::from_gray(58)
+                        },
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(grid_x0, y + roll.row_h),
+                            egui::pos2(rect.max.x - SB, y + roll.row_h),
+                        ],
+                        egui::Stroke::new(0.5f32, Color32::from_gray(40)),
+                    );
+                    if n.rem_euclid(12) == 0 {
+                        painter.text(
+                            egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            format!("C{}", n.div_euclid(12) - 1),
+                            egui::FontId::proportional(8.0),
+                            Color32::from_gray(225),
                         );
                     }
-                    // ---- gesture ----
-                    let snap = |t: f64| (t / step_sec).floor() * step_sec;
-                    let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
-                    if let Some(pt) = resp.interact_pointer_pos() {
-                        if pt.x >= grid_x0 && pt.y > rect.min.y && pt.y < rect.max.y {
-                            let sec = sec_at(pt.x);
-                            let note_row =
-                                (((rect.max.y - pt.y) / roll.row_h).floor() as i32 + lo).clamp(0, 127) as u8;
-                            if resp.secondary_clicked() {
-                                let before = roll.pat.notes.len();
-                                roll.pat.notes.retain(|n| {
-                                    let n0 = t_of(n.start);
-                                    let n1 = n0 + t_of(n.len.max(1));
-                                    !(n.note == note_row && sec >= n0 - 0.001 && sec <= n1 + 0.001)
-                                });
-                                roll.changed |= roll.pat.notes.len() != before;
-                            } else if resp.drag_started() {
-                                // Grab an existing note? Move it. Else draw.
-                                let hit = roll.pat.notes.iter().position(|n| {
-                                    let n0 = t_of(n.start);
-                                    let n1 = n0 + t_of(n.len.max(1));
-                                    n.note == note_row && sec >= n0 - 0.001 && sec <= n1
-                                });
-                                match hit {
-                                    Some(idx) => {
-                                        let n0 = t_of(roll.pat.notes[idx].start);
-                                        roll.drag = Some((idx, sec - n0));
-                                    }
-                                    None => {
-                                        let st = snap(sec);
-                                        let vel = roll.new_vel;
-                                        roll.pat.notes.push(crate::midipat::Note {
-                                            ch: 0,
-                                            note: note_row,
-                                            vel,
-                                            press: 0,
-                                            start: tick_of(st),
-                                            len: (tick_of(snap_up(sec)) - tick_of(st))
-                                                .max(PPQ as u32 / 8),
-                                        });
-                                        roll.drag = Some((roll.pat.notes.len() - 1, 0.0));
+                }
+                // pattern end + playhead markers
+                let end_x = x_of(roll.pat.len_samples(sr) as f64 / sr as f64);
+                if end_x > grid_x0 && end_x < rect.max.x {
+                    painter.line_segment(
+                        [egui::pos2(end_x, rect.min.y), egui::pos2(end_x, rect.max.y - SB)],
+                        egui::Stroke::new(1.6f32, Color32::from_rgb(230, 180, 90)),
+                    );
+                }
+                let phx = x_of(playhead as f64 / sr as f64);
+                if phx > grid_x0 && phx < rect.max.x - SB {
+                    painter.line_segment(
+                        [egui::pos2(phx, rect.min.y), egui::pos2(phx, rect.max.y - SB)],
+                        egui::Stroke::new(1.4f32, Color32::from_rgb(90, 220, 120)),
+                    );
+                }
+                // notes (+ yellow end caps on the selected ones — the
+                // resize handles, same language as the loop-area handles)
+                const EDGE_PX: f32 = 6.0;
+                let hover = ui.input(|i| i.pointer.hover_pos());
+                let mut hot_edge = false;
+                for (idx, note) in roll.pat.notes.iter().enumerate() {
+                    let n = note.note as i32;
+                    if n < lo as i32 - 1 || n > hi as i32 + 1 {
+                        continue;
+                    }
+                    let s0 = t_of(note.start);
+                    let dur = t_of(note.len.max(1));
+                    let x0 = x_of(s0);
+                    let x1 = (x_of(s0 + dur)).max(x0 + 2.0);
+                    if x1 < grid_x0 || x0 > rect.max.x {
+                        continue;
+                    }
+                    let y = y_of(n);
+                    let is_sel = roll.sel_notes.contains(&idx);
+                    let dragging = matches!(roll.gesture, RollGesture::Move { idx: d, .. } if d == idx);
+                    let col = if dragging {
+                        Color32::from_rgb(150, 200, 255)
+                    } else if is_sel {
+                        Color32::from_rgb(120, 185, 255)
+                    } else {
+                        Color32::from_rgb(80, 150, 245)
+                    };
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0.max(grid_x0), y + 1.0),
+                            egui::pos2(x1, y + roll.row_h - 1.0),
+                        ),
+                        2.0,
+                        col,
+                    );
+                    if is_sel {
+                        for ex in [x0, x1] {
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2((ex - 2.0).max(grid_x0), y + 1.0),
+                                    egui::pos2((ex + 2.0).min(rect.max.x), y + roll.row_h - 1.0),
+                                ),
+                                1.0,
+                                Color32::from_rgb(250, 200, 50),
+                            );
+                        }
+                    }
+                    if let Some(hp) = hover {
+                        let y_in = hp.y >= y && hp.y <= y + roll.row_h;
+                        if y_in
+                            && ((hp.x - x0).abs() <= EDGE_PX || (hp.x - x1).abs() <= EDGE_PX)
+                        {
+                            hot_edge = true;
+                        }
+                    }
+                }
+                // marquee rectangle while rubber-banding
+                if let RollGesture::Marquee { from, .. } = roll.gesture {
+                    if let Some(hp) = hover {
+                        painter.rect_stroke(
+                            egui::Rect::from_two_pos(from, hp),
+                            0.0,
+                            egui::Stroke::new(1.2f32, Color32::from_rgb(150, 200, 255)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+                // ================= gestures =================
+                let grid_top = rect.min.y;
+                let grid_bot = rect.max.y - SB;
+                let in_grid = |pt: egui::Pos2| {
+                    pt.x >= grid_x0 && pt.x <= rect.max.x - SB && pt.y >= grid_top && pt.y <= grid_bot
+                };
+                // Topmost note under a point (last drawn wins). Notes are
+                // passed in as an arg so the helper borrows nothing mutable.
+                let note_hit = |notes: &[crate::midipat::Note],
+                                pt: egui::Pos2|
+                 -> Option<(usize, f64, f64)> {
+                    let sec = sec_at(pt.x);
+                    let row = row_at(pt.y);
+                    if !(0..=127).contains(&row) {
+                        return None;
+                    }
+                    notes.iter().enumerate().rev().find_map(|(i, n)| {
+                        let n0 = t_of(n.start);
+                        let n1 = n0 + t_of(n.len.max(1));
+                        (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6)
+                            .then_some((i, n0, n1))
+                    })
+                };
+                if let Some(pt) = resp.interact_pointer_pos() {
+                    let mods = ui.input(|i| i.modifiers);
+                    // Right-click deletes the note under the cursor.
+                    if resp.secondary_clicked() && in_grid(pt) {
+                        {
+                            if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
+                                roll.pat.notes.remove(i);
+                                roll.sel_notes.retain(|s| *s != i);
+                                for s in roll.sel_notes.iter_mut() {
+                                    if *s > i {
+                                        *s -= 1;
                                     }
                                 }
                                 roll.changed = true;
-                            } else if let Some((idx, off)) = roll.drag {
-                                if idx < roll.pat.notes.len() {
-                                    let note = &mut roll.pat.notes[idx];
-                                    if off == 0.0 {
-                                        // Fresh draw: stretch to the pointer.
-                                        let tail = tick_of(snap_up(sec)).max(note.start + 1);
-                                        note.len = tail - note.start;
+                            }
+                        }
+                    }
+                    // ---- press decides the gesture + selection ----
+                    // (egui 0.36 has no press-edge Response; `is_pointer
+                    // _button_down_on` + "no gesture in flight yet" fires
+                    // exactly once per press and STILL catches presses on
+                    // the press frame — unlike drag_started, which only
+                    // fires after the pointer has already drifted past the
+                    // tiny edge-hit zones. That drift was why "can't grab
+                    // a clip/note edge" felt impossible.)
+                    if resp.is_pointer_button_down_on()
+                        && matches!(roll.gesture, RollGesture::None)
+                        && in_grid(pt)
+                    {
+                        let sec = sec_at(pt.x);
+                        let row = (row_at(pt.y).clamp(0, 127)) as u8;
+                        match note_hit(&roll.pat.notes, pt) {
+                            Some((idx, n0, n1)) => {
+                                let x1p = x_of(n1);
+                                let x0p = x_of(n0);
+                                if (x1p - pt.x).abs() <= EDGE_PX || (x0p - pt.x).abs() <= EDGE_PX {
+                                    // Edge cap: resize (loop-area-handle
+                                    // style). Head drag moves the start,
+                                    // tail drag the end.
+                                    let edge =
+                                        if (x1p - pt.x).abs() <= (x0p - pt.x).abs() { 1 } else { 0 };
+                                    if !roll.sel_notes.contains(&idx) {
+                                        roll.sel_notes = vec![idx];
+                                        roll.sel_anchor = Some(idx);
+                                    }
+                                    roll.gesture = RollGesture::Resize {
+                                        idx,
+                                        edge,
+                                        t0: n0,
+                                        end0: n1,
+                                    };
+                                } else {
+                                    // Body press: FL selection semantics.
+                                    if mods.command {
+                                        match roll.sel_notes.iter().position(|x| *x == idx) {
+                                            Some(p) => {
+                                                roll.sel_notes.remove(p);
+                                            }
+                                            None => roll.sel_notes.push(idx),
+                                        }
+                                        roll.sel_notes.sort_unstable();
+                                        roll.sel_anchor = Some(idx);
+                                    } else if mods.shift {
+                                        if let Some(a) = roll.sel_anchor.filter(|a| {
+                                            roll.pat.notes.get(*a).is_some()
+                                        }) {
+                                            let (a0, a1) = (
+                                                roll.pat.notes[a].start,
+                                                roll.pat.notes[idx].start,
+                                            );
+                                            let (lo_t, hi_t) = (a0.min(a1), a0.max(a1));
+                                            roll.sel_notes = roll
+                                                .pat
+                                                .notes
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, n)| n.start >= lo_t && n.start <= hi_t)
+                                                .map(|(i, _)| i)
+                                                .collect();
+                                        } else {
+                                            roll.sel_notes = vec![idx];
+                                            roll.sel_anchor = Some(idx);
+                                        }
+                                    } else if !roll.sel_notes.contains(&idx) {
+                                        roll.sel_notes = vec![idx];
+                                        roll.sel_anchor = Some(idx);
+                                    }
+                                    // Group move: snapshot every selected
+                                    // note; drag moves them all.
+                                    if roll.sel_notes.contains(&idx) {
+                                        let notes: Vec<(usize, crate::midipat::Note)> = roll
+                                            .sel_notes
+                                            .iter()
+                                            .filter_map(|i| {
+                                                roll.pat.notes.get(*i).copied().map(|n| (*i, n))
+                                            })
+                                            .collect();
+                                        let base = roll.pat.notes[idx].start;
+                                        roll.drag_notes = notes;
+                                        roll.gesture = RollGesture::Move {
+                                            idx,
+                                            off: sec - n0,
+                                            base,
+                                            fresh: false,
+                                        };
+                                    }
+                                }
+                                roll.changed = true;
+                            }
+                            None => {
+                                if mods.command || mods.shift {
+                                    // Rubber-band on empty space.
+                                    roll.gesture = RollGesture::Marquee {
+                                        from: pt,
+                                        add: mods.shift,
+                                    };
+                                } else {
+                                    // Draw a new note (drag lengthens it).
+                                    let st = tick_of(snap(sec));
+                                    roll.pat.notes.push(crate::midipat::Note {
+                                        ch: 0,
+                                        note: row,
+                                        vel: roll.new_vel,
+                                        press: 0,
+                                        start: st,
+                                        len: min_len_ticks,
+                                    });
+                                    let idx = roll.pat.notes.len() - 1;
+                                    roll.sel_notes = vec![idx];
+                                    roll.sel_anchor = Some(idx);
+                                    roll.drag_notes.clear();
+                                    roll.gesture = RollGesture::Move {
+                                        idx,
+                                        off: 0.0,
+                                        base: st,
+                                        fresh: true,
+                                    };
+                                    // Placement feedback: hear the note now.
+                                    placed = Some(row);
+                                    roll.changed = true;
+                                }
+                            }
+                        }
+                    } else if resp.dragged() {
+                        match roll.gesture {
+                            RollGesture::Move { idx, off, base, fresh } => {
+                                if idx >= roll.pat.notes.len() {
+                                    roll.gesture = RollGesture::None;
+                                } else if in_grid(pt) {
+                                    let sec = sec_at(pt.x);
+                                    let row = (row_at(pt.y).clamp(0, 127)) as u8;
+                                    if fresh {
+                                        // Fresh draw: the tail follows the
+                                        // pointer (FL stretch-draw).
+                                        let note = &mut roll.pat.notes[idx];
+                                        let tail = tick_of(snap_up(sec));
+                                        note.len = tail.saturating_sub(note.start).max(min_len_ticks);
+                                        note.note = row;
                                     } else {
-                                        // Move: follow the pointer (snapped).
-                                        note.start = tick_of(snap(sec - off).max(0.0));
-                                        note.note = note_row;
+                                        let d = tick_of(snap(sec - off).max(0.0)) as i64
+                                            - base as i64;
+                                        // Snapshot from the press frame —
+                                        // the selection may have changed
+                                        // since; the group moves rigidly.
+                                        let dn = std::mem::take(&mut roll.drag_notes);
+                                        // Pitch shift = rows the pointer
+                                        // moved since the grab.
+                                        let dnote = dn
+                                            .iter()
+                                            .find(|(i, _)| *i == idx)
+                                            .map(|(_, n)| row as i32 - n.note as i32)
+                                            .unwrap_or(0);
+                                        for (i, n) in dn.iter() {
+                                            if let Some(cur) = roll.pat.notes.get_mut(*i) {
+                                                cur.start = (n.start as i64 + d).max(0) as u32;
+                                                cur.note = (n.note as i32 + dnote)
+                                                    .clamp(0, 127)
+                                                    as u8;
+                                            }
+                                        }
+                                        roll.drag_notes = dn;
                                     }
                                     roll.changed = true;
                                 }
                             }
-                        } else if pt.x >= rect.min.x
-                            && pt.x < grid_x0
-                            && pt.y > rect.min.y
-                            && pt.y < rect.max.y
-                            && resp.clicked_by(egui::PointerButton::Primary)
-                        {
-                            // FL: clicking a piano key plays that note.
-                            audition = Some(
-                                (((rect.max.y - pt.y) / roll.row_h).floor() as i32 + lo)
-                                    .clamp(0, 127) as u8,
-                            );
+                            RollGesture::Resize { idx, edge, t0, end0 } => {
+                                if idx < roll.pat.notes.len() && in_grid(pt) {
+                                    let sec = sec_at(pt.x);
+                                    let note = &mut roll.pat.notes[idx];
+                                    let st = tick_of(t0);
+                                    let en = tick_of(end0);
+                                    if edge == 1 {
+                                        let cand = tick_of(snap_up(sec).max(t0 + step_sec));
+                                        note.len = cand.saturating_sub(st).max(min_len_ticks);
+                                    } else {
+                                        let cand = tick_of(snap(sec).max(0.0))
+                                            .min(en.saturating_sub(min_len_ticks));
+                                        note.start = cand;
+                                        note.len = (en - cand).max(min_len_ticks);
+                                    }
+                                    roll.changed = true;
+                                }
+                            }
+                            RollGesture::Marquee { .. } => {} // painted live
+                            RollGesture::None => {}
                         }
                     }
-                                                if resp.drag_stopped() {
-                                                    roll.drag = None;
-                                                    roll.pat.sort();
-                                                }
-                });
+                    if resp.drag_stopped() {
+                        if let RollGesture::Marquee { from, add } = roll.gesture {
+                            let box_r = egui::Rect::from_two_pos(from, pt);
+                            let hits: Vec<usize> = roll
+                                .pat
+                                .notes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, n)| {
+                                    let x0 = x_of(t_of(n.start));
+                                    let x1 = x_of(t_of(n.start + n.len.max(1)));
+                                    let y0 = y_of(n.note as i32);
+                                    let yr = egui::Rect::from_min_max(
+                                        egui::pos2(x0.min(x1), y0),
+                                        egui::pos2(x0.max(x1), y0 + roll.row_h),
+                                    );
+                                    box_r.intersects(yr)
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+                            if add {
+                                for h in hits {
+                                    if !roll.sel_notes.contains(&h) {
+                                        roll.sel_notes.push(h);
+                                    }
+                                }
+                                roll.sel_notes.sort_unstable();
+                            } else {
+                                roll.sel_notes = hits;
+                            }
+                            roll.sel_anchor = roll.sel_notes.first().copied();
+                        }
+                        roll.gesture = RollGesture::None;
+                        roll.drag_notes.clear();
+                        // NOTE: the pattern is NOT re-sorted here — sorting
+                        // would invalidate every selection index. Sorting
+                        // happens at save (SMF write) only.
+                    }
+                    // Piano keys: click plays the note through the
+                    // preview track.
+                    if pt.x >= rect.min.x
+                        && pt.x < grid_x0
+                        && pt.y >= grid_top
+                        && pt.y <= grid_bot
+                        && resp.clicked_by(egui::PointerButton::Primary)
+                    {
+                        audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
+                    }
+                }
+                if hot_edge {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+
+                // ================= scrollbars =================
+                // Content extents → thumb sizes. Manual because the canvas
+                // is a painted rect, not a ScrollArea.
+                let content_w = (roll.pat.len_ticks as f64 / PPQ as f64 * roll.px_per_beat as f64)
+                    .max(view_w as f64);
+                let hbar = egui::Rect::from_min_max(
+                    egui::pos2(grid_x0, rect.max.y - SB),
+                    egui::pos2(rect.max.x - SB, rect.max.y),
+                );
+                let vbar = egui::Rect::from_min_max(
+                    egui::pos2(rect.max.x - SB, rect.min.y),
+                    egui::pos2(rect.max.x, rect.max.y - SB),
+                );
+                painter.rect_filled(hbar, 0.0, Color32::from_black_alpha(90));
+                painter.rect_filled(vbar, 0.0, Color32::from_black_alpha(90));
+                let h_max_px = (content_w - view_w as f64).max(0.0);
+                let thumb_w = (view_w as f64 / content_w * view_w as f64)
+                    .clamp(24.0, view_w as f64) as f32;
+                let hx = hbar.min.x
+                    + if h_max_px > 0.0 {
+                        (roll.scroll_sec * px_per_sec / h_max_px) as f32 * (hbar.width() - thumb_w)
+                    } else {
+                        0.0
+                    };
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(hx, hbar.min.y + 1.5), egui::pos2(hx + thumb_w, hbar.max.y - 1.5)),
+                    3.0,
+                    Color32::from_gray(120),
+                );
+                let thumb_h = (view_h / (128.0 * roll.row_h) * view_h).clamp(24.0, view_h);
+                let v_frac = if v_max > 0.0 {
+                    (roll.vscroll_px / v_max).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                // Bottom-anchored: fraction 0 (note 0 at the bottom) puts
+                // the thumb at the bar's bottom edge.
+                let vy = vbar.max.y - thumb_h - v_frac * (vbar.height() - thumb_h);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(vbar.min.x + 1.5, vy), egui::pos2(vbar.max.x - 1.5, vy + thumb_h)),
+                    3.0,
+                    Color32::from_gray(120),
+                );
+                // Alloced AFTER the canvas so the bars steal their pixels.
+                let hresp = ui.interact(hbar, egui::Id::new("roll_hsb"), Sense::drag());
+                if hresp.dragged_by(egui::PointerButton::Primary) || hresp.clicked() {
+                    if let Some(hp) = hresp.interact_pointer_pos() {
+                        if h_max_px > 0.0 && hbar.width() > thumb_w {
+                            let r = ((hp.x - hbar.min.x - thumb_w / 2.0)
+                                / (hbar.width() - thumb_w))
+                                .clamp(0.0, 1.0) as f64;
+                            roll.scroll_sec = r * h_max_px / px_per_sec;
+                        }
+                    }
+                }
+                if hresp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                let vresp = ui.interact(vbar, egui::Id::new("roll_vsb"), Sense::drag());
+                if vresp.dragged_by(egui::PointerButton::Primary) || vresp.clicked() {
+                    if let Some(hp) = vresp.interact_pointer_pos() {
+                        if v_max > 0.0 && vbar.height() > thumb_h {
+                            let r = ((vbar.max.y - hp.y - thumb_h / 2.0)
+                                / (vbar.height() - thumb_h))
+                                .clamp(0.0, 1.0) as f64;
+                            roll.vscroll_px = (r * v_max as f64) as f32;
+                        }
+                    }
+                }
+                if vresp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+
+                ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("- pitch").clicked() {
-                        roll.lo_note = roll.lo_note.saturating_sub(12);
-                    }
-                    if ui.button("+ pitch").clicked() {
-                        roll.lo_note = (roll.lo_note + 12).min(103);
-                    }
                     ui.add(Slider::new(&mut roll.new_vel, 1..=127).text("vel"))
                         .on_hover_text("Velocity of newly drawn notes");
-                    ui.label("zoom:");
                     ui.add(Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("px/beat"))
                         .on_hover_text("Ctrl+wheel over the grid does this too");
                     ui.add(Slider::new(&mut roll.row_h, 6.0..=22.0).text("row px"))
                         .on_hover_text("Alt+wheel over the grid does this too");
+                    ui.label(
+                        RichText::new(
+                            "drag empty = draw \u{b7} drag note = move \u{b7} yellow caps = resize \u{b7} ctrl/shift+drag = box select \u{b7} right-click = delete",
+                        )
+                        .weak()
+                        .small(),
+                    );
                 });
             });
+        // Keyboard focus: the LAST primary click decides. Inside the
+        // window → the roll owns Ctrl+C/V/A, Delete and swallows the
+        // global shortcuts; outside → the main GUI takes them back.
+        if let Some(win) = resp.as_ref() {
+            // Store the FULL window frame (title bar included) so tests
+            // and title-bar logic never have to re-scan stale geometry.
+            let rect = win.response.rect;
+            roll.win_rect = Some(rect);
+            if let Some(click) =
+                ui.ctx().input(|i| {
+                    if i.pointer.button_clicked(egui::PointerButton::Primary) {
+                        i.pointer.hover_pos()
+                    } else {
+                        None
+                    }
+                })
+            {
+                roll.focused = rect.contains(click);
+            }
+        }
         // A key in the piano strip was clicked: play it (deferred — the
         // renderer needs &mut self, which the window closure holds open).
         if let Some(n) = audition {
+            self.audition_note(n);
+        }
+        if let Some(n) = placed {
             self.audition_note(n);
         }
         // ---- toolbar actions deferred (need &mut self) ----
@@ -2893,11 +3472,15 @@ impl App {
                 pat.press.retain(|m| m.at < lim);
             }
             roll.changed = true;
+            roll.sel_notes.clear();
+            roll.sel_anchor = None;
         }
         if clear {
             roll.pat.notes.clear();
             roll.pat.ccs.clear();
             roll.pat.press.clear();
+            roll.sel_notes.clear();
+            roll.sel_anchor = None;
             roll.changed = true;
         }
         if preview {
@@ -2912,9 +3495,27 @@ impl App {
         }
         if save {
             self.save_piano_roll(&mut roll.pat, sel);
+            roll.sel_notes.clear();
+            roll.sel_anchor = None;
         }
         if !open {
+            // The X closes the roll for real (was: reopened next frame,
+            // leaving quit as the only escape).
             self.status = "piano roll closed (unsaved changes are kept until quit)".into();
+            return;
+        }
+        // Watchdog (mirrors the main grid's post-frame reaper): gestures
+        // ARM on press, so an armed gesture must die on button-up even
+        // when no drag ever started — a click's release lands on whatever
+        // widget holds the pointer (often the title bar), never on the
+        // canvas response, so without this a no-travel click sticks the
+        // roll in Move and every later press is ignored. Runs AFTER the
+        // window paints so a real drag's drag_stopped() commits first.
+        if !matches!(roll.gesture, RollGesture::None)
+            && !ui.ctx().input(|i| i.pointer.any_down())
+        {
+            roll.gesture = RollGesture::None;
+            roll.drag_notes.clear();
         }
         self.piano_roll = Some(roll);
     }
@@ -3117,10 +3718,18 @@ impl App {
                         continue; // the picker replaces the raw id slider
                     }
                     let mut nv = vals.get(k).copied().unwrap_or(pd.default);
-                    if ui
-                        .add(Slider::new(&mut nv, pd.min..=pd.max).text(&pd.label))
-                        .changed()
-                    {
+                    // Root note reads as STANDARD notation (C3, C#4, ...):
+                    // the slider steps whole semitones and shows the note
+                    // name instead of the raw MIDI number (AC3.1). The
+                    // stored/passed value is still the MIDI number.
+                    let is_root = sampler && k == 1 && pd.label == "root note";
+                    let mut sl = Slider::new(&mut nv, pd.min..=pd.max).text(&pd.label);
+                    if is_root {
+                        sl = sl
+                            .step_by(1.0)
+                            .custom_formatter(|n, _| note_name(n.round().clamp(0.0, 127.0) as u8));
+                    }
+                    if ui.add(sl).changed() {
                         inst.set_param(k, nv);
                         dirty = true;
                     }
@@ -3156,10 +3765,76 @@ impl App {
                     .weak()
                     .small(),
                 );
+                // Custom editor hosting: VST2 editors run in their own
+                // X11 window driven by effEditIdle (docs/PLUGINS.md).
+                if entry.has_editor() {
+                    let editing = self.vst_editors.contains_key(&t);
+                    let label = if editing {
+                        "\u{23f9} close plugin window"
+                    } else {
+                        "\u{1f5bc} open plugin window"
+                    };
+                    if ui.button(label).clicked() {
+                        if editing {
+                            self.vst_editors.remove(&t);
+                        } else if let Some(h) = entry.vst2_handle() {
+                            let pth = entry.path().to_string_lossy().into_owned();
+                            match crate::vstedit::open_editor(&h, pth.as_str(), entry.name()) {
+                                Ok(w) => {
+                                    self.status = format!(
+                                        "{}: editor window opened",
+                                        entry.name()
+                                    );
+                                    self.vst_editors.insert(t, w);
+                                }
+                                Err(e) => self.status = format!("plugin GUI: {e}"),
+                            }
+                        } else {
+                            self.status = "VST3 editor hosting is not available yet \
+                                           (the realtime engine owns the plugin; see \
+                                           docs/PLUGINS.md)"
+                                .into();
+                        }
+                    }
+                }
                 vst_param_sliders(ui, &entry);
             });
         if !open {
             self.synth_win = None;
+        }
+    }
+
+    /// Close editor windows that are user-closed, failed, or whose track
+    /// no longer hosts the plugin they were opened for.
+    fn reap_vst_editors(&mut self) {
+        let mut closed: Vec<usize> = Vec::new();
+        let mut refused = false;
+        for (t, w) in self.vst_editors.iter() {
+            let cur = match self
+                .track_synth_inst
+                .get(*t)
+                .and_then(|slot| slot.as_ref())
+            {
+                Some(arc) => match arc.as_ref() {
+                    crate::audio::SynthHandle::Vst(e) => {
+                        Some(e.path().to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+            if w.open_failed() {
+                refused = true;
+            }
+            if w.is_closed() || w.open_failed() || cur.as_deref() != Some(w.path()) {
+                closed.push(*t);
+            }
+        }
+        for t in closed {
+            self.vst_editors.remove(&t);
+        }
+        if refused {
+            self.status = "editor: plugin refused to open its window".into();
         }
     }
 
@@ -4020,6 +4695,12 @@ impl eframe::App for App {
             changed = true;
         }
 
+        // VST2 editor windows: drop ones the user closed (or whose plugin
+        // refused to open), and stale ones whose track swapped plugins —
+        // before the held-drop below, so `effEditClose` always precedes
+        // plugin teardown.
+        self.reap_vst_editors();
+
         // Late VST releases: plugins replaced or removed since the last
         // tick drop here, so destructors (and the VST3 teardown the runner
         // hands off) run on the creating thread, never the audio thread.
@@ -4148,10 +4829,16 @@ impl App {
         midi_monitor(ui, self);
         central_panels(ui, self);
 
-        // Watchdog: a scrub/clip drag that somehow loses its release event
-        // must not stick (rack drops now run on egui's native DnD).
+        // Watchdog: a scrub/clip/marquee drag that somehow loses its
+        // release event must not stick (rack drops now run on egui's
+        // native DnD; gestures now ARM on press, so every armed gesture
+        // must also die on button-up, drag or no drag).
         if !ui.ctx().input(|i| i.pointer.any_down()) {
             self.scrub_drag = false;
+            self.drag_clip = None;
+            self.clip_resize = None;
+            self.marquee = None;
+            self.marquee_pending = None;
             self.drag_loop_handle = None;
             if self.sep_drag.take().is_some() {
                 self.save_config();
@@ -4964,12 +5651,17 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 pat,
                 px_per_beat: 90.0,
                 row_h: 11.0,
-                lo_note: 36,
+                vscroll_px: 396.0,
                 scroll_sec: 0.0,
                 changed: false,
-                drag: None,
+                gesture: RollGesture::None,
                 canvas_rect: None,
                 new_vel: 100,
+                sel_notes: Vec::new(),
+                sel_anchor: None,
+                drag_notes: Vec::new(),
+                focused: true,
+                win_rect: None,
             }));
         }
         ui.label(RichText::new("grid:").strong());
@@ -4991,15 +5683,32 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 }
             });
         ui.label("snap");
-        egui::ComboBox::from_id_salt("snap_sub_cb")
-            .selected_text(SUBDIVISIONS[app.snap_sub].1)
-            .show_ui(ui, |ui| {
-                for (n, s) in SUBDIVISIONS.iter().enumerate() {
-                    if ui.selectable_value(&mut app.snap_sub, n, s.1).changed() {
-                        app.save_config();
+        // Master snap switch (requirement: OFF = snap to the program's
+        // minimum resolution — one sample — not to a subdivision).
+        if ui
+            .checkbox(&mut app.snap_on, "")
+            .on_hover_text(
+                "Snap on/off. When off, placement, drags and clip resize \
+                 land on any SAMPLE (no quantization to the grid).",
+            )
+            .changed()
+        {
+            app.save_config();
+        }
+        ui.add_enabled_ui(app.snap_on, |ui| {
+            egui::ComboBox::from_id_salt("snap_sub_cb")
+                .selected_text(SUBDIVISIONS[app.snap_sub].1)
+                .show_ui(ui, |ui| {
+                    for (n, s) in SUBDIVISIONS.iter().enumerate() {
+                        if ui.selectable_value(&mut app.snap_sub, n, s.1).changed() {
+                            app.save_config();
+                        }
                     }
-                }
-            });
+                });
+        });
+        if !app.snap_on {
+            ui.label(RichText::new("(off: 1 sample)").weak().small());
+        }
         ui.separator();
         // ---- looping (grid header) ----
         let mut lt = app.loop_tl;
@@ -5378,25 +6087,25 @@ fn lane_row(
             )
         })
         .collect();
-    // Edge zones of SELECTED clips become trim/extend handles.
-    const EDGE_PX: f32 = 6.0;
+    // Edge zones become trim/extend handles on ANY clip (grabbing an edge
+    // selects the clip on the way — the old "only selected clips resize"
+    // rule made the feature undiscoverable and read as broken).
+    const EDGE_PX: f32 = 7.0;
     let edge_at = |app: &App, pt: egui::Pos2| -> Option<(usize, u8)> {
-        let pos = s_at(x0, pt.x, sr, px);
-        let ci = clips.iter().position(|(c, _)| pos >= c.pos && pos < c.end(app.asset_len(c.asset)))?;
-        if !app.sel_clips.contains(&(t, k, ci)) {
-            return None;
+        let mut best: Option<(f32, usize, u8)> = None;
+        for (ci, (c, _)) in clips.iter().enumerate() {
+            let alen = app.asset_len(c.asset);
+            for (edge, ex) in [
+                (0u8, x_of(x0, c.pos, sr, px)),
+                (1u8, x_of(x0, c.end(alen), sr, px)),
+            ] {
+                let d = (pt.x - ex).abs();
+                if d <= EDGE_PX && best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, ci, edge));
+                }
+            }
         }
-        let c = clips[ci].0;
-        let alen = app.asset_len(c.asset);
-        let cx0 = x_of(x0, c.pos, sr, px);
-        let cx1 = x_of(x0, c.end(alen), sr, px);
-        if (pt.x - cx0).abs() <= EDGE_PX {
-            Some((ci, 0))
-        } else if (cx1 - pt.x).abs() <= EDGE_PX {
-            Some((ci, 1))
-        } else {
-            None
-        }
+        best.map(|(_, ci, edge)| (ci, edge))
     };
 
     // ---- paint (clipped to this strip) ----
@@ -5473,6 +6182,18 @@ fn lane_row(
             );
         }
         if sel {
+            // Yellow end caps = the resize handles (same language as the
+            // loop-area handles in the ruler and the piano roll notes).
+            for ex in [cx0, cx1] {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(ex - 2.0, cres.min.y),
+                        egui::pos2(ex + 2.0, cres.max.y),
+                    ),
+                    1.0,
+                    Color32::from_rgb(250, 200, 50),
+                );
+            }
             // Selection hint: these clips are what Delete removes.
             ui.painter().text(
                 egui::pos2(cx1 - 3.0, rect.min.y + 1.0),
@@ -5507,6 +6228,43 @@ fn lane_row(
     }
     ui.set_clip_rect(old_clip);
 
+    // Selection marquee (rubber box): (t, lane, x0, add) at press → x1
+    // follows the pointer; the selection is rebuilt live from the box.
+    if let Some((_mt, _mk, mx0, add)) = app.marquee {
+        if let Some(pt) = resp.interact_pointer_pos() {
+            let x1 = pt.x.clamp(rect.min.x, rect.max.x);
+            let (a, b) = (mx0.min(x1), mx0.max(x1));
+            let p0 = s_at(x0, a, sr, px);
+            let p1 = s_at(x0, b, sr, px);
+            let ids: Vec<(usize, usize, usize)> = clips
+                .iter()
+                .enumerate()
+                .filter(|(_, (c, _))| {
+                    let alen = app.asset_len(c.asset);
+                    c.pos < p1 && c.end(alen) > p0
+                })
+                .map(|(j, _)| (t, k, j))
+                .collect();
+            let mut ids = ids;
+            if add {
+                for b0 in &app.marquee_base {
+                    if b0.0 == t && b0.1 == k && !ids.contains(b0) {
+                        ids.push(*b0);
+                    }
+                }
+                ids.sort();
+            }
+            // Live preview while dragging: selection = box ∩ clips.
+            app.sel_clips = ids;
+            app.sel_anchor = app.sel_clips.first().copied();
+            ui.painter().rect_stroke(
+                egui::Rect::from_min_max(egui::pos2(a, rect.min.y), egui::pos2(b, rect.max.y)),
+                0.0,
+                egui::Stroke::new(1.2f32, Color32::from_rgb(150, 200, 255)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
     // ---- interactions ----
     // Release of a rack drag over this strip places the clip (the strip
     // receives it directly; the old manual cross-panel handoff never did).
@@ -5529,14 +6287,30 @@ fn lane_row(
     }
     // Any primary press in the grid remembers this track as the paste
     // target ("paste into the nearest track to the last click").
-    if resp.drag_started_by(egui::PointerButton::Primary) {
-        app.last_click_track = Some(t);
+    //
+    // GESTURES ARM ON PRESS, not on drag_started: egui only fires
+    // `drag_started` once the pointer has already travelled several pixels
+    // — by then a press that meant to grab a 6 px edge handle has drifted
+    // out of its own hit zone and the clip MOVES instead of resizing.
+    // That drift was the reported "clip length cannot be edited / notes
+    // cannot be adjusted" bug in both grids. Press-arming also lets an
+    // edge grab SELECT the clip on the way into the drag.
+    let no_gesture = app.drag_clip.is_none()
+        && app.clip_resize.is_none()
+        && app.marquee.is_none()
+        && app.marquee_pending.is_none()
+        && !app.scrub_drag;
+    if no_gesture && resp.is_pointer_button_down_on() {
         if let Some(pt) = resp.interact_pointer_pos() {
             if rect.contains(pt) {
+                app.last_click_track = Some(t);
                 let mods = ui.input(|i| i.modifiers);
                 let pos = s_at(x0, pt.x, sr, px);
-                // Edge of a SELECTED clip wins over everything: trim/extend.
+                // Edge of ANY clip wins over everything: trim/extend.
                 if let Some((ci, edge)) = edge_at(app, pt) {
+                    if !app.is_sel((t, k, ci)) {
+                        app.select_one((t, k, ci));
+                    }
                     let c = app.arr.tracks[t].lanes[k].clips[ci];
                     app.clip_resize = Some(ClipResize {
                         t,
@@ -5559,7 +6333,7 @@ fn lane_row(
                             } else if mods.shift
                                 && app.sel_anchor.is_some_and(|a| a.0 == t && a.1 == k)
                             {
-                                // Shift+click: the same-lane run between the
+                                // Shift+press: the same-lane run between the
                                 // anchor clip and this one, inclusive.
                                 let apos = app
                                     .sel_anchor
@@ -5569,10 +6343,17 @@ fn lane_row(
                                     .map(|c| c.pos)
                                     .unwrap_or(pos);
                                 let (lo, hi) = (apos.min(pos), apos.max(pos));
+                                // Intersect, don't just compare `pos`: the
+                                // click point sits INSIDE the clicked clip,
+                                // past its start, so a start-only filter
+                                // silently dropped the very clip clicked and
+                                // broke the run at both ends.
                                 let ids: Vec<(usize, usize, usize)> = clips
                                     .iter()
                                     .enumerate()
-                                    .filter(|(_, (c, _))| c.pos >= lo && c.pos <= hi)
+                                    .filter(|(_, (c, _))| {
+                                        c.pos <= hi && c.end(app.asset_len(c.asset)) >= lo
+                                    })
                                     .map(|(j, _)| (t, k, j))
                                     .collect();
                                 app.select_range(ids);
@@ -5613,13 +6394,18 @@ fn lane_row(
                             }
                         }
                         None => {
-                            // Empty grid = playhead handle: press-jumps on
-                            // release (below), drag keeps scanning; the
-                            // movement area spans the grid of every track
-                            // and matches the pinned ruler position 1:1.
-                            app.sel_clips.clear();
-                            app.sel_anchor = None;
+                            // Empty grid: press seeks (playhead jumps), drag
+                            // scrubs AND — once past a small threshold —
+                            // turns into the rubber-band selection box, so
+                            // dragging across clips multi-selects them.
+                            let add = mods.command || mods.shift;
+                            if !add {
+                                app.sel_clips.clear();
+                                app.sel_anchor = None;
+                            }
                             app.scrub_drag = true;
+                            app.marquee_pending =
+                                Some((t, k, pt.x, add, app.sel_clips.clone()));
                             app.backend.cmd(Cmd::Seek { pos });
                         }
                     }
@@ -5627,6 +6413,21 @@ fn lane_row(
             }
         }
     } else if resp.dragged_by(egui::PointerButton::Primary) {
+        // Pending marquee: leave scrub mode once the pointer really drags,
+        // so a horizontal rubber band can replace the playhead scan.
+        let pending = app.marquee_pending.clone();
+        if let Some((mt, mk, mx, add, base)) = pending {
+            if mt == t && mk == k {
+                if let Some(pt) = resp.interact_pointer_pos() {
+                    if (pt.x - mx).abs() > 6.0 {
+                        app.marquee = Some((mt, mk, mx, add));
+                        app.marquee_base = base;
+                        app.marquee_pending = None;
+                        app.scrub_drag = false;
+                    }
+                }
+            }
+        }
         if let Some(pt) = resp.interact_pointer_pos() {
             if app.scrub_drag {
                 if rect.contains(pt) {
@@ -5661,7 +6462,11 @@ fn lane_row(
                         // Start never moves before the asset's data begins,
                         // and the clip keeps at least one subdivision.
                         cand = cand.max(orig_start).min(r.end0.saturating_sub(unit));
-                        let new_cut = r.cut0 + (cand - r.pos0);
+                        // cand may sit LEFT of pos0 (re-exposing cut audio):
+                        // signed math, u64 would wrap (debug panics).
+                        let new_cut =
+                            (r.cut0 as i64 + (cand as i64 - r.pos0 as i64)).clamp(0, alen as i64)
+                                as u64;
                         let new_len = r.end0 - cand;
                         let avail = alen.saturating_sub(new_cut);
                         let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
@@ -7402,7 +8207,10 @@ mod tests {
         std::fs::create_dir_all(dir.join("slooper/effects")).unwrap();
         let samples = dir.join("samples");
         std::fs::create_dir_all(&samples).unwrap();
-        let data: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        // 3 s of sine: v07 clip tests need an asset comfortably longer
+        // than the clips they drag (30 k samples) so a 200 px edge drag
+        // at the default 160 px/s trims well past the asserted delta.
+        let data: Vec<f32> = (0..144_000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         crate::audio_io::export(
             &samples.join("kick.wav"),
             48000,
@@ -7419,6 +8227,18 @@ mod tests {
         let mut app = App::new(Backend::start());
         app.drain_events(); // discard the null-audio notice
         app.sample_rate = 48_000; // null audio never sends Evt::Ready
+        // Same wiring Evt::Ready performs in the real app: shared default
+        // piano instance + per-track bindings into the engine, so engine
+        // paths like bounce_track_preview have their fallback voice.
+        app.rebuild_all_synths();
+        // rebuild_all_synths sends SetDefaultSynth through the manager
+        // queue (async). Tests call engine paths SYNCHRONOUSLY, so apply
+        // the same default voice to the shared engine directly too.
+        app.backend.engine.set_default_synth(
+            app.synth_registry
+                .create_instance("piano", 48_000.0, &[])
+                .map(|i| std::sync::Arc::new(SynthHandle::Script(i))),
+        );
         app
     }
 
@@ -8609,9 +9429,10 @@ mod tests {
         );
 
         // 4) Preview renders audio: PreviewPlay fires and the status is not
-        // the "no synth available" failure.
+        // the "no synth available" failure. (Match the BUTTON, not the
+        // "preview:" combo label.)
         app.drain_events();
-        let pv = find_galley(&mut app, &ctx, "preview")
+        let pv = find_galley(&mut app, &ctx, "\u{25b6} preview")
             .expect("preview button")
             .center();
         frame(&mut app, &ctx, vec![moved(pv), btn_btn(pv, true)]);
@@ -8623,8 +9444,8 @@ mod tests {
         );
         assert_eq!(app.preview_playing.as_deref(), Some("piano roll"));
 
-        // 5) The toolbar synth picker: open the combo, pick "track synth",
-        // the choice lands in App state (and is persisted from there).
+        // 5) The preview TRACK picker (a combobox): open it, choose track 1
+        // so previews route through that track's synth + chain.
         let combo = {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -8636,7 +9457,7 @@ mod tests {
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
             let hit = out.shapes.iter().find_map(|cs| {
                 if let egui::epaint::Shape::Text(t) = &cs.shape {
-                    if t.galley.text() == "synth:" {
+                    if t.galley.text() == "preview:" {
                         return Some(t.pos);
                     }
                 }
@@ -8645,20 +9466,22 @@ mod tests {
             let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
             drop(prims);
             out.textures_delta.clear();
-            hit.expect("synth picker painted")
+            hit.expect("preview track picker painted")
         };
-        let cb = egui::pos2(combo.x + 60.0, combo.y + 6.0);
+        // The combobox button sits just right of the "preview:" label.
+        let cb = egui::pos2(combo.x + 120.0, combo.y + 6.0);
         frame(&mut app, &ctx, vec![moved(cb), btn_btn(cb, true)]);
         frame(&mut app, &ctx, vec![btn_btn(cb, false)]);
         frame(&mut app, &ctx, vec![]); // popup opens
-        let ts = find_galley(&mut app, &ctx, "track synth")
-            .expect("track synth popup row")
+        let tr = find_galley(&mut app, &ctx, "track 1")
+            .expect("track 1 popup row")
             .center();
-        frame(&mut app, &ctx, vec![moved(ts), btn_btn(ts, true)]);
-        frame(&mut app, &ctx, vec![btn_btn(ts, false)]);
-        assert_eq!(app.preview_synth.as_deref(), Some("__track__"));
-        // Track 1 has no synth binding → the fallback keeps preview alive.
-        let pv2 = find_galley(&mut app, &ctx, "preview")
+        frame(&mut app, &ctx, vec![moved(tr), btn_btn(tr, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(tr, false)]);
+        assert_eq!(app.preview_track, Some(0), "preview routes to track 1");
+        // Track 1 has no explicit synth binding → the fallback keeps the
+        // preview alive (synth + empty chain still renders).
+        let pv2 = find_galley(&mut app, &ctx, "\u{25b6} preview")
             .expect("preview button")
             .center();
         frame(&mut app, &ctx, vec![moved(pv2), btn_btn(pv2, true)]);
@@ -8804,5 +9627,600 @@ mod tests {
             "saved chain round-trips"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ================= v0.7 acceptance-criteria pins ======================
+    // (requirements list: scratch slooper-v07/REQUIREMENTS.md)
+
+    fn galley_at(app: &mut App, ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text().contains(needle) {
+                    // `galley.rect` is LOCAL to the shape; the absolute
+                    // center is `t.pos + (local.center() - local.min)`.
+                    // Adding then subtracting `t.pos` (the old code)
+                    // collapsed to the raw local center and pointed every
+                    // click at the screen origin.
+                    let local = t.galley.rect;
+                    return Some(t.pos + (local.center() - local.min));
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit.map(|c| egui::Rect::from_center_size(c, egui::vec2(6.0, 10.0)))
+    }
+
+    /// Biggest painted rect of an exact fill color.
+    fn painted_rect(app: &mut App, ctx: &egui::Context, rgb: (u8, u8, u8)) -> Option<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let rect = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                    let (r0, g0, b0, a0) = r.fill.to_tuple();
+                    if a0 == 255
+                        && (r0 as i16 - rgb.0 as i16).abs() <= 3
+                        && (g0 as i16 - rgb.1 as i16).abs() <= 3
+                        && (b0 as i16 - rgb.2 as i16).abs() <= 3
+                    {
+                        return Some(r.rect);
+                    }
+                }
+                None
+            })
+            .max_by(|a, b| {
+                (a.width() * a.height())
+                    .partial_cmp(&(b.width() * b.height()))
+                    .unwrap()
+            });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        rect
+    }
+
+    /// ALL painted rects of an exact fill color (clip bodies).
+    fn painted_rects(app: &mut App, ctx: &egui::Context, rgb: (u8, u8, u8)) -> Vec<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut rects: Vec<egui::Rect> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                    let (r0, g0, b0, a0) = r.fill.to_tuple();
+                    if a0 >= 100
+                        && (r0 as i16 - rgb.0 as i16).abs() <= 3
+                        && (g0 as i16 - rgb.1 as i16).abs() <= 3
+                        && (b0 as i16 - rgb.2 as i16).abs() <= 3
+                        && r.rect.width() > 4.0
+                    {
+                        return Some(r.rect);
+                    }
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        rects.sort_by(|a, b| a.min.x.partial_cmp(&b.min.x).unwrap());
+        rects
+    }
+
+    fn click_pt(app: &mut App, ctx: &egui::Context, p: egui::Pos2) {
+        frame(app, ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+    }
+
+    fn click_mod(app: &mut App, ctx: &egui::Context, p: egui::Pos2, m: egui::Modifiers) {
+        frame(app, ctx, vec![egui::Event::ModifiersChanged(m), moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false), egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+    }
+
+    fn drag_pt(app: &mut App, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        frame(app, ctx, vec![moved(from), btn(from, egui::PointerButton::Primary, true)]);
+        // A 1 px nudge starts the drag: the first motion frame past the
+        // press only arms egui's drag machinery, and canvases that commit
+        // every drag frame (piano roll) silently swallow a big first jump.
+        frame(app, ctx, vec![moved(from + egui::vec2(1.0, 0.0))]);
+        let mid = from + (to - from) * 0.5;
+        frame(app, ctx, vec![moved(mid)]);
+        frame(app, ctx, vec![moved(to)]);
+        // Land on the endpoint once more so handlers that commit with a
+        // frame of lag still see the true destination.
+        frame(app, ctx, vec![moved(to)]);
+        frame(app, ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+    }
+
+    /// Open the piano roll through the real toolbar button; returns the
+    /// painted canvas rect.
+    fn open_roll_headless(app: &mut App, ctx: &egui::Context) -> egui::Rect {
+        frame(app, ctx, vec![]);
+        let b = galley_at(app, ctx, "Piano roll").expect("piano roll toolbar button");
+        let p = b.center();
+        click_pt(app, ctx, p);
+        assert!(app.piano_roll.is_some(), "toolbar button opens the roll");
+        for _ in 0..24 {
+            frame(app, ctx, vec![]);
+        }
+        painted_rect(app, ctx, (22, 22, 26)).expect("roll canvas painted")
+    }
+
+    /// AC1.3, AC1.4, AC1.5, AC1.6, AC1.8.
+    #[test]
+    fn v07_roll_fills_scrolls_gates_and_closes() {
+        let mut app = headless_app("v07rollnav");
+        let ctx = egui::Context::default();
+        let canvas = open_roll_headless(&mut app, &ctx);
+
+        // AC1.3 the window fills most of the screen.
+        assert!(
+            canvas.width() > 1440.0 * 0.8 && canvas.height() > 853.0 * 0.55,
+            "roll must fill the GUI, got {canvas:?}"
+        );
+
+        // AC1.4 the roll follows the MAIN metronome bpm (no own control).
+        app.metro_bpm = String::from("97");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.bpm, 97, "roll bpm = main bpm");
+
+        // AC1.6 both scrollbars move the view. Make content scrollable.
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.len_ticks = 7680;
+            r.px_per_beat = 400.0;
+            r.scroll_sec = 0.0;
+            r.vscroll_px = 0.0;
+        }
+        frame(&mut app, &ctx, vec![]);
+        let c = painted_rect(&mut app, &ctx, (22, 22, 26)).expect("canvas");
+        click_pt(&mut app, &ctx, egui::pos2(c.max.x - 5.0, c.min.y + 12.0));
+        assert!(
+            app.piano_roll.as_ref().unwrap().vscroll_px > 0.0,
+            "vertical scrollbar click scrolls the pitch view"
+        );
+        click_pt(&mut app, &ctx, egui::pos2(c.max.x - 40.0, c.max.y - 5.0));
+        assert!(
+            app.piano_roll.as_ref().unwrap().scroll_sec > 0.1,
+            "horizontal scrollbar click scrolls the time view"
+        );
+
+        // AC1.5 a click inside the roll focuses it; space must NOT start
+        // the transport behind the roll.
+        let before = app.backend.engine.transport_on();
+        click_pt(&mut app, &ctx, egui::pos2(c.min.x + 300.0, c.min.y + 60.0));
+        assert!(app.piano_roll.as_ref().unwrap().focused, "click focuses the roll");
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Space, egui::Modifiers::NONE)]);
+        assert_eq!(
+            app.backend.engine.transport_on(),
+            before,
+            "space is swallowed while the roll owns the keyboard"
+        );
+
+        // AC1.8 the title-bar close button closes ONLY the roll.
+        // The X lives at the right end of the title bar — anchor on the
+        // stored full-frame rect (title bar included); hard-coded screen
+        // coordinates drifted the moment the window layout moved.
+        let mut closed = false;
+        let wr = app.piano_roll.as_ref().unwrap().win_rect.expect("roll frame rect");
+        for dx in [6.0f32, 12.0, 18.0, 24.0] {
+            for dy in [11.0f32, 16.0] {
+                click_pt(&mut app, &ctx, egui::pos2(wr.max.x - dx, wr.min.y + dy));
+                if app.piano_roll.is_none() {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                break;
+            }
+        }
+        assert!(closed, "the window X closes the piano roll alone");
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]); // app survives the close
+    }
+
+    /// AC1.7, AC7.2, AC8.4 (piano roll).
+    #[test]
+    fn v07_roll_edge_resize_group_move_and_clipboard() {
+        let mut app = headless_app("v07rolle");
+        let ctx = egui::Context::default();
+        let _canvas = open_roll_headless(&mut app, &ctx);
+        app.snap_on = false; // sample-granular gestures for exact deltas
+        let ppb = 400.0f32; // px/beat at 120 bpm
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.bpm = 120;
+            r.pat.len_ticks = 1920;
+            r.px_per_beat = ppb;
+            r.row_h = 9.0;
+            r.scroll_sec = 0.0;
+            r.vscroll_px = 0.0;
+            r.pat.notes = vec![
+                crate::midipat::Note { ch: 0, note: 48, vel: 100, press: 0, start: 480, len: 480 },
+                crate::midipat::Note { ch: 0, note: 50, vel: 100, press: 0, start: 960, len: 480 },
+            ];
+        }
+        frame(&mut app, &ctx, vec![]);
+        let c = painted_rect(&mut app, &ctx, (22, 22, 26)).expect("canvas");
+        let gx0 = c.min.x + 58.0;
+        let x_of = |t_ticks: u32| gx0 + (t_ticks as f64 / 480.0 * ppb as f64) as f32;
+        let y_of = |n: i32| c.max.y - 10.0 - n as f32 * 9.0 - 9.0;
+
+        // Focus the roll: click the title bar (does not draw a note).
+        // Anchor on the stored frame rect — a shape-scan title position
+        // goes stale as soon as the window's first-use auto-placement
+        // settles, and the click then lands outside the moved window.
+        let wr = app.piano_roll.as_ref().unwrap().win_rect.expect("roll frame rect");
+        click_pt(&mut app, &ctx, egui::pos2(wr.min.x + wr.width() * 0.5, wr.min.y + 10.0));
+        assert!(app.piano_roll.as_ref().unwrap().focused, "title click focuses the roll");
+
+        // AC8.4 click / ctrl+click / shift+click / marquee box on notes.
+        let b0 = egui::pos2(x_of(480) + 40.0, y_of(48) + 4.0);
+        let b1 = egui::pos2(x_of(960) + 40.0, y_of(50) + 4.0);
+        click_pt(&mut app, &ctx, b0);
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes,
+            vec![0],
+            "plain click selects one note"
+        );
+        click_mod(&mut app, &ctx, b1, egui::Modifiers::COMMAND);
+        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 2, "ctrl+click toggles in");
+        click_mod(&mut app, &ctx, b0, egui::Modifiers::SHIFT);
+        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 2, "shift+click runs from anchor");
+        click_mod(&mut app, &ctx, b1, egui::Modifiers::COMMAND);
+        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 1, "ctrl+click toggles out");
+        // Ctrl+drag a rubber band on empty canvas replaces the selection.
+        let from = egui::pos2(gx0 + 10.0, y_of(60) + 4.0);
+        let to = egui::pos2(x_of(1440) + 20.0, y_of(46) + 4.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                moved(from),
+                btn(from, egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![moved(from + (to - from) * 0.5)]);
+        frame(&mut app, &ctx, vec![moved(to), egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes.len(),
+            2,
+            "marquee box selects every intersected note"
+        );
+
+        // AC8.4 Ctrl+A selects all, AC7.2 copy + paste at the playhead.
+        // `i.modifiers` only updates from ModifiersChanged — an inline
+        // Key.modifiers alone never arms the command modifier.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::A, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 2, "Ctrl+A selects all");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(app.roll_clip.as_ref().map(|v| v.len()), Some(2), "Ctrl+C copies the notes");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes.len(), 4, "Ctrl+V pastes at the playhead");
+
+        // AC1.7 drag the RIGHT edge of note 0 outward: len grows, start
+        // fixed (loop-area-handle style). Press 2 px INSIDE the boundary
+        // — exactly on it falls outside the note's half-open x range.
+        let n0 = app.piano_roll.as_ref().unwrap().pat.notes[0];
+        let pe = egui::pos2(x_of(n0.start + n0.len) - 2.0, y_of(n0.note as i32) + 4.0);
+        drag_pt(&mut app, &ctx, pe, pe + egui::vec2(80.0, 0.0));
+        let after = app.piano_roll.as_ref().unwrap().pat.notes[0];
+        assert_eq!(after.start, n0.start, "tail drag pins the start");
+        let dl = after.len as f64 - n0.len as f64;
+        assert!((dl - 96.0).abs() < 10.0, "80px tail drag \u{2248} +96 ticks, got {dl}");
+
+        // AC1.7 head drag: start moves, end pinned.
+        let n0 = after;
+        let ph = egui::pos2(x_of(n0.start) + 2.0, y_of(n0.note as i32) + 4.0);
+        drag_pt(&mut app, &ctx, ph, ph + egui::vec2(40.0, 0.0));
+        let after2 = app.piano_roll.as_ref().unwrap().pat.notes[0];
+        assert_eq!(
+            after2.start + after2.len,
+            n0.start + n0.len,
+            "head drag pins the end"
+        );
+        assert!(after2.start > n0.start, "head drag moves the start right");
+
+        // AC8.4 group move: Ctrl+A then drag one note body — EVERY selected
+        // note shifts by the same snapped delta.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::A, egui::Modifiers::COMMAND),
+            ],
+        );
+        let before: Vec<u32> = app.piano_roll.as_ref().unwrap().pat.notes.iter().map(|n| n.start).collect();
+        let nb = app.piano_roll.as_ref().unwrap().pat.notes[0];
+        let pb = egui::pos2(
+            x_of(nb.start) + (((nb.len as f64 / 960.0) * 800.0) * 0.5) as f32,
+            y_of(nb.note as i32) + 4.0,
+        );
+        drag_pt(&mut app, &ctx, pb, pb + egui::vec2(160.0, 0.0));
+        let movedv: Vec<u32> = app.piano_roll.as_ref().unwrap().pat.notes.iter().map(|n| n.start).collect();
+        let d0 = movedv[0] as i64 - before[0] as i64;
+        assert!((d0 - 192).abs() < 10, "160px group drag \u{2248} +192 ticks, got {d0}");
+        for (b, m) in before.iter().zip(movedv.iter()) {
+            assert_eq!(*m as i64 - *b as i64, d0, "group moves rigidly");
+        }
+    }
+
+    /// AC5.1-AC5.3 (main GUI clip edges) + AC6.1/6.2 (snap toggle).
+    #[test]
+    fn v07_clip_edge_drag_and_snap_toggle() {
+        let mut app = headless_app("v07trim");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        // A synthetic 12 s asset so edge drags have room to move.
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 44_100 * 12].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "long".into(),
+            std::path::PathBuf::from("/tmp/long-test.wav"),
+            data,
+            false,
+        ));
+        let alen = app.asset_len(a);
+        assert!(alen > 300_000, "test asset must be long enough, got {alen}");
+        app.px_per_sec = 40.0; // 12 s asset = 480 px, fits the viewport
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        app.last_click_track = Some(0);
+        app.snap_on = false;
+        frame(&mut app, &ctx, vec![]);
+        // Selected clip body color. NOTE: selection is shown by a
+        // COL_CLIP_SEL *outline*; the body fill stays COL_CLIP·0.45
+        // either way, so geometry is anchored on the fill.
+        let sel_rgb = {
+            let c = crate::ui::COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        // The body fill is translucent (COL_CLIP·0.45 keeps alpha ~115),
+        // so match through painted_rects (alpha-tolerant) and take the
+        // biggest hit — `painted_rect`'s opaque-only filter never sees it.
+        let r0 = painted_rects(&mut app, &ctx, sel_rgb)
+            .into_iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("selected clip painted");
+        {
+            // The selection outline must be painted in COL_CLIP_SEL.
+            let (sr, sg, sb, _) = crate::ui::COL_CLIP_SEL.to_tuple();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let outlined = out.shapes.iter().any(|cs| match &cs.shape {
+                egui::epaint::Shape::Rect(r) => {
+                    let (r0, g0, b0, _) = r.stroke.color.to_tuple();
+                    r0.abs_diff(sr) <= 3 && g0.abs_diff(sg) <= 3 && b0.abs_diff(sb) <= 3
+                }
+                _ => false,
+            });
+            assert!(outlined, "selected clip carries a COL_CLIP_SEL outline");
+        }
+        let cy = r0.center().y;
+        macro_rules! clp {
+            () => {
+                app.arr.tracks[0].lanes[0].clips[0]
+            };
+        }
+        let span0 = clp!().end(alen) - clp!().pos;
+
+        // AC5.2 trim from the tail (right edge inward). At 160 px/s a
+        // 200 px pull removes ~60 k samples, comfortably past the 30 k
+        // assertion floor (the old 58 px drag only cut ~17 k).
+        drag_pt(&mut app, &ctx, egui::pos2(r0.max.x - 2.0, cy), egui::pos2(r0.max.x - 200.0, cy));
+        let c1 = clp!();
+        assert!(c1.end(alen) - c1.pos < span0 - 30_000 && c1.cut == 0, "tail drag shortens and keeps the head: {c1:?}");
+
+        // AC5.2 trim from the head (left edge inward): pos AND cut move.
+        frame(&mut app, &ctx, vec![]);
+        let r1 = painted_rects(&mut app, &ctx, sel_rgb)
+            .into_iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("clip after trim");
+        drag_pt(&mut app, &ctx, egui::pos2(r1.min.x + 2.0, cy), egui::pos2(r1.min.x + 60.0, cy));
+        let c2 = clp!();
+        assert!(c2.pos > c1.pos && c2.cut > 0 && c2.end(alen) == c1.end(alen), "head drag cuts into the audio: {c2:?} vs {c1:?}");
+
+        // AC5.3 head back leftward: re-exposes the cut audio.
+        frame(&mut app, &ctx, vec![]);
+        let r2 = painted_rects(&mut app, &ctx, sel_rgb)
+            .into_iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("clip after head trim");
+        drag_pt(&mut app, &ctx, egui::pos2(r2.min.x + 2.0, cy), egui::pos2(r2.min.x - 40.0, cy));
+        let c3 = clp!();
+        assert!(c3.cut < c2.cut, "outward head drag re-exposes audio");
+
+        // AC5.3 tail PAST the asset end: silent extension.
+        frame(&mut app, &ctx, vec![]);
+        let r3 = painted_rects(&mut app, &ctx, sel_rgb)
+            .into_iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("clip before extend");
+        // +240 px, not +200: at 160 px/s the release must land PAST the
+        // asset end (200 px hits it exactly → play_len returns to None).
+        drag_pt(&mut app, &ctx, egui::pos2(r3.max.x - 2.0, cy), egui::pos2(r3.max.x + 240.0, cy));
+        let c4 = clp!();
+        let avail4 = alen - c4.cut;
+        assert!(
+            c4.play_len == Some(c4.end(alen) - c4.pos) && c4.end(alen) - c4.pos > avail4,
+            "silence extension stores play_len > available audio: {c4:?}"
+        );
+
+        // AC6.1 the snap checkbox lives in the grid header next to the
+        // subdivision combo; clicking it flips snap_on; AC6.2 OFF makes the
+        // snap unit exactly one sample.
+        app.snap_on = true;
+        frame(&mut app, &ctx, vec![]);
+        let unit_on = app.snap_unit();
+        assert!(unit_on > 1.0, "snap on = subdivision unit");
+        let lbl = galley_at(&mut app, &ctx, "snap").expect("snap label in header");
+        // The clickable box sits AFTER the 4-glyph "snap" label (its own
+        // label is ""), so aim right of the text, not at its middle.
+        click_pt(&mut app, &ctx, egui::pos2(lbl.center().x + 20.0, lbl.center().y));
+        assert!(!app.snap_on, "header checkbox toggles snap off");
+        assert_eq!(app.snap_unit(), 1.0, "snap off = one sample");
+    }
+
+    /// AC8.1-AC8.3 (main GUI multi-selection).
+    #[test]
+    fn v07_main_grid_multi_select() {
+        let mut app = headless_app("v07msel");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        // Three 40 k-sample clips spread along lane 0 with empty gaps
+        // around them. NOTE: Clip::new's second arg is the POSITION, so
+        // the old "length" numbers stacked all three at the same x; the
+        // timeline length goes in play_len.
+        app.arr.insert(0, 0, Clip { asset: a, pos: 60_000, cut: 0, play_len: Some(40_000) });
+        app.arr.insert(0, 0, Clip { asset: a, pos: 130_000, cut: 0, play_len: Some(40_000) });
+        app.arr.insert(0, 0, Clip { asset: a, pos: 200_000, cut: 0, play_len: Some(40_000) });
+        frame(&mut app, &ctx, vec![]);
+        let body = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let mut rects = painted_rects(&mut app, &ctx, body);
+        assert!(rects.len() >= 3, "three clips painted: {}", rects.len());
+        // Left-to-right order: the click/marquee steps below index the
+        // clips along the lane, not by painted area.
+        rects.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+        let rects = &rects[..3];
+
+        // AC8.1 plain click selects one, Ctrl+click adds.
+        click_pt(&mut app, &ctx, rects[0].center());
+        assert_eq!(app.sel_clips.len(), 1, "plain click = one clip");
+        click_mod(&mut app, &ctx, rects[2].center(), egui::Modifiers::COMMAND);
+        assert_eq!(app.sel_clips.len(), 2, "ctrl+click toggles a second clip in");
+        click_mod(&mut app, &ctx, rects[2].center(), egui::Modifiers::COMMAND);
+        assert!(app.sel_clips.len() == 1, "ctrl+click again toggles it out");
+        click_mod(&mut app, &ctx, rects[2].center(), egui::Modifiers::COMMAND);
+
+        // AC8.2 shift+click selects the same-lane run from the anchor.
+        click_mod(&mut app, &ctx, rects[0].center(), egui::Modifiers::SHIFT);
+        assert_eq!(app.sel_clips.len(), 3, "shift+click extends to the whole run");
+
+        // AC8.3 dragging a box on the empty lane area selects every clip
+        // it intersects.
+        let y = rects[1].center().y;
+        let from = egui::pos2(rects[0].min.x - 60.0, y);
+        let to = egui::pos2(rects[2].max.x + 40.0, y);
+        drag_pt(&mut app, &ctx, from, to);
+        assert_eq!(app.sel_clips.len(), 3, "selection box selects all intersected clips");
+    }
+
+    /// AC3.1 the sampler root note renders as standard note notation.
+    #[test]
+    fn v07_sampler_root_note_shows_note_names() {
+        let mut app = headless_app("v07root");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        fn is_note(s: &str) -> bool {
+            let t = s.trim();
+            let mut ch = t.chars();
+            let Some(a) = ch.next() else { return false };
+            a.is_ascii_uppercase() && matches!(a, 'A'..='G') && {
+                let rest: String = ch.collect();
+                let (acc, num): (String, String) = rest
+                    .chars()
+                    .partition(|c| *c == '#');
+                !num.is_empty()
+                    && num.chars().all(|c| c.is_ascii_digit())
+                    && acc.chars().all(|c| c == '#')
+            }
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let g: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let s = t.galley.text().trim().to_string();
+                    if is_note(&s) {
+                        return Some(s);
+                    }
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        assert!(
+            g.iter().any(|s| s == "C3"),
+            "root-note slider must paint 'C3' (default 48), galleys: {g:?}"
+        );
     }
 }

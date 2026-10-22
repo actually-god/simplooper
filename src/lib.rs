@@ -30,6 +30,7 @@ pub mod quantize;
 pub mod samples808;
 pub mod synth;
 pub mod vsthost;
+pub mod vstedit;
 pub mod synth_api;
 pub mod ui;
 

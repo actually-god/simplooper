@@ -31,10 +31,16 @@ pub const API_SRC: &str = include_str!("synth_api.rs");
 pub const BUNDLED: &[(&str, &str)] = &[
     ("piano.rs", include_str!("../synths/piano.rs")),
     ("sampler.rs", include_str!("../synths/sampler.rs")),
+    // Attribution for the piano's modal model (MIT, fan455); the registry
+    // only compiles *.rs, so this rides along as documentation.
+    (
+        "THIRD-PARTY-NOTICES.md",
+        include_str!("../synths/THIRD-PARTY-NOTICES.md"),
+    ),
 ];
 /// Bump when a bundled script changes, so shipped fixes replace the user
 /// folder's copy (with a `.bak` backup) instead of freezing at first seed.
-const BUNDLED_VERSION: &str = "2";
+const BUNDLED_VERSION: &str = "3";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
@@ -647,6 +653,98 @@ mod tests {
             let tail = out2.iter().fold(0.0f32, |m, x| m.max(x.abs()));
             assert!(tail < peak.max(1e-9), "{stem} all_off must stop new sound");
         }
+    }
+
+    /// Goertzel-style squared magnitude of `x` at frequency `f` over
+    /// `x[a..b]` — enough to tell a harmonic line from the noise floor.
+    fn tone_power(x: &[f32], f: f64, sr: f64, a: usize, b: usize) -> f64 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        let w = std::f64::consts::TAU * f / sr;
+        for (n, s) in x.iter().enumerate().take(b).skip(a) {
+            let ph = w * n as f64;
+            re += *s as f64 * ph.cos();
+            im -= *s as f64 * ph.sin();
+        }
+        re * re + im * im
+    }
+
+    /// Peak power within ±0.6 % of `f` (covers the synth's stiff-string
+    /// partial stretch) — so the test measures "a line lives near n·f0",
+    /// not the exact coefficient choice.
+    fn line_power(x: &[f32], f: f64, sr: f64, a: usize, b: usize) -> f64 {
+        let mut m = 0.0f64;
+        let mut k = -3;
+        while k <= 3 {
+            let ff = f * (1.0 + 0.002 * k as f64);
+            m = m.max(tone_power(x, ff, sr, a, b));
+            k += 1;
+        }
+        m
+    }
+
+    #[test]
+    fn piano_is_modal_not_static() {
+        // AC2.2: the replacement piano must sound like DECAYING PARTIALS —
+        // strong lines at the harmonics, upper partials dying faster than
+        // the fundamental, and definitely not a flat (white-noise-like)
+        // spectrum nor the old fixed-ratio FM buzz.
+        let reg = test_registry("modal");
+        let inst = reg.create_instance("piano", 48_000.0, &[]).expect("piano");
+        let desc = reg.desc("piano").unwrap().clone();
+        let mut p = [0.0f32; MAX_PARAMS];
+        for (k, pd) in desc.params.iter().enumerate() {
+            p[k] = pd.default;
+        }
+        let sr = 48_000.0f64;
+        let note = 57u8; // A3 = 220 Hz
+        let f0 = 220.0f64;
+        inst.note_on(0, note, 110);
+        let secs = 4.0;
+        let n = (secs * sr) as usize;
+        let mut out = vec![0.0f32; n];
+        let mut at = 0usize;
+        while at < n {
+            let end = (at + 1024).min(n);
+            let mut blk = vec![0.0f32; end - at];
+            unsafe { inst.process_into(&mut blk, &p) };
+            out[at..end].copy_from_slice(&blk);
+            at = end;
+        }
+        let rms = |a: usize, b: usize| -> f64 {
+            out[a..b].iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>()
+                / (b - a) as f64
+        };
+        let head = (0.10 * sr) as usize..(0.60 * sr) as usize;
+        let tail = (3.40 * sr) as usize..(3.90 * sr) as usize;
+        assert!(rms(head.start, head.end) > 1e-4, "piano must make sound");
+        assert!(rms(tail.start, tail.end) > 1e-8, "must still ring at 3.4 s");
+        assert!(
+            rms(head.start, head.end) > 2.0 * rms(tail.start, tail.end),
+            "must DECAY: head rms {} vs tail rms {}",
+            rms(head.start, head.end),
+            rms(tail.start, tail.end)
+        );
+        // Harmonic lines dominate the inter-harmonic floor at the head.
+        for h in [2.0, 3.0, 5.0] {
+            let on = line_power(&out, h * f0, sr, head.start, head.end);
+            let off = tone_power(&out, (h + 0.5) * f0, sr, head.start, head.end);
+            assert!(
+                on > 25.0 * off.max(1e-12),
+                "harmonic {h} must stand out: on {on} off {off}"
+            );
+        }
+        // Not white noise: fundamentals-side energy dwarfs the high band.
+        let low = line_power(&out, f0, sr, head.start, head.end);
+        let high = line_power(&out, 7000.0, sr, head.start, head.end);
+        assert!(low > 10.0 * high, "spectrum must fall with frequency: {low} vs {high}");
+        // PARTIAL-dependent decay (the modal signature): the 6th partial's
+        // level RELATIVE to the fundamental drops strongly by the tail.
+        let rel = |a: usize, b: usize| -> f64 {
+            line_power(&out, 6.0 * f0, sr, a, b) / line_power(&out, f0, sr, a, b).max(1e-12)
+        };
+        let (rh, rt) = (rel(head.start, head.end), rel(tail.start, tail.end));
+        assert!(rt < 0.7 * rh, "upper partials must decay faster: head {rh} tail {rt}");
+        inst.all_off();
     }
 
     #[test]

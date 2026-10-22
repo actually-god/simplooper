@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 2
+// slooper-synth-version: 3
 // sampler.rs — pitch-following audio-clip synthesizer.
 //
 // Plays ANY audio asset from the rack as an instrument: pick the asset id,

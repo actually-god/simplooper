@@ -366,6 +366,41 @@ pub struct RtStageEntry {
     name: String,
     /// Where this plugin was loaded from (re-opens offline render copies).
     spec: (PathBuf, VstKind),
+    /// Whether the plugin advertises a custom editor window (VST2
+    /// `effFlagsHasEditor`, VST3 `IComponent` view). Drives the "GUI"
+    /// button; the slider panel remains the fallback for GUI-less plugins.
+    has_editor: bool,
+    /// VST2 only: raw `AEffect` dispatcher for editor hosting (see
+    /// `src/vstedit.rs`). VST3 editors are not hosted (docs/PLUGINS.md).
+    vst2: Option<Vst2Handle>,
+}
+
+/// Raw editor-dispatch handle for a loaded VST2 plugin: just the
+/// `AEffect` address, so it can cross into the editor GUI thread.
+/// Callers must close any editor before the plugin instance is dropped.
+#[derive(Clone, Copy)]
+pub struct Vst2Handle(*mut vst2::api::AEffect);
+unsafe impl Send for Vst2Handle {}
+unsafe impl Sync for Vst2Handle {}
+
+impl Vst2Handle {
+    pub(crate) fn from_instance(inst: &vst2::host::PluginInstance) -> Self {
+        Self(inst.raw_effect())
+    }
+    /// Raw `AEffect::dispatcher` call with a VST2 opcode number.
+    pub fn dispatch(
+        &self,
+        opcode: i32,
+        index: i32,
+        value: isize,
+        ptr: *mut std::ffi::c_void,
+        opt: f32,
+    ) -> isize {
+        unsafe {
+            let ae = self.0;
+            ((*ae).dispatcher)(ae, opcode, index, value, ptr, opt)
+        }
+    }
 }
 
 unsafe impl Send for RtStageEntry {}
@@ -419,7 +454,14 @@ struct RtParts {
     out_channels: usize,
 }
 
-fn assemble(name: String, parts: RtParts, params: Arc<VstParams>, descs: Vec<VstParamDesc>) -> RtStageEntry {
+fn assemble(
+    name: String,
+    parts: RtParts,
+    params: Arc<VstParams>,
+    descs: Vec<VstParamDesc>,
+    has_editor: bool,
+    vst2: Option<Vst2Handle>,
+) -> RtStageEntry {
     let last: Vec<f32> = (0..descs.len()).map(|k| params.get(k)).collect();
     let seen_gen = params.generation();
     let state = RtState {
@@ -448,6 +490,8 @@ fn assemble(name: String, parts: RtParts, params: Arc<VstParams>, descs: Vec<Vst
         descs,
         name,
         spec: parts.spec,
+        has_editor,
+        vst2,
     }
 }
 
@@ -474,6 +518,8 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         }
     }
     let out_ch = plugin.output_channel_count().max(1);
+    // Checked before the plugin moves into the realtime runner.
+    let has_editor = plugin.has_editor();
     plugin.start_processing().map_err(|e| format!("start: {e}"))?;
     let (mut runner, control) = RealtimePluginRunner::new(plugin, 256);
     runner.start().map_err(|e| format!("run: {e}"))?;
@@ -491,6 +537,8 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         },
         params,
         descs,
+        has_editor,
+        None,
     ))
 }
 
@@ -534,6 +582,10 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         }
     }
     let out_ch = info.outputs.clamp(1, 2) as usize;
+    // Editor hosting: grab the raw effect handle + has-editor flag before
+    // the instance moves into the realtime backend.
+    let has_editor = unsafe { ((*inst.raw_effect()).flags & 1) != 0 };
+    let vst2 = Some(Vst2Handle::from_instance(&inst));
     Ok(assemble(
         info.name,
         RtParts {
@@ -547,6 +599,8 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         },
         params,
         descs,
+        has_editor,
+        vst2,
     ))
 }
 
@@ -558,6 +612,21 @@ impl RtStageEntry {
     /// Plugin display name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the plugin advertises a custom editor GUI.
+    pub fn has_editor(&self) -> bool {
+        self.has_editor
+    }
+
+    /// VST2 editor dispatch handle (`None` for VST3 — see docs/PLUGINS.md).
+    pub fn vst2_handle(&self) -> Option<Vst2Handle> {
+        self.vst2
+    }
+
+    /// Plugin file path this entry was loaded from.
+    pub fn path(&self) -> &std::path::Path {
+        &self.spec.0
     }
 
     /// (Path, kind) this entry was loaded from.

@@ -519,6 +519,17 @@ impl PluginInstance {
         plug
     }
 
+    /// Vendored patch: raw `AEffect` pointer for out-of-band editor hosting.
+    ///
+    /// The main slooper crate dispatches `effEditOpen` / `effEditClose` /
+    /// `effEditIdle` from a dedicated X11 GUI thread (see `src/vstedit.rs`
+    /// there), which needs the effect pointer without holding the instance.
+    /// Valid for the instance's whole lifetime; never touch it after the
+    /// instance is dropped (the editor must be closed first).
+    pub fn raw_effect(&self) -> *mut AEffect {
+        unsafe { *self.params.effect.get() }
+    }
+
 
     /// Vendored patch: read the plugin state chunk (VST2.4 `effGetChunk`).
     ///

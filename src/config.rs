@@ -179,10 +179,14 @@ pub struct Config {
     /// longer ones are auditioned from the start for exactly this long.
     #[serde(default = "default_preview_secs")]
     pub preview_secs: f32,
-    /// Synth stem used to audition MIDI (piano roll preview, key clicks,
-    /// rack MIDI rows). `None` = the bundled fallback synth.
+    /// Track whose instrument + mixer chain auditions MIDI (piano-roll
+    /// "preview through track"). `None` = the default synth script.
     #[serde(default)]
-    pub preview_synth: Option<String>,
+    pub preview_track: Option<u32>,
+    /// Grid snap on/off (main header checkbox). True = placement snaps to
+    /// the subdivision grid; false = one sample (the minimum resolution).
+    #[serde(default = "default_true")]
+    pub snap_on: bool,
     /// False only in configs written before 0.3.0, where volume was
     /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
     #[serde(default)]
@@ -260,7 +264,8 @@ impl Default for Config {
             monitor_on: true,
             preview_on: true,
             preview_secs: default_preview_secs(),
-            preview_synth: None,
+            preview_track: None,
+            snap_on: true,
             vol_scale_v2: true,
             project_dir: String::new(),
             rack_folders: Vec::new(),
@@ -494,7 +499,8 @@ mod tests {
             monitor_on: false,
             preview_on: false,
             preview_secs: 2.5,
-            preview_synth: Some("piano".into()),
+            preview_track: Some(3),
+            snap_on: false,
             vol_scale_v2: true,
             project_dir: "/tmp/projects".into(),
             rack_folders: vec!["/tmp/samples".into(), "/tmp/takes".into()],
@@ -545,7 +551,8 @@ mod tests {
         assert_eq!(back.trk_pan, cfg.trk_pan);
         assert!(!back.preview_on, "preview toggle round-trips");
         assert!((back.preview_secs - 2.5).abs() < f32::EPSILON);
-        assert_eq!(back.preview_synth.as_deref(), Some("piano"));
+        assert_eq!(back.preview_track, Some(3), "preview track round-trips");
+        assert!(!back.snap_on, "snap toggle round-trips");
         assert_eq!(back.fx_dir, "/tmp/effects");
         assert_eq!(back.track_fx[0][0].stem, "template");
         assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);
