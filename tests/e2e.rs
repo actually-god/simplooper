@@ -526,6 +526,12 @@ fn ring_mean(ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, n: usize) -> Option<f
     read_ring(ring, widx, n, Duration::from_millis(500)).map(|x| x.iter().sum::<f32>() / n as f32)
 }
 
+/// Peak |sample| of the most recent `n` captured sink samples.
+fn ring_peak(ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, n: usize) -> Option<f32> {
+    read_ring(ring, widx, n, Duration::from_millis(500))
+        .map(|x| x.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+}
+
 /// Poll `pred` until true or the timeout expires (panics on timeout).
 fn wait_until(pred: impl Fn() -> bool, timeout: Duration, what: &str) {
     let deadline = Instant::now() + timeout;
@@ -859,6 +865,140 @@ fn metro_clicks(x: &[f32], sr: u32) -> Vec<(usize, u8)> {
         }
     }
     out
+}
+
+#[test]
+fn e2e_midi_clip_plays_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    // Sink client: slooper's mix must appear at our capture ring.
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("midi_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            LoopSrcProc {
+                out: out_a,
+                sink,
+                mode: Arc::new(AtomicU8::new(0)),
+                const_val: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+                seed: 0x9e37_79b9,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "backend did not apply the sink layout"
+    );
+
+    // The shared default synth, installed exactly as the app does it.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(slooper::audio::SynthHandle::Script(
+        inst,
+    )))));
+
+    // A MIDI-only project: one bar of quarter notes at 120 BPM on track 0.
+    // No audio asset exists at index 0 — the clip resolves through the MIDI
+    // table only (a missing audio asset must skip, not crash the RT mix).
+    let mut pat = slooper::midipat::Pattern::new(120);
+    for (i, note) in [60u8, 64, 67, 72].iter().enumerate() {
+        pat.notes.push(slooper::midipat::Note {
+            ch: 0,
+            note: *note,
+            vel: 110,
+            press: 0,
+            start: (i as u32) * slooper::midipat::PPQ as u32,
+            len: slooper::midipat::PPQ as u32 / 2,
+        });
+    }
+    pat.sort();
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    // Project length = exactly the pattern's bar (2 s), so the looping
+    // transport re-enters the clip after every wrap.
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: sr as u64 * 2,
+    });
+    b.cmd(Cmd::SetLoop(true));
+
+    // Silent while the transport is stopped.
+    std::thread::sleep(Duration::from_millis(150));
+    wait_until(
+        || ring_peak(&ring, &widx, 960).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(3),
+        "silence before the transport starts",
+    );
+
+    // Play: the notes must sound through the default piano. This is the
+    // path that used to abort the RT thread (midi scratch rows were never
+    // allocated): the first staged note panicked inside `process`.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(5),
+        "MIDI clip audible through the default synth",
+    );
+
+    // Still alive mid-bar and after a transport wrap: notes land in many
+    // different blocks, and the wrapped playhead re-arms the whole event
+    // queue — a dead RT thread stops cycling the graph entirely.
+    // Windows are 333 ms so they can never fall inside the 250 ms gap
+    // between the last note-off and the wrap.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(
+        ring_peak(&ring, &widx, 16000).map(|p| p > 0.002).unwrap_or(false),
+        "MIDI render died mid-bar",
+    );
+    let after = widx.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(
+        widx.load(Ordering::Relaxed) > after,
+        "audio graph stopped cycling (RT thread died?)"
+    );
+    assert!(
+        ring_peak(&ring, &widx, 16000).map(|p| p > 0.002).unwrap_or(false),
+        "no sound after the transport wrapped through the loop point",
+    );
+
+    b.cmd(Cmd::StopAll);
+    wait_for(
+        &b,
+        |e| matches!(e, Evt::Transport { on: false }),
+        Duration::from_secs(2),
+    );
+    std::thread::sleep(Duration::from_millis(700)); // let the tail ring out
+    wait_until(
+        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(5),
+        "silence after StopAll (transport gate closes the MIDI render)",
+    );
+    let _ = active;
 }
 
 #[test]

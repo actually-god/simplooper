@@ -928,6 +928,10 @@ impl Engine {
     }
     pub fn set_default_synth(&self, synth: Option<Arc<SynthHandle>>) {
         *self.default_synth.lock().unwrap() = synth;
+        // The RT handler snapshots `default_synth` inside its `synths_gen`
+        // refresh — without a bump here it would keep rendering with a
+        // stale (or missing) fallback until some track binding changed.
+        self.synths_gen.fetch_add(1, Ordering::Relaxed);
     }
     pub fn default_synth(&self) -> Option<Arc<SynthHandle>> {
         self.default_synth.lock().unwrap().clone()
@@ -1471,7 +1475,10 @@ fn run(
         sample_no: 0,
         fx_cache: engine.fx_table(),
         fx_cache_gen: engine.fx_gen(),
-        fx_rt: Vec::new(),
+        // Seed from the engine's current chains: a launch that restores
+        // chains from config never bumps fx_gen, so waiting for a refresh
+        // here left an empty grid beside a non-empty cache → RT panic.
+        fx_rt: seed_fx_rt(&engine.fx_table()[..]),
         arr: engine.arrangement(),
         arr_cache_gen: engine.arr_gen(),
         assets: engine.assets(),
@@ -1496,7 +1503,10 @@ fn run(
         midi_cache: engine.midi(),
         midi_cache_gen: engine.midi_gen(),
         midi_ev: Vec::new(),
-        midi_scratch: Vec::new(),
+        // One row per track, EXACTLY like trk_bufs: `render_midi_block`
+        // indexes `midi_scratch[t]` the moment the first note stages, and an
+        // empty vector there aborted the RT thread (v0.6/v0.7 MIDI crash).
+        midi_scratch: vec![Vec::new(); MAX_LOOPS],
         midi_live: [false; MAX_LOOPS],
         synth_p: [0.0f32; crate::synth::MAX_PARAMS],
         synth_pg: [0u64; MAX_LOOPS],
@@ -2579,6 +2589,25 @@ struct FxRt {
     p: [f32; crate::fx::MAX_PARAMS],
 }
 
+/// Build the per-slot RT slider grid matching `table` (one row per track,
+/// one `FxRt` per chain slot). Proc seeding AND the `process` refresh must
+/// both use this: an empty grid next to a non-empty `fx_cache` makes
+/// `fx_rt[t]` index out of bounds the first time such a track sounds.
+fn seed_fx_rt(table: &[TrackFx]) -> Vec<Vec<FxRt>> {
+    table
+        .iter()
+        .map(|tf| {
+            tf.slots()
+                .iter()
+                .map(|_| FxRt {
+                    gen: 0,
+                    p: [0.0; crate::fx::MAX_PARAMS],
+                })
+                .collect()
+        })
+        .collect()
+}
+
 impl Proc {
     /// Run one track-output sample through the track's effect chain (the
     /// volume x gain trim has already been multiplied into `x`). Only for
@@ -2751,19 +2780,7 @@ impl ProcessHandler for Proc {
             if let Ok(tb) = self.engine.fx.try_lock() {
                 self.fx_cache = tb.clone();
                 self.fx_cache_gen = fxg;
-                self.fx_rt = self
-                    .fx_cache
-                    .iter()
-                    .map(|tf| {
-                        tf.slots()
-                            .iter()
-                            .map(|_| FxRt {
-                                gen: 0,
-                                p: [0.0; crate::fx::MAX_PARAMS],
-                            })
-                            .collect()
-                    })
-                    .collect();
+                self.fx_rt = seed_fx_rt(&self.fx_cache[..]);
                 // Stamp the chain reaper (see `Engine::drain_vst_held`): the
                 // displaced chain died right here, but every VST entry it
                 // held also lives in `vst_held`, so no plugin destructor ran
