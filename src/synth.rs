@@ -98,10 +98,14 @@ pub fn seed_folder(dir: &Path) {
                     continue;
                 }
                 // Only auto-update copies still carrying OUR version stamp —
-                // a hand-edited piano.rs is the user's file.
-                let stamped = cur.lines().next().is_some_and(|l| {
-                    l.contains("slooper-synth-version:")
-                }) && src.contains(&format!("slooper-synth-version: {BUNDLED_VERSION}"));
+                // a hand-edited piano.rs is the user's file. The stamp lives
+                // on line 2 (line 1 is the `==== slooper ==` banner), so
+                // scan the header block, not just the first line.
+                let stamped = cur
+                    .lines()
+                    .take(4)
+                    .any(|l| l.contains("slooper-synth-version:"))
+                    && src.contains(&format!("slooper-synth-version: {BUNDLED_VERSION}"));
                 if stamped && cur != *src {
                     let bak = dir.join(format!("{name}.bak"));
                     let _ = std::fs::write(&bak, cur);
@@ -613,6 +617,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("SLOOPER_SYNTHS_DIR", &dir);
         Registry::open(dir.clone())
+    }
+
+    #[test]
+    fn seed_folder_updates_stamped_stale_scripts() {
+        // The v0.7 modal-piano swap is invisible to existing installs
+        // unless an old STAMPED copy updates in place — and the version
+        // stamp sits on line 2 of every bundled script (line 1 is the
+        // `==== slooper ==` banner), so the header scan must see it.
+        let dir = std::env::temp_dir().join("sp-synth-seed");
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_folder(&dir);
+        let piano = dir.join("piano.rs");
+        let cur = std::fs::read_to_string(&piano).unwrap();
+        assert!(cur.contains(&format!("slooper-synth-version: {BUNDLED_VERSION}")));
+        // An install from a previous app version: old content, still stamped.
+        let old = "// ============ slooper ==\n// slooper-synth-version: 0\n// old FM voice\n".to_string();
+        std::fs::write(&piano, &old).unwrap();
+        // A hand-edited script (no stamp in the header) is the user's file.
+        let mine = dir.join("sampler.rs");
+        std::fs::write(&mine, "// my custom synth\n").unwrap();
+        seed_folder(&dir);
+        let upd = std::fs::read_to_string(&piano).unwrap();
+        assert!(
+            upd.contains("fan455"),
+            "stale stamped piano.rs was not updated in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("piano.rs.bak")).unwrap(),
+            old,
+            "old copy not backed up"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&mine).unwrap(),
+            "// my custom synth\n"
+        );
+        assert!(!dir.join("sampler.rs.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
