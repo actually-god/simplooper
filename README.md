@@ -3,14 +3,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A minimalist clip-based audio DAW built in Rust for Linux (JACK /
-PipeWire-JACK). Sixteen tracks on one global, draggable playhead: drop audio
-from the **asset rack** onto a metronome-defined bar grid, record takes that
-turn themselves into clips, stack child lanes additively, quantize with one
-click, and save whole projects to disk — with MIDI binding, keyboard
-shortcuts, per-track effects, and clean export.
+PipeWire-JACK). Up to sixteen tracks on one global, draggable playhead: drop
+audio from the **asset rack** onto a metronome-defined bar grid, record audio
+takes and MIDI takes that turn themselves into clips, play software
+instruments from the built-in piano to hosted VSTi, draw notes in a piano
+roll, stack child lanes additively, quantize with one click, and save whole
+projects to disk — with MIDI binding, keyboard shortcuts, per-track effect +
+plugin chains, and clean export.
 
 **Docs:** [install guide](docs/INSTALL.md) · [user guide](docs/USAGE.md) ·
-[agent/automation guide](docs/AGENT-GUIDE.md)
+[plugins & synths](docs/PLUGINS.md) · [agent/automation
+guide](docs/AGENT-GUIDE.md)
 
 ## Features
 
@@ -22,33 +25,59 @@ shortcuts, per-track effects, and clean export.
   global transport and one **always-on playhead** over a bar/beat grid derived
   from the metronome. Press play or stop **anywhere** — the position is kept;
   **drag the playhead** across the ruler or any lane to scrub to the exact
-  spot you want to hear. A per-track **play gate** (`PLAYED` / `muted`) mutes
+  spot you want to hear. A per-track **play gate** (`on` / `mute`) mutes
   a track without touching its clips, and the transport bar's **PLAY/STOP**
-  button (or `Space`, or bound MIDI) starts/stops everything at once.
+  button (or `Space`, or bound MIDI) starts/stops everything at once. The
+  visible track count is a setting (1–16); bindings for hidden tracks are
+  kept, not dropped.
 - **Clips from the asset rack** — every track is a lane space you drop audio
   into, not a single pre-allocated buffer. Clips are references to audio
   files: drag them from the asset rack onto any lane, drag them along the
   timeline to reposition (with snap), and stack as many as you like — clips
   that overlap simply add together.
-- **Child lanes** — every track has a base lane plus any number of child
-  lanes (`+ child` / `- child` in the row). Children stack additively on the
-  same track mixer (vol, gain, pan, effects). **Ctrl+C / Ctrl+V / Ctrl+D**
-  copy, paste and duplicate clips — a paste lands on the track nearest your
-  last click, right at the playhead. When a recording or a drop
-  would land **on top of existing clip material, a child lane opens
-  automatically** — you can never punch a hole in another clip by accident.
+- **Clip trimming** — select a clip and grab its edge: trim from either end,
+  or keep dragging the head back outward to **re-expose the audio you cut**
+  (nothing is ever destroyed — clips just window the asset). Dragging the
+  tail **past the asset end** stores a silent extension (rendered as a dark
+  tail with an amber *original* marker). Edges snap to the asset's own
+  boundaries, and trimming snaps even when grid snap is off.
+- **Group editing** — click selects, **Ctrl + click** toggles, **Shift +
+  click** takes a same-lane run, **Ctrl + A** selects everything; a group
+  drags sideways as one unit, and dragging a single clip across lane lines
+  moves it lanes. **Ctrl + C / Ctrl + V** copies and pastes the whole
+  selection **with trims and relative offsets intact** — the paste lands at
+  the playhead on the last-clicked track and the view scrolls to it.
+  **Ctrl + D** duplicates; **Delete** removes the group.
 - **Record → take → clip** — each track keeps its **REC** button (and its
   keyboard/MIDI binding). Press REC, play, press REC again: the take is
   written as a WAV into the rack's **primary folder** (so it is instantly an
   asset for every future project) and automatically placed as a clip **at
   the playhead** in the recorded-into track — opening a child lane if the
   base lane is busy there. Takes longer than the ~60 s take buffer auto-stop.
+- **MIDI recording** — the same strip carries **MREC**: arm it and slooper
+  captures every *incoming MIDI message that is not bound to an action*;
+  stop (button again, or stop the transport) and the take becomes a `.mid`
+  asset in the primary folder plus a placed clip — playable, editable in the
+  piano roll, and shown as notes on the clip itself.
+- **Instruments & synths** — every track binds a synthesizer: the bundled
+  **modal piano** (physical-modelled, credit in `synths/`), the **sampler**
+  script (plays any rack asset pitched around a root note shown as `C3`-style
+  note names), or **any scanned VSTi**. Parameters open in a sliders window;
+  VST2 instruments can open their native editor window (see
+  [docs/PLUGINS.md](docs/PLUGINS.md)).
+- **Piano roll** — the grid toolbar's **♫ Piano roll** opens a full-window
+  note editor: draw notes on the snap grid, drag to move, edge-resize,
+  marquee / Ctrl / Shift select, Ctrl + C/V/A, one-click **quantize**.
+  Preview routes through the picked track's *synth + effects chain*; the
+  tempo follows the metronome. **save** writes the pattern as a MIDI asset
+  (primary folder) and places a clip at the playhead.
 - **Asset rack** — a panel on the left of the main window listing audio
   folders (add any number with **+ folder**, reorder, remove with `x`,
   re-scan with `...`). The **first folder is the primary folder**: all
   recordings are stored there. Supported import formats (WAV, MP3, OGG,
   FLAC, M4A, AAC, AIFF) are decoded and resampled to the engine rate on
-  demand; per-asset actions quantize, trim silence, or remove.
+  demand; `.mid` files appear with a blue **MIDI** badge; per-asset actions
+  quantize, trim silence, or remove.
 - **Metronome grid & easy quantize** — the metronome (BPM 20–300, beats per
   measure 1–16, six subdivisions) *is* the project clock: its tempo and
   time-signature define the visible bar grid, the ruler, and the quantize
@@ -58,24 +87,29 @@ shortcuts, per-track effects, and clean export.
   seam crossfade keep it click-free); **Trim** clips silence off the start
   and end of an asset; tick **auto-quantize** and every fresh recording is
   quantized the moment it lands. Placed clips snap to a separate **snap
-  subdivision** grid while you drag.
-- **Projects** — Ctrl+S saves everything (grid, mixer, FX, lanes, clips,
-  asset table) into a single JSON `.slooper` file in your projects
-  folder; the first save asks for a name. **Save as** re-names, **Load**
-  shows every project in the folder newest-first, and the projects folder
-  itself is a setting. Audio is never embedded — derived assets are written
-  next to the project and missing files are re-found by name.
+  subdivision** grid — and a **snap checkbox** turns snapping off entirely
+  so placements land on any single sample.
+- **Projects** — Ctrl+S saves everything (grid, mixer, FX chain, synths,
+  lanes, clips, asset table) into a single JSON `.slooper` file in your
+  projects folder; the first save asks for a name. **Save as** re-names,
+  **Load** shows every project in the folder newest-first, and the projects
+  folder itself is a setting. Audio is never embedded — derived assets are
+  written next to the project and missing files are re-found by name.
 - **Mixer dock & effects** — a **Mixer** panel docked right of the timeline
   holds every track's full strip, each one pixel-aligned to its track block:
-  name, REC, play gate, child-lane buttons, **vol** (−∞…+6 dB), **gain**,
-  **pan** (−100…+100, equal power; editable dB / position text boxes, raw
-  MIDI readout and a **0** reset button) and **FX…**, all scrolling in
-  lockstep with the timeline. The
-  **master volume** (peak meter + one-row fader at the top of the mixer
-dock, above Track 1) spans the same −∞…+6 dB range. Effects are
-  per-track runtime-compiled chains (Rust scripts hot-compiled with rustc,
-  per-effect sliders, scripted custom GUIs, user presets) running after
-  vol × gain, live and in export renders.
+  name, REC, play gate, **MREC**, child-lane buttons, **vol** (−∞…+6 dB),
+  **gain**, **pan** (−100…+100, equal power; editable dB / position text
+  boxes, raw MIDI readout and a **0** reset button), the **FX** chain chip
+  and the **synth** picker — all scrolling in lockstep with the timeline.
+  The **master volume** (peak meter + one-row fader at the top of the mixer
+  dock, above Track 1) spans the same −∞…+6 dB range.
+- **One chain per track — scripts *and* plugins** — each track's mixer
+  chain is a single ordered list mixing runtime-compiled **Rust effect
+  scripts** (hot-compiled with rustc, per-effect sliders, scripted custom
+  GUIs, user presets) and binary **VST2 / VST3 plugins** (parameter sliders,
+  native VST2 editor windows). **Plugins used as instruments** can be bound
+  as the track's synth and played by its MIDI clips. Live and in export
+  renders.
 - **Global loop region** — a **loop** toggle plus mode dropdown on the grid
   toolbar: **current longest** (default — wraps at the end of the longest
   playing clip), **whole song**, or **area**, whose start and end show up as
@@ -90,19 +124,21 @@ dock, above Track 1) spans the same −∞…+6 dB range. Effects are
   `samples/808/CREDITS.md`).
 - **Settings menu** — hamburger (top-left): input/output port picker (per
   output **L** / **R** / both), projects folder, latency
-  compensation, MIDI + keyboard bindings for every action.
-- **MIDI binding** — every action — per-track record / clear / play-gate,
-  track select, **play all** / **stop all**, metronome, export, per-track
-  volume / gain / pan knobs — binds to a live-captured Note, CC, or Program
-  Change; knob bindings get two-point axis calibration (incl. inverted
-  travel). Everything persists between sessions.
+  compensation, track count (1–16), GUI scale, MIDI + keyboard bindings for
+  every action.
+- **MIDI binding** — every action — per-track record / **MIDI record** /
+  clear / play-gate, track select, **play all** / **stop all**, metronome,
+  export, per-track volume / gain / pan knobs — binds to a live-captured
+  Note, CC, or Program Change; knob bindings get two-point axis calibration
+  (incl. inverted travel). Everything persists between sessions.
 - **Keyboard shortcuts** — `Space` play/stop all, `R` record, `C` clear,
   `E` export prompt, `M` metronome, `1`–`4` select track (5–16 bindable),
-  Ctrl+S save (Ctrl+Shift+S rename), Ctrl+C/Ctrl+V/Ctrl+D clip
-  copy/paste/duplicate. All rebindable; ignored while typing
+  Ctrl+S save (Ctrl+Shift+S rename), Ctrl+A/C/V/D select-all /
+  copy / paste / duplicate. All rebindable; ignored while typing
   in text boxes; auto-repeat never re-fires.
-- **Import / export** — export one track (its mixer + chain baked in) or the
-  whole project as WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
+- **Import / export** — export one track (its mixer + chain baked in), the
+  whole project, or just the **current clip selection** (rendered
+  time-aligned) as WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
 - **MIDI monitor** — permanent `slooper:midi_in` JACK MIDI port; every
   event parsed and shown in the bottom panel.
 - **Latency compensation** — *latency (ms)* discards that many leading
@@ -111,11 +147,13 @@ dock, above Track 1) spans the same −∞…+6 dB range. Effects are
 
 ## Requirements
 
-- Rust (stable) and `cargo`; **`rustc` at runtime** for building effect
-  scripts on the fly (optional — the app runs fine without custom effects)
+- Rust (stable) and `cargo`; **`rustc` at runtime** for building effect and
+  synth scripts on the fly (optional — the app runs fine without custom
+  scripts)
 - Build-time system libraries: JACK headers + `.pc` file (provided by
   `pipewire-jack` or the official `libjack` package), plus `pkgconf`.
   No other system deps — the GUI stack is pure-Rust.
+- An X11 display (XWayland counts) for native VST2 plugin editor windows.
 - `ffmpeg` (optional) for MP3/OGG export.
 - A JACK-compatible audio server:
   - **PipeWire** (recommended): just install `pipewire` + `pipewire-jack`.
@@ -152,26 +190,33 @@ Full walkthrough in [docs/USAGE.md](docs/USAGE.md). The short version:
 3. Add an audio folder to the **asset rack** (+ folder) — the first one
    doubles as the recordings folder.
 4. Set your tempo/meter in the transport bar (that *is* the grid), then
-   either drag an asset onto a track lane, or arm a track and press **REC**,
-   play, and press REC again — the take lands on the timeline by itself.
+   either drag an asset onto a track lane, arm a track and press **REC**,
+   arm **MREC** to capture MIDI, or draw notes in the **♫ Piano roll**.
 5. Press `Space` to run the whole project; drag the playhead to scan.
 6. Ctrl+S to save the project once it sounds right.
 
-### Effects
+### Effects & plugins
 
-Each track owns an independent effect chain. Click a track's **FX** button:
+Each track owns one **ordered mixer chain** — effect scripts and binary VST
+plugins interleaved in one list. Click a track's **FX** chip:
 
-- **Effects location** — folder scanned for effect scripts; default
+- **The chain** — one row per slot, top-to-bottom *is* audio order; ↑↓
+  reorder, `×` remove. A slot whose plugin/script failed to load stays
+  visible as *not loaded* until the next rescan.
+- **+ effect** — script effects from the effects folder; default
   `~/.local/share/slooper/effects`, created and seeded with `template.rs`
-  + the ABI contract on first run; **Rescan** compiles edited scripts.
-- **The list** — one row per script: toggle (default off), display name,
-  author/description hover text; enabled effects snap to the top and ↑↓
-  reorder the chain (top-to-bottom *is* audio order). Failing scripts stay
-  listed, dimmed, with the compiler error.
-- Enabled effects show as **name buttons** on the track row (chain order),
-  each opening an editor window — auto sliders or the script's own GUI.
+  + the ABI contract on first run; **Rescan effects** compiles edited
+  scripts. The app-shipped effect scripts update in place (with a `.bak`
+  backup) when they are fixed upstream.
+- **+ VST plugin** — plugins scanned from your plugin folders
+  (`~/.vst`, `~/.vst3`, system dirs + anything you add in the folder
+  manager); **Rescan Plugins** re-reads them after installs.
+- Clicking a slot opens its editor: the script's own scripted GUI or
+  automatic sliders for effects, parameter sliders for plugins — and VST2
+  *instruments* can open their native editor window
+  ([docs/PLUGINS.md](docs/PLUGINS.md)).
 
-Signal order per track: `clip × volume × gain → effects chain → pan →
+Signal order per track: `clip × volume × gain → chain → pan →
 output buses`. The same chain runs in export renders.
 
 Writing an effect: copy `template.rs`, rename, edit — one standalone Rust
@@ -181,6 +226,8 @@ optionally a scripted custom GUI. Compiled with
 `rustc --edition 2021 --crate-type cdylib`. Working examples in `effects/`:
 `parametric_eq.rs` (6-band EQ, live spectrum, draggable log-axis handles)
 and `space_echo.rs` (echo + reverb with tone voicing and factory presets).
+Scripted **synths** work the same way — `synths/synth_api.rs` plus the
+bundled `piano.rs` / `sampler.rs` are the reference.
 
 ### MIDI binding
 
@@ -206,6 +253,7 @@ undo/redo — are dropped).
 | `E` | export prompt |
 | `M` | metronome on / off |
 | `1`–`4` | select track 1–4 (5–16 via the action list) |
+| `Ctrl+A` | select all clips (then drag / copy / delete as a group) |
 | `Ctrl+S` | save project (asks for a name the first time) |
 | `Ctrl+Shift+S` | save under a new name |
 
@@ -224,7 +272,9 @@ Quantization always follows the **metronome** — set BPM / beats-per-measure
 - **Trim** — clips silence off the start and end of the selected asset.
 - **auto-quantize** checkbox — every fresh recording is quantized
   automatically when it lands in the rack.
-- **snap** dropdown — the grid dragged clips and auto-placed takes snap to.
+- **snap** dropdown + checkbox — the grid dragged clips and auto-placed
+  takes snap to; untick **snap** and everything (placement, drags, clip
+  resize) lands on any single sample.
 
 ## Architecture
 
@@ -233,11 +283,23 @@ src/
 ├── main.rs    entry point, eframe window setup
 ├── lib.rs     crate root: pub mods
 ├── audio.rs   JACK backend + DAW engine: manager thread, Cmd/Evt channels,
-│              RT process handler (clip mixing, takes, metronome, transport)
-├── arrange.rs arrangement model: tracks → lanes → clips (asset id + start
-│              sample), placement/snap/lane-overlap rules, serialization
-├── assets.rs  asset rack: folder scan (audio extensions), recordings into
+│              RT process handler (clip mixing, takes, metronome, transport,
+│              per-track synth + chain playback, offline renders)
+├── arrange.rs arrangement model: tracks → lanes → clips (asset id, start
+│              sample, trim offset, play length), placement/snap/lane-overlap
+│              rules, edge-trim math, serialization
+├── assets.rs  asset rack: folder scan (audio + .mid), recordings into
 │              the primary folder, take save/resolve
+├── midipat.rs SMF format-0 MIDI pattern model (PPQ 480; notes, CC,
+│              channel pressure; read + write; length survives via meta)
+├── synth.rs   scripted synth plugins: rust-script compile-on-load, own ABI
+│              + host vtable, compile cache, bundled piano/sampler seeded
+│              into the synths folder
+├── vsthost.rs VST2/VST3 plugin hosting: folder scan, block-based processing,
+│              parameter relay (VST2 via the patched vendor/vst2 crate,
+│              VST3 via vst3-host)
+├── vstedit.rs VST2 editor hosting (effEditOpen/Idle/GetRect/Close over an
+│              X11 plug/replug container window)
 ├── project.rs .slooper save format (versioned JSON), projects dir
 │              listing, asset re-resolution by name
 ├── audio_io.rs import decoding (symphonia) + export (WAV/FLAC native,
@@ -255,15 +317,21 @@ src/
 ├── quantize.rs  metronome grids, content quantize, silence trim,
 │                zero-crossing refinement + seam crossfade
 └── ui.rs      egui app: top bar (transport/project buttons), asset rack,
-               grid toolbar, timeline lanes + playhead drag, settings,
+               grid toolbar (quantize/snap, loop, ♫ Piano roll, zoom),
+               timeline lanes + playhead drag, Mixer dock (strips, chain
+               window, synth bindings), piano roll window, settings,
                MIDI monitor, export window
 ```
+
+(`vendor/vst2/` holds the patched, in-tree VST2 crate — see its
+`VENDOR-NOTES.md`.)
 
 - `Backend::start()` spawns the **audio manager thread**, which owns the
   `jack::Client` (`NO_START`). GUI ↔ audio run over two bounded channels:
   commands (`Refresh`, `Apply{ins,outs}`, `Quit`, `ToggleRecord`,
   `SetTrackOn`/`ToggleTrackOn`, `PlayAll`, `StopAll`, `Seek`, `SetProject`,
-  `ExportTrack`, `ExportProject`, `SetTrackEffects`, `SetLatency`,
+  `SetLoop`, `ExportTrack`, `ExportProject`, `ExportSelection`,
+  `SetTrackEffects`, `PreviewPlay`/`PreviewStop`, `SetLatency`,
   `SetMetro`, …) and events (`Ready`, `Ports`, `Applied`, `Midi`,
   `MidiSources`, `Xrun`, `Transport`, `TrackState`, `Take { track, at,
   data }`, `Notice`, errors).
@@ -283,6 +351,7 @@ src/
   manager thread (`Evt::Take`), which saves the WAV into the primary rack
   folder, appends the asset, and places the clip at the take's start
   position — opening a child lane when the base lane is occupied there.
+  MIDI takes follow the same handshake as `.mid` assets.
 - **Loop region**: the engine keeps `loop_start`/`loop_end` samples and a
   mode (area / longest / whole song). `region_end()` resolves the wrap point
   each block (longest = furthest playing clip end, min = the region's end);
@@ -323,15 +392,20 @@ makepkg's default `$srcdir=$PWD/src` collides with Rust's own `src/`.
 cargo test -- --test-threads=1
 ```
 
-Unit tests (85) cover MIDI parsing/binding and shortcut-table migration,
+Unit tests (128 + 1 bin) cover MIDI parsing/binding and shortcut-table
+migration, the SMF pattern round-trip, synth script loading/rendering,
 quantize/silence-trim math, the arrangement model (placement, snapping,
-child-lane creation on overlap, removal rules), the asset store, the
-`.slooper` project format, and engine render/mixing. The e2e suite (7
+edge trimming, child-lane creation on overlap, removal rules), chain
+persistence, the asset store, the `.slooper` project format, engine
+render/mixing, and the egui layer driven headlessly (clicks and drags
+through the real UI, incl. the v0.6/v0.7 acceptance pins for group editing,
+clip trimming, the piano roll, and the chain window). The e2e suite (8
 tests) drives a real JACK client pair in real time: MIDI monitor, audio
 mixing/routing, the global transport (play/stop anywhere, seek, loop wrap),
-the metronome grid, the record → take → clip pipeline, and export. Tests
-self-skip when no JACK/PipeWire server is running; the e2e tests serialize
-on a shared lock (`E2E_LOCK`) and need a running server.
+the metronome grid, the record → take → clip pipeline, MIDI capture, VST
+processing in export, and export. Tests self-skip when no
+JACK/PipeWire server is running; the e2e tests serialize on a shared lock
+(`E2E_LOCK`) and need a running server.
 Packaging is covered by `tests/packaging.sh` (see the Packaging section).
 
 ## License
@@ -350,4 +424,9 @@ included, as long as the copyright notice travels with substantial copies.
 - [x] Metronome-based quantize, silence trim, auto-quantize on record
 - [x] `.slooper` project files (named save, load browser, projects folder)
 - [x] Keyboard shortcuts for track + transport actions
+- [x] Group editing: multi-select, group clipboard, selection export
+- [x] Clip edge trimming (cut/extend, silent extension, sample-exact override)
+- [x] MIDI instruments: per-track synths (scripted + VSTi), piano roll,
+      MIDI recording (MREC)
+- [x] VST2/VST3 hosting: one chain per track, params, native VST2 editors
 - [ ] Clip-level fades, split-at-playhead, per-clip gain strips
