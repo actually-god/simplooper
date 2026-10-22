@@ -55,6 +55,30 @@ pub struct TrackFxSave {
     pub params: Vec<f32>,
 }
 
+/// One slot of a track's mixer chain (see `Config::track_chain`). Tagged so
+/// a chain mixes effect scripts and hosted plugins in any order.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ChainSave {
+    /// Bundled/user effect script by stem.
+    Fx {
+        stem: String,
+        #[serde(default)]
+        params: Vec<f32>,
+    },
+    /// In-process hosted VST plugin.
+    Vst {
+        path: String,
+        /// "VST2" or "VST3".
+        kind: String,
+        /// Display name (UI only; the plugin file is authoritative).
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        params: Vec<f32>,
+    },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Keyboard shortcuts as key names (e.g. `"R"`, `"Space"`), one per entry
@@ -155,6 +179,10 @@ pub struct Config {
     /// longer ones are auditioned from the start for exactly this long.
     #[serde(default = "default_preview_secs")]
     pub preview_secs: f32,
+    /// Synth stem used to audition MIDI (piano roll preview, key clicks,
+    /// rack MIDI rows). `None` = the bundled fallback synth.
+    #[serde(default)]
+    pub preview_synth: Option<String>,
     /// False only in configs written before 0.3.0, where volume was
     /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
     #[serde(default)]
@@ -170,15 +198,21 @@ pub struct Config {
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
     pub fx_dir: String,
-    /// Per-track effect chains: index = track, entries = enabled scripts in
-    /// chain order (each stem + its slider values).
+    /// Per-track effect chains (legacy format, pre-VST-in-chain). Loaded
+    /// only when `track_chain` is absent; saves write `track_chain` only.
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
+    /// Per-track mixer chains: index = track, entries = chain slots in
+    /// audio order. Scripted effects and VST plugins are one unified list —
+    /// a plugin can sit anywhere in the chain (FL Studio mixer model).
+    #[serde(default)]
+    pub track_chain: Vec<Vec<ChainSave>>,
     /// Extra VST search folders (user-set; the standard system folders are
     /// always scanned on top of these).
     #[serde(default)]
     pub vst_dirs: Vec<String>,
-    /// Per-track VST insert, index = track (None = no insert).
+    /// Per-track VST insert (legacy single-insert format; folded into
+    /// `track_chain` on load, never written again).
     #[serde(default)]
     pub track_vst: Vec<Option<VstSave>>,
     /// Per-track synth bindings: script stem ("" / None = default piano)
@@ -226,11 +260,13 @@ impl Default for Config {
             monitor_on: true,
             preview_on: true,
             preview_secs: default_preview_secs(),
+            preview_synth: None,
             vol_scale_v2: true,
             project_dir: String::new(),
             rack_folders: Vec::new(),
             fx_dir: String::new(),
             track_fx: Vec::new(),
+            track_chain: Vec::new(),
             vst_dirs: Vec::new(),
             track_vst: Vec::new(),
             track_synth: Vec::new(),
@@ -304,6 +340,40 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".config"));
         base.join("slooper").join("config.json")
+    }
+
+    /// Effective mixer chains: `track_chain` when present, else migrated
+    /// from the legacy split (`track_fx` scripts + trailing `track_vst`).
+    pub fn chain(&self) -> Vec<Vec<ChainSave>> {
+        if !self.track_chain.is_empty() {
+            return self.track_chain.clone();
+        }
+        let n = self.track_fx.len().max(self.track_vst.len());
+        (0..n)
+            .map(|i| {
+                let mut v: Vec<ChainSave> = self
+                    .track_fx
+                    .get(i)
+                    .map(|s| {
+                        s.iter()
+                            .map(|f| ChainSave::Fx {
+                                stem: f.stem.clone(),
+                                params: f.params.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(Some(vs)) = self.track_vst.get(i) {
+                    v.push(ChainSave::Vst {
+                        path: vs.path.clone(),
+                        kind: vs.kind.clone(),
+                        name: vs.name.clone(),
+                        params: vs.params.clone(),
+                    });
+                }
+                v
+            })
+            .collect()
     }
 
     /// Load the config, falling back to defaults on any error.
@@ -424,10 +494,12 @@ mod tests {
             monitor_on: false,
             preview_on: false,
             preview_secs: 2.5,
+            preview_synth: Some("piano".into()),
             vol_scale_v2: true,
             project_dir: "/tmp/projects".into(),
             rack_folders: vec!["/tmp/samples".into(), "/tmp/takes".into()],
             fx_dir: "/tmp/effects".into(),
+            track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             track_fx: vec![vec![TrackFxSave {
                 stem: "template".into(),
                 params: vec![0.5, 4.0],
@@ -473,6 +545,7 @@ mod tests {
         assert_eq!(back.trk_pan, cfg.trk_pan);
         assert!(!back.preview_on, "preview toggle round-trips");
         assert!((back.preview_secs - 2.5).abs() < f32::EPSILON);
+        assert_eq!(back.preview_synth.as_deref(), Some("piano"));
         assert_eq!(back.fx_dir, "/tmp/effects");
         assert_eq!(back.track_fx[0][0].stem, "template");
         assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);

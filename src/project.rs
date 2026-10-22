@@ -60,6 +60,10 @@ pub struct ProjTrack {
     pub on: bool,
     #[serde(default)]
     pub fx: Vec<TrackFxSave>,
+    /// Full mixer chain (scripts + plugins). Preferred over `fx` when
+    /// present; old files (fx only) still load.
+    #[serde(default)]
+    pub chain: Vec<crate::config::ChainSave>,
     /// Lane 0 = the track itself, lanes 1.. = child tracks.
     pub lanes: Vec<Vec<ProjClip>>,
 }
@@ -216,6 +220,7 @@ mod tests {
                 pan: 64,
                 on: true,
                 fx: vec![TrackFxSave { stem: "template".into(), params: vec![1.0] }],
+                chain: Vec::new(),
                 lanes: vec![vec![ProjClip { asset: 0, pos: 0, cut: 0, play_len: None }], vec![]],
             }],
             assets: vec![ProjAsset { name: "kick".into(), file: "/x/kick.wav".into() }],

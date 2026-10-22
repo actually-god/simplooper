@@ -92,12 +92,41 @@ pub struct PortInfo {
     pub client: String,
 }
 
-/// One live per-track effect slot: the refcounted effect instance plus the
-/// description needed to clone it for offline renders (never touched by the
-/// realtime path).
+/// One slot of a track's chain: either a scripted effect or a hosted VST
+/// plugin. Both kinds live in the *same* ordered chain, so a plugin can sit
+/// anywhere in the effects order (FL Studio's mixer-slot model).
+pub enum FxKind {
+    /// Bundled/JS-compiled effect script.
+    Scripted {
+        inst: Arc<crate::fx::Instance>,
+        desc: crate::fx::EffectDesc,
+    },
+    /// In-process hosted plugin (VST2/VST3), loaded by `vsthost`.
+    Vst(Arc<crate::vsthost::RtStageEntry>),
+}
+
+/// A chain slot; see [`FxKind`].
 pub struct FxSlot {
-    pub inst: Arc<crate::fx::Instance>,
-    pub desc: crate::fx::EffectDesc,
+    pub kind: FxKind,
+}
+
+impl FxSlot {
+    pub fn scripted(inst: Arc<crate::fx::Instance>, desc: crate::fx::EffectDesc) -> Self {
+        Self { kind: FxKind::Scripted { inst, desc } }
+    }
+    pub fn vst(entry: Arc<crate::vsthost::RtStageEntry>) -> Self {
+        Self { kind: FxKind::Vst(entry) }
+    }
+    pub fn is_vst(&self) -> bool {
+        matches!(self.kind, FxKind::Vst(_))
+    }
+    /// Chain-list label (window titles, chips).
+    pub fn label(&self) -> String {
+        match &self.kind {
+            FxKind::Scripted { desc, .. } => desc.name.clone(),
+            FxKind::Vst(e) => e.name().to_string(),
+        }
+    }
 }
 
 /// A track's live effect chain (GUI order = audio order). Replaced whole
@@ -115,6 +144,31 @@ impl TrackFx {
 
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// True when any slot hosts a plugin: the track's chain must run
+    /// block-wise (plugins consume whole buffers), not per sample.
+    pub fn has_vst(&self) -> bool {
+        self.slots.iter().any(|s| s.is_vst())
+    }
+}
+
+/// A track's sound source for MIDI clips. Hosted plugins are first-class
+/// synthesizers (VSTi), not just effects, so the synth table holds both
+/// kinds; every consumer (RT render, offline render, sliders, panic) goes
+/// through this enum.
+pub enum SynthHandle {
+    Script(Arc<crate::synth::Instance>),
+    Vst(Arc<crate::vsthost::RtStageEntry>),
+}
+
+impl SynthHandle {
+    /// Silence every ringing voice (transport seek).
+    pub fn all_off(&self) {
+        match self {
+            SynthHandle::Script(i) => i.all_off(),
+            SynthHandle::Vst(e) => e.all_notes_off(),
+        }
     }
 }
 
@@ -196,20 +250,14 @@ pub enum Cmd {
     },
     /// Replace the MIDI pattern table (indexed in parallel with `assets`).
     SetMidiAssets(Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>),
-    /// Bind/unbind one track's synthesizer instance.
+    /// Bind/unbind one track's synthesizer (scripted synth or VSTi).
     SetTrackSynth {
         i: usize,
-        synth: Option<Arc<crate::synth::Instance>>,
+        synth: Option<Arc<SynthHandle>>,
     },
     /// Set the fallback synth (bundled piano) used by tracks with no
     /// explicit binding.
-    SetDefaultSynth(Option<Arc<crate::synth::Instance>>),
-    /// Bind/unbind one track's VST stage entry (loaded on the UI thread;
-    /// the engine runs it until replaced).
-    SetTrackVst {
-        i: usize,
-        entry: Option<Arc<crate::vsthost::RtStageEntry>>,
-    },
+    SetDefaultSynth(Option<Arc<SynthHandle>>),
     /// Write a track's rendered contribution (all its lanes, engine-rate
     /// mixdown of the current project) to `path` in format `fmt`. Runs on
     /// the manager thread; a Notice/Error event reports the outcome.
@@ -496,17 +544,16 @@ pub struct Engine {
     /// hold `None`); pushed together with the project by the GUI.
     midi: std::sync::Mutex<Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>>,
     midi_gen: AtomicU64,
-    /// Per-track synth bindings + the fallback instance (bundled piano)
-    /// used by unbound tracks.
-    synths: std::sync::Mutex<Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]>>,
+    /// Per-track synth bindings (scripted or VSTi) + the fallback instance
+    /// (bundled piano) used by unbound tracks.
+    synths: std::sync::Mutex<Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]>>,
     synths_gen: AtomicU64,
-    default_synth: std::sync::Mutex<Option<Arc<crate::synth::Instance>>>,
-    /// Per-track VST stage entries + generation (same shape as `synths`).
-    /// A displaced entry is *held* in `vst_held` instead of dropping where
-    /// the swap happened: plugin destructors (and the VST3 COM teardown the
-    /// runner hands off) must run on the creating (UI) thread. The UI drains
-    /// held entries once the audio cache has caught up (`vst_refreshed`).
-    vsts: std::sync::Mutex<Arc<[Option<Arc<crate::vsthost::RtStageEntry>>; MAX_LOOPS]>>,
+    default_synth: std::sync::Mutex<Option<Arc<SynthHandle>>>,
+    /// Chain reaper: a chain swap displaces VST slots; the displaced entries
+    /// are *held* in `vst_held` instead of dropping where the swap happened:
+    /// plugin destructors (and the VST3 COM teardown the runner hands off)
+    /// must run on the creating (UI) thread. The UI drains held entries once
+    /// the audio chain cache has caught up (`vst_gen` == `vst_refreshed`).
     vsts_gen: AtomicU64,
     vst_refreshed: AtomicU64,
     vst_held: std::sync::Mutex<Vec<Arc<crate::vsthost::RtStageEntry>>>,
@@ -574,7 +621,6 @@ impl Engine {
             synths: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
             synths_gen: AtomicU64::new(0),
             default_synth: std::sync::Mutex::new(None),
-            vsts: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
             vsts_gen: AtomicU64::new(0),
             vst_refreshed: AtomicU64::new(0),
             vst_held: std::sync::Mutex::new(Vec::new()),
@@ -794,9 +840,26 @@ impl Engine {
         self.pan[i].store(p.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
-    /// Replace track `i`'s live effect chain (manager thread).
+    /// Replace track `i`'s live effect chain (manager thread). Any VST slot
+    /// displaced by the swap is held for UI-thread teardown (see
+    /// [`Self::drain_vst_held`]) so plugin destructors never run where they
+    /// could race the audio cache swap.
     pub fn set_track_fx(&self, i: usize, chain: TrackFx) {
         let mut t = self.fx.lock().unwrap();
+        if let Some(old) = t.get(i) {
+            let mut displaced = false;
+            for s in old.slots() {
+                if let FxKind::Vst(e) = &s.kind {
+                    self.vst_held.lock().unwrap().push(e.clone());
+                    displaced = true;
+                }
+            }
+            if displaced {
+                // Arms `drain_vst_held`: releasable only once the RT chain
+                // cache has picked up this swap and stamped `vst_refreshed`.
+                self.vsts_gen.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let fresh = core::array::from_fn(|k| if k == i { chain.clone() } else { t[k].clone() });
         *t = Arc::new(fresh);
         drop(t);
@@ -847,7 +910,7 @@ impl Engine {
 
     /// Bind/unbind one track's synthesizer (unbound tracks fall back to the
     /// default synth — the bundled piano).
-    pub fn set_track_synth(&self, i: usize, synth: Option<Arc<crate::synth::Instance>>) {
+    pub fn set_track_synth(&self, i: usize, synth: Option<Arc<SynthHandle>>) {
         if let Ok(mut g) = self.synths.try_lock() {
             let mut next = g.clone();
             if let Some(slot) = Arc::make_mut(&mut next).get_mut(i) {
@@ -857,46 +920,27 @@ impl Engine {
             self.synths_gen.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub fn synths(&self) -> Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]> {
+    pub fn synths(&self) -> Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]> {
         self.synths.lock().unwrap().clone()
     }
     pub fn synths_gen(&self) -> u64 {
         self.synths_gen.load(Ordering::Relaxed)
     }
-    pub fn set_default_synth(&self, synth: Option<Arc<crate::synth::Instance>>) {
+    pub fn set_default_synth(&self, synth: Option<Arc<SynthHandle>>) {
         *self.default_synth.lock().unwrap() = synth;
     }
-    pub fn default_synth(&self) -> Option<Arc<crate::synth::Instance>> {
+    pub fn default_synth(&self) -> Option<Arc<SynthHandle>> {
         self.default_synth.lock().unwrap().clone()
     }
 
-    /// Bind/unbind one track's VST stage entry. The displaced entry is held
-    /// (not dropped) until the UI thread collects it via [`Self::drain_vst_held`].
-    pub fn set_track_vst(&self, i: usize, entry: Option<Arc<crate::vsthost::RtStageEntry>>) {
-        if i >= MAX_LOOPS {
-            return;
-        }
-        if let Ok(mut g) = self.vsts.lock() {
-            let mut next = g.clone();
-            let slot = &mut Arc::make_mut(&mut next)[i];
-            if let Some(old) = slot.take() {
-                self.vst_held.lock().unwrap().push(old);
-            }
-            *slot = entry;
-            *g = next;
-            self.vsts_gen.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    pub fn vsts(&self) -> Arc<[Option<Arc<crate::vsthost::RtStageEntry>>; MAX_LOOPS]> {
-        self.vsts.lock().unwrap().clone()
-    }
     pub fn vst_gen(&self) -> u64 {
         self.vsts_gen.load(Ordering::Relaxed)
     }
-    /// Hand replaced entries back to the UI thread — but only once the audio
-    /// cache has caught up with every swap, so the final reference of each
-    /// plugin dies on the caller's (UI) thread rather than mid-swap on the
-    /// audio thread.
+
+    /// Hand chain-displaced plugin entries back to the UI thread — but only
+    /// once the audio chain cache has caught up with every swap, so the final
+    /// reference of each plugin dies on the caller's (UI) thread rather than
+    /// mid-swap on the audio thread.
     pub fn drain_vst_held(&self) -> Vec<Arc<crate::vsthost::RtStageEntry>> {
         if self.vst_gen() == self.vst_refreshed.load(Ordering::Relaxed) {
             core::mem::take(&mut *self.vst_held.lock().unwrap())
@@ -906,7 +950,7 @@ impl Engine {
     }
 
     /// The synth a track actually renders through (binding, else default).
-    fn synth_for(&self, t: usize) -> Option<Arc<crate::synth::Instance>> {
+    fn synth_for(&self, t: usize) -> Option<Arc<SynthHandle>> {
         self.synths()
             .get(t)
             .cloned()
@@ -991,19 +1035,6 @@ impl Engine {
 
     /// Render one track's contribution (all lanes; the track's play/stop
     /// flag is ignored when a track export is explicitly requested).
-    /// Open a *private* copy of a track's VST insert for offline rendering:
-    /// same path/kind, current slider values. The live instance is never
-    /// touched (the audio thread owns it), so exports and the running mix
-    /// cannot interfere.
-    pub fn spawn_vst_private(&self, t: usize) -> Option<Arc<crate::vsthost::RtStageEntry>> {
-        let live = self.vsts.lock().ok()?.get(t)?.clone()?;
-        let (path, kind) = live.spec().clone();
-        let params: Vec<f32> = (0..live.params().len()).map(|k| live.params().get(k)).collect();
-        crate::vsthost::open(&path, kind, self.sample_rate().max(1), Some(&params))
-            .ok()
-            .map(|l| l.entry)
-    }
-
     pub fn render_track(&self, t: usize) -> Option<Vec<f32>> {
         self.render_tracks(Some(t), self.proj_len() as usize)
     }
@@ -1014,6 +1045,7 @@ impl Engine {
         if only.is_none() && arr.is_empty() {
             return None;
         }
+        let sr = self.sample_rate().max(1);
         let mut out = vec![0.0f32; len.max(1)];
         let mut any = false;
         for t in 0..MAX_LOOPS {
@@ -1028,13 +1060,13 @@ impl Engine {
             let (pgl, pgr) = pan_gains(self.loop_pan(t));
             let pdown = (pgl + pgr) * F1S2;
             let chain = self.fx.lock().unwrap()[t].clone();
-            // With a VST insert, the track's full contribution (all clips)
-            // accumulates here first: the plugin must run continuously over
-            // the track span so tails ring past the last clip, exactly like
-            // the live mix. pdown/pan apply after the insert.
-            let pv = self.spawn_vst_private(t);
-            let mut trk: Vec<f32> =
-                if pv.is_some() { vec![0.0f32; len.max(1)] } else { Vec::new() };
+            // A chain that hosts a plugin must run continuously over the
+            // track's whole contribution (all clips accumulate dry first),
+            // so tails ring past the last clip exactly like the live mix —
+            // the live RT path uses the same span rule. Scripted-only chains
+            // keep the historical per-clip phase-0 treatment.
+            let span = chain.has_vst();
+            let mut trk: Vec<f32> = if span { vec![0.0f32; len.max(1)] } else { Vec::new() };
             let midi = self.midi();
             // MIDI clips first: the whole track's patterns through one fresh
             // synth, then through the same track FX + gain as audio clips.
@@ -1043,40 +1075,42 @@ impl Engine {
                 .iter()
                 .any(|l| l.clips.iter().any(|c| matches!(midi.get(c.asset as usize), Some(Some(_)))))
             {
-                if let Some(inst) = self.synth_for(t).and_then(|i| i.spawn_fresh()) {
+                if let Some(h) = self.synth_for(t) {
                     let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
                     for lane in &arr.tracks[t].lanes {
                         for cl in &lane.clips {
                             if let Some(Some(pat)) = midi.get(cl.asset as usize) {
-                                stage_midi_events(pat, cl, self.sample_rate().max(1), &mut ev);
+                                stage_midi_events(pat, cl, sr, &mut ev);
                             }
                         }
                     }
                     let mut buf = vec![0.0f32; len.max(1)];
-                    render_midi_events(&inst, &mut ev, 0, len.max(1), &mut buf);
-                    let chain = self.fx.lock().unwrap()[t].clone();
-                    let fx: Vec<Arc<crate::fx::Instance>> = chain
-                        .slots()
-                        .iter()
-                        .filter_map(|s| s.inst.spawn_fresh(&s.desc))
-                        .collect();
-                    let sbuf: Vec<f32> = buf
-                        .into_iter()
-                        .take(out.len())
-                        .map(|x| {
-                            let mut s = x * tamp;
-                            for f in &fx {
-                                s = f.process_private(s);
-                            }
-                            s
-                        })
-                        .collect();
-                    for (k, s) in sbuf.into_iter().enumerate() {
-                        any = true;
-                        if pv.is_some() {
-                            trk[k] += s;
-                        } else {
+                    render_midi_any(&h, &mut ev, 0, len.max(1), &mut buf, sr);
+                    if span {
+                        for (k, x) in buf.into_iter().take(out.len()).enumerate() {
+                            any = true;
+                            trk[k] += x * tamp;
+                        }
+                    } else if let Some(fx) = scripted_chain(&chain) {
+                        let sbuf: Vec<f32> = buf
+                            .into_iter()
+                            .take(out.len())
+                            .map(|x| {
+                                let mut s = x * tamp;
+                                for f in &fx {
+                                    s = f.process_private(s);
+                                }
+                                s
+                            })
+                            .collect();
+                        for (k, s) in sbuf.into_iter().enumerate() {
+                            any = true;
                             out[k] += s * pdown;
+                        }
+                    } else {
+                        for (k, x) in buf.into_iter().take(out.len()).enumerate() {
+                            any = true;
+                            out[k] += x * tamp * pdown;
                         }
                     }
                 }
@@ -1090,15 +1124,13 @@ impl Engine {
                     any = true;
                     // Fresh private instances per clip: every clip starts at
                     // effect phase 0, and the live chain is never advanced.
-                    let fx: Vec<Arc<crate::fx::Instance>> = chain
-                        .slots()
-                        .iter()
-                        .filter_map(|s| s.inst.spawn_fresh(&s.desc))
-                        .collect();
+                    let fx = if span { None } else { scripted_chain(&chain) };
                     let mix = |x: f32| {
                         let mut s = x * tamp;
-                        for f in &fx {
-                            s = f.process_private(s);
+                        if let Some(fx) = &fx {
+                            for f in fx {
+                                s = f.process_private(s);
+                            }
                         }
                         s
                     };
@@ -1117,7 +1149,7 @@ impl Engine {
                     for (j, k) in (dstart..hi).enumerate() {
                         any = true;
                         let m = mix(data[j]);
-                        if pv.is_some() {
+                        if span {
                             trk[k] += m;
                         } else {
                             out[k] += m * pdown;
@@ -1125,9 +1157,10 @@ impl Engine {
                     }
                 }
             }
-            if pv.is_some() {
-                // Insert pass over the full track span (tails survive clips).
-                vst_chunk(pv.as_deref(), &mut trk);
+            if span {
+                // Full chain over the whole track span (fresh copies: the
+                // live chain is never advanced by an export).
+                run_chain_over(&chain, sr, &mut trk);
                 for (k, s) in trk.into_iter().enumerate() {
                     out[k] += s * pdown;
                 }
@@ -1184,33 +1217,37 @@ impl Engine {
             let (pgl, pgr) = pan_gains(self.loop_pan(*t));
             let pdown = (pgl + pgr) * F1S2;
             let chain = chains[*t].clone();
-            let pv = self.spawn_vst_private(*t);
+            let span = chain.has_vst();
             // MIDI clip: fresh synth copy + fresh chain, same treatment as
             // an audio clip (phase 0, live state untouched).
             if let Some(Some(pat)) = midi.get(cl.asset as usize) {
-                if let Some(inst) = self.synth_for(*t).and_then(|i| i.spawn_fresh()) {
+                if let Some(h) = self.synth_for(*t) {
                     let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
                     stage_midi_events(pat, cl, sr, &mut ev);
                     let mut buf = vec![0.0f32; len];
-                    render_midi_events(&inst, &mut ev, from, len, &mut buf);
-                    let fx: Vec<Arc<crate::fx::Instance>> = chain
-                        .slots()
-                        .iter()
-                        .filter_map(|s| s.inst.spawn_fresh(&s.desc))
-                        .collect();
-                    let mut sbuf: Vec<f32> = buf
-                        .into_iter()
-                        .map(|x| {
-                            let mut s2 = x * tamp;
-                            for f in &fx {
-                                s2 = f.process_private(s2);
-                            }
-                            s2
-                        })
-                        .collect();
-                    vst_chunk(pv.as_deref(), &mut sbuf);
-                    for (k, s2) in sbuf.into_iter().enumerate() {
-                        out[k] += s2 * pdown;
+                    render_midi_any(&h, &mut ev, from, len, &mut buf, sr);
+                    if span {
+                        run_chain_over(&chain, sr, &mut buf);
+                        for (k, s2) in buf.into_iter().enumerate() {
+                            out[k] += s2 * tamp * pdown;
+                        }
+                    } else {
+                        let fx = scripted_chain(&chain);
+                        let mut sbuf: Vec<f32> = buf
+                            .into_iter()
+                            .map(|x| {
+                                let mut s2 = x * tamp;
+                                if let Some(fx) = &fx {
+                                    for f in fx {
+                                        s2 = f.process_private(s2);
+                                    }
+                                }
+                                s2
+                            })
+                            .collect();
+                        for (k, s2) in sbuf.drain(..).enumerate() {
+                            out[k] += s2 * pdown;
+                        }
                     }
                 }
                 continue;
@@ -1219,15 +1256,13 @@ impl Engine {
                 Some(d) if !d.is_empty() => d,
                 _ => continue,
             };
-            let fx: Vec<Arc<crate::fx::Instance>> = chain
-                .slots()
-                .iter()
-                .filter_map(|s| s.inst.spawn_fresh(&s.desc))
-                .collect();
+            let fx = if span { None } else { scripted_chain(&chain) };
             let mix = |x: f32| {
                 let mut s = x * tamp;
-                for f in &fx {
-                    s = f.process_private(s);
+                if let Some(fx) = &fx {
+                    for f in fx {
+                        s = f.process_private(s);
+                    }
                 }
                 s
             };
@@ -1239,7 +1274,11 @@ impl Engine {
                 .min(cl.pos + alen_u);
             let hi = (dend as usize).min(dstart + data.len());
             let mut chunk: Vec<f32> = data[..hi - dstart].iter().map(|x| mix(*x)).collect();
-            vst_chunk(pv.as_deref(), &mut chunk);
+            if span {
+                // Fresh full-chain pass over this chunk (selection bounces
+                // stay clip-local, mirroring the scripted per-clip rule).
+                run_chain_over(&chain, sr, &mut chunk);
+            }
             for (j, k) in (dstart..hi).enumerate() {
                 let o = (k - from as usize).min(len - 1);
                 out[o] += chunk[j] * pdown;
@@ -1421,8 +1460,6 @@ fn run(
         clip_buf: Vec::new(),
         synths_cache: engine.synths(),
         synths_cache_gen: engine.synths_gen(),
-        vsts_cache: engine.vsts(),
-        vsts_cache_gen: 0,
         mix_l: Vec::new(),
         mix_r: Vec::new(),
         trk_bufs: vec![Vec::new(); MAX_LOOPS],
@@ -1437,6 +1474,7 @@ fn run(
         synth_p: [0.0f32; crate::synth::MAX_PARAMS],
         synth_pg: [0u64; MAX_LOOPS],
         mono: Vec::new(),
+        sil: Vec::new(),
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -1522,7 +1560,6 @@ fn run(
                 engine.set_track_synth(i.min(MAX_LOOPS - 1), synth)
             }
             Ok(Cmd::SetDefaultSynth(s)) => engine.set_default_synth(s),
-            Ok(Cmd::SetTrackVst { i, entry }) => engine.set_track_vst(i, entry),
             Ok(Cmd::ExportTrack { i, path, fmt }) => {
                 let i = i.min(MAX_LOOPS - 1);
                 match engine.render_track(i) {
@@ -2017,6 +2054,130 @@ fn vst_chunk(e: Option<&crate::vsthost::RtStageEntry>, chunk: &mut [f32]) {
     }
 }
 
+/// Reopen a *private* copy of a loaded plugin for offline rendering: same
+/// path/kind, current slider values. The live entry is never touched (the
+/// audio thread owns it), so exports and the running mix cannot interfere.
+fn spawn_entry_private(
+    e: &crate::vsthost::RtStageEntry,
+    sr: u32,
+) -> Option<Arc<crate::vsthost::RtStageEntry>> {
+    let (path, kind) = e.spec().clone();
+    let params: Vec<f32> = (0..e.params().len()).map(|k| e.params().get(k)).collect();
+    crate::vsthost::open(&path, kind, sr.max(1), Some(&params))
+        .ok()
+        .map(|l| l.entry)
+}
+
+/// Fresh scripted instances for a chain (offline renders), or `None` when
+/// the chain has no scripted slot at all (cheap passthrough for callers).
+fn scripted_chain(chain: &TrackFx) -> Option<Vec<Arc<crate::fx::Instance>>> {
+    let v: Vec<Arc<crate::fx::Instance>> = chain
+        .slots()
+        .iter()
+        .filter_map(|s| match &s.kind {
+            FxKind::Scripted { inst, desc } => inst.spawn_fresh(desc),
+            FxKind::Vst(_) => None,
+        })
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Run the whole chain (scripted + plugins, in order) over a full render
+/// buffer using fresh private copies. Plugin slots consume the buffer
+/// block-wise; scripted slots run sample-wise like the live path.
+fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32]) {
+    for slot in chain.slots() {
+        match &slot.kind {
+            FxKind::Scripted { inst, desc } => {
+                if let Some(f) = inst.spawn_fresh(desc) {
+                    for x in buf.iter_mut() {
+                        *x = f.process_private(*x);
+                    }
+                }
+            }
+            FxKind::Vst(e) => {
+                if let Some(pv) = spawn_entry_private(e, sr) {
+                    vst_chunk(Some(pv.as_ref()), buf);
+                }
+            }
+        }
+    }
+}
+
+/// Render staged MIDI events through either synth kind. VSTi timing lands
+/// at internal-block boundaries (≤ `VST_BLOCK` samples late, uniformly —
+/// the same contract as the live path).
+fn render_midi_any(
+    h: &SynthHandle,
+    ev: &mut [(u64, u8, u8, u8, u8)],
+    from: u64,
+    len: usize,
+    out: &mut [f32],
+    sr: u32,
+) {
+    match h {
+        SynthHandle::Script(inst) => {
+            if let Some(fresh) = inst.spawn_fresh() {
+                render_midi_events(&fresh, ev, from, len, out);
+            }
+        }
+        SynthHandle::Vst(e) => {
+            if let Some(pv) = spawn_entry_private(e, sr) {
+                render_midi_vst(&pv, ev, from, len, out);
+            }
+        }
+    }
+}
+
+fn render_midi_vst(
+    e: &crate::vsthost::RtStageEntry,
+    ev: &[(u64, u8, u8, u8, u8)],
+    from: u64,
+    len: usize,
+    out: &mut [f32],
+) {
+    let mut ev: Vec<(usize, u8, u8, u8, u8)> = ev
+        .iter()
+        .filter(|(at, ..)| *at >= from && *at - from < len as u64)
+        .map(|(at, k, c, d1, d2)| ((*at - from) as usize, *k, *c, *d1, *d2))
+        .collect();
+    ev.sort_unstable();
+    let sil = vec![0.0f32; crate::vsthost::VST_BLOCK];
+    let process_seg = |a: usize, b: usize, out: &mut [f32]| {
+        let mut a = a;
+        while a < b {
+            let n = (b - a).min(crate::vsthost::VST_BLOCK).min(out.len() - a);
+            if n == 0 {
+                break;
+            }
+            e.process(&sil[..n], &mut out[a..a + n]);
+            a += n;
+        }
+    };
+    let mut cur = 0usize;
+    let mut i = 0usize;
+    while i < ev.len() {
+        let off = ev[i].0.min(len).min(out.len());
+        if off > cur {
+            process_seg(cur, off, out);
+            cur = off;
+        }
+        while i < ev.len() && ev[i].0.min(len).min(out.len()) == off {
+            let (_, kind, ch, d1, d2) = ev[i];
+            match kind {
+                0 => e.note_off(ch, d1),
+                1 => e.cc(ch, d1, d2),
+                _ => e.note_on(ch, d1, d2),
+            }
+            i += 1;
+        }
+    }
+    if cur < out.len() {
+        process_seg(cur, out.len(), out);
+    }
+    e.all_notes_off();
+}
+
 fn stage_midi_events(
     pat: &crate::midipat::Pattern,
     cl: &crate::arrange::Clip,
@@ -2133,13 +2294,14 @@ impl Proc {
             synth_pg,
             synths_cache,
             midi_cache,
+            sil,
             ..
         } = self;
         for t in 0..MAX_LOOPS {
             if !engine.track_on(t) {
                 continue;
             }
-            let inst = match synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone()) {
+            let handle = match synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone()) {
                 Some(i) => i,
                 None => continue, // no synth loaded at all: silence
             };
@@ -2199,47 +2361,82 @@ impl Proc {
             if midi_ev.is_empty() {
                 continue;
             }
-            // Sliders: only refetch when the GUI actually moved one.
-            let gen = inst.param_gen();
-            if gen != synth_pg[t] {
-                inst.read_params(synth_p);
-                synth_pg[t] = gen;
-            }
             let row = &mut midi_scratch[t];
             if row.len() < block_n {
                 row.clear();
                 row.resize(block_n, 0.0);
             }
-            mono.clear();
-            mono.resize(block_n, 0.0);
             // (offset, kind) ordering puts offs (kind 0) before ons (kind 3)
             // at the same sample, so a retrigger never kills its own note.
             midi_ev.sort_unstable();
-            let mut cur = 0usize;
-            let mut i = 0usize;
-            while i < midi_ev.len() {
-                let off = midi_ev[i].0.min(block_n);
-                if off > cur {
-                    // SAFETY: single-threaded here; one instance, one call.
-                    unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
-                    cur = off;
-                }
-                while i < midi_ev.len() && midi_ev[i].0 == off {
-                    let (_, kind, ch, d1, d2) = midi_ev[i];
-                    match kind {
-                        0 => inst.note_off(ch, d1),
-                        1 => inst.cc(ch, d1, d2),
-                        2 => inst.press(ch, d2),
-                        _ => inst.note_on(ch, d1, d2),
+            match handle.as_ref() {
+                SynthHandle::Script(inst) => {
+                    // Sliders: only refetch when the GUI actually moved one.
+                    let gen = inst.param_gen();
+                    if gen != synth_pg[t] {
+                        inst.read_params(synth_p);
+                        synth_pg[t] = gen;
                     }
-                    i += 1;
+                    mono.clear();
+                    mono.resize(block_n, 0.0);
+                    let mut cur = 0usize;
+                    let mut i = 0usize;
+                    while i < midi_ev.len() {
+                        let off = midi_ev[i].0.min(block_n);
+                        if off > cur {
+                            // SAFETY: single-threaded here; one instance, one call.
+                            unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
+                            cur = off;
+                        }
+                        while i < midi_ev.len() && midi_ev[i].0 == off {
+                            let (_, kind, ch, d1, d2) = midi_ev[i];
+                            match kind {
+                                0 => inst.note_off(ch, d1),
+                                1 => inst.cc(ch, d1, d2),
+                                2 => inst.press(ch, d2),
+                                _ => inst.note_on(ch, d1, d2),
+                            }
+                            i += 1;
+                        }
+                    }
+                    if cur < block_n {
+                        unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
+                    }
+                    for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
+                        *r += *m;
+                    }
                 }
-            }
-            if cur < block_n {
-                unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
-            }
-            for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
-                *r += *m;
+                SynthHandle::Vst(e) => {
+                    // A VSTi generates from events: feed each event, drive
+                    // the plugin over silence in between, straight into the
+                    // row. Events land at internal-block boundaries (the
+                    // host's uniform ≤ VST_BLOCK staging delay). Channel
+                    // pressure has no message form here — dropped.
+                    sil.clear();
+                    sil.resize(block_n, 0.0);
+                    let mut cur = 0usize;
+                    let mut i = 0usize;
+                    while i < midi_ev.len() {
+                        let off = midi_ev[i].0.min(block_n);
+                        if off > cur {
+                            e.process(&sil[cur..off], &mut row[cur..off]);
+                            cur = off;
+                        }
+                        while i < midi_ev.len() && midi_ev[i].0.min(block_n) == off {
+                            let (_, kind, ch, d1, d2) = midi_ev[i];
+                            match kind {
+                                0 => e.note_off(ch, d1),
+                                1 => e.cc(ch, d1, d2),
+                                2 => {}
+                                _ => e.note_on(ch, d1, d2),
+                            }
+                            i += 1;
+                        }
+                    }
+                    if cur < block_n {
+                        e.process(&sil[cur..block_n], &mut row[cur..block_n]);
+                    }
+                }
             }
             midi_live[t] = true;
             any = true;
@@ -2317,19 +2514,17 @@ struct Proc {
     /// block so the sample loop can call `&mut self` effect code freely).
     clip_buf: Vec<ClipEntry>,
     // ---- MIDI playback ------------------------------------------------------
-    synths_cache: Arc<[Option<Arc<crate::synth::Instance>>; MAX_LOOPS]>,
+    synths_cache: Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]>,
     synths_cache_gen: u64,
-    dflt_synth: Option<Arc<crate::synth::Instance>>,
-    // ---- VST inserts -------------------------------------------------------
-    vsts_cache: Arc<[Option<Arc<crate::vsthost::RtStageEntry>>; MAX_LOOPS]>,
-    vsts_cache_gen: u64,
-    /// Per-block pre-master mix. With VST inserts the sample loop cannot
-    /// write the ports directly any more (a track's sum has to pass through
-    /// its plugin before panning), so the block mix lands here and the port
-    /// writes move to a post-loop pass — for every block, uniform path.
+    dflt_synth: Option<Arc<SynthHandle>>,
+    /// Per-block pre-master mix. Tracks whose chain hosts a plugin cannot
+    /// use the per-sample path (a chain runs block-wise), so the block mix
+    /// lands here and the port writes move to a post-loop pass — for every
+    /// block, uniform path.
     mix_l: Vec<f32>,
     mix_r: Vec<f32>,
-    /// Held-back track sums (tracks with a VST insert) and monitor tap.
+    /// Held-back track sums (tracks with a plugin in the chain) and monitor
+    /// tap; plus the VST scratch buffer for block-wise chain passes.
     trk_bufs: Vec<Vec<f32>>,
     mon_buf: Vec<f32>,
     vst_tmp: Vec<f32>,
@@ -2347,6 +2542,8 @@ struct Proc {
     synth_pg: [u64; MAX_LOOPS],
     /// Reusable mono render buffer for one track's synth block.
     mono: Vec<f32>,
+    /// Reusable zero input for driving a VSTi with no audio side-chain.
+    sil: Vec<f32>,
 }
 
 /// RT-side snapshot of one effect instance's sliders.
@@ -2357,7 +2554,8 @@ struct FxRt {
 
 impl Proc {
     /// Run one track-output sample through the track's effect chain (the
-    /// volume x gain trim has already been multiplied into `x`).
+    /// volume x gain trim has already been multiplied into `x`). Only for
+    /// scripted-only chains; plugin chains go through `run_chain_block`.
     #[inline]
     fn fx_mix(&mut self, t: usize, x: f32) -> f32 {
         let chain = &self.fx_cache[t];
@@ -2366,7 +2564,7 @@ impl Proc {
         }
         let mut s = x;
         for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
-            let inst = &slot.inst;
+            let FxKind::Scripted { inst, .. } = &slot.kind else { continue };
             let g = inst.param_gen();
             if g != rt.gen {
                 inst.read_params(&mut rt.p);
@@ -2377,6 +2575,35 @@ impl Proc {
             s = unsafe { inst.call_sample(s, &rt.p) }
         }
         s
+    }
+
+    /// Run a plugin-bearing chain over a whole block (mono in, mono out,
+    /// in place — `tmp` is scratch). Scripted slots keep their per-slot
+    /// slider snapshots (`fx_rt`); plugins consume/replenish their rings.
+    /// The dry input is already trim-scaled; pan/master are folded later.
+    fn run_chain_block(&mut self, t: usize, buf: &mut [f32], tmp: &mut [f32]) {
+        let n = buf.len().min(tmp.len());
+        let Self { fx_cache, fx_rt, .. } = self;
+        for (k, slot) in fx_cache[t].slots().iter().enumerate() {
+            match &slot.kind {
+                FxKind::Scripted { inst, .. } => {
+                    let rt = &mut fx_rt[t][k];
+                    let g = inst.param_gen();
+                    if g != rt.gen {
+                        inst.read_params(&mut rt.p);
+                        rt.gen = g;
+                    }
+                    // SAFETY: audio thread owns the live chain (as fx_mix).
+                    for x in buf[..n].iter_mut() {
+                        *x = unsafe { inst.call_sample(*x, &rt.p) };
+                    }
+                }
+                FxKind::Vst(e) => {
+                    e.process(&buf[..n], &mut tmp[..n]);
+                    buf[..n].copy_from_slice(&tmp[..n]);
+                }
+            }
+        }
     }
 
     /// Build this block's clip windows for the timeline span `[p0, p0 + n)`.
@@ -2510,6 +2737,12 @@ impl ProcessHandler for Proc {
                             .collect()
                     })
                     .collect();
+                // Stamp the chain reaper (see `Engine::drain_vst_held`): the
+                // displaced chain died right here, but every VST entry it
+                // held also lives in `vst_held`, so no plugin destructor ran
+                // on this thread — the UI may now collect them.
+                let vg = self.engine.vst_gen();
+                self.engine.vst_refreshed.store(vg, Ordering::Relaxed);
             }
         }
         // Asset preview: refresh the audition buffer on a generation change
@@ -2524,15 +2757,6 @@ impl ProcessHandler for Proc {
             }
         }
         self.preview_live = self.engine.preview_on.load(Ordering::Relaxed) != 0;
-
-        let vg = self.engine.vst_gen();
-        if vg != self.vsts_cache_gen {
-            if let Ok(g) = self.engine.vsts.try_lock() {
-                self.vsts_cache = g.clone();
-                self.vsts_cache_gen = vg;
-                self.engine.vst_refreshed.store(vg, Ordering::Relaxed);
-            }
-        }
 
         // Per-track output trim (volume x gain, linear) snapshotted once per
         // cycle; applied to each clip's PLAYBACK contribution only, so the
@@ -2608,8 +2832,13 @@ impl ProcessHandler for Proc {
             if let Some(d) = &self.dflt_synth {
                 d.all_off();
             }
-            for e in self.vsts_cache.iter().flatten() {
-                e.flush();
+            // Plugin buffers/rings in every chain: drop stale audio.
+            for tf in self.fx_cache.iter() {
+                for s in tf.slots() {
+                    if let FxKind::Vst(e) = &s.kind {
+                        e.flush();
+                    }
+                }
             }
         }
         let mut p0 = self.pos;
@@ -2764,20 +2993,19 @@ impl ProcessHandler for Proc {
         let mut mixer_live = clip_sound;
         if transport && !mixer_live {
             mixer_live = (0..MAX_LOOPS).any(|t| {
-                self.engine.track_on(t)
-                    && (!self.fx_cache[t].is_empty() || self.vsts_cache[t].is_some())
+                self.engine.track_on(t) && !self.fx_cache[t].is_empty()
             });
         }
         // Per-track sample accumulators for the clip mix.
         let mut acc = [0.0f32; MAX_LOOPS];
 
-        // Tracks whose sums must pass through a VST insert before the pan,
-        // plus the monitor tap when the monitored track has its own insert.
+        // Tracks whose chain hosts a plugin: their per-track sums (and the
+        // monitor tap) run the chain block-wise after the sample loop.
         let mut vst_mask = [false; MAX_LOOPS];
         for t in 0..MAX_LOOPS {
-            vst_mask[t] = audible[t] && self.vsts_cache[t].is_some();
+            vst_mask[t] = audible[t] && self.fx_cache[t].has_vst();
         }
-        let sel_vst = audible[sel] && self.vsts_cache[sel].is_some();
+        let sel_vst = audible[sel] && self.fx_cache[sel].has_vst();
         let has_vst = vst_mask.iter().any(|v| *v) || sel_vst;
 
         // Per-block mix buffers (taken out of self so the sample loop can
@@ -2863,12 +3091,13 @@ impl ProcessHandler for Proc {
                 }
                 for (t, &a) in acc.iter().enumerate() {
                     if audible[t] {
-                        let m = self.fx_mix(t, a * amp[t]);
                         if vst_mask[t] {
-                            // Held back: the plugin consumes this pre-pan
-                            // post-fx sum after the sample loop.
-                            trk_bufs[t][i] = m;
+                            // Held back: this track's chain (scripts and
+                            // plugins, in chain order) runs block-wise over
+                            // the pre-pan sum after the sample loop.
+                            trk_bufs[t][i] = a * amp[t];
                         } else {
+                            let m = self.fx_mix(t, a * amp[t]);
                             play_l += m * pgl[t];
                             play_r += m * pgr[t];
                         }
@@ -2951,7 +3180,7 @@ impl ProcessHandler for Proc {
             // back for the plugin instead of feeding the mix directly.
             let mut mon = 0.0f32;
             if sel_vst {
-                mon_buf[i] = self.fx_mix(sel, src_in * mon_amp);
+                mon_buf[i] = src_in * mon_amp;
             } else {
                 mon = self.fx_mix(sel, src_in * mon_amp);
             }
@@ -2970,30 +3199,27 @@ impl ProcessHandler for Proc {
             }
         }
 
-        // VST inserts: process the held-back track sums (pre-pan) and the
-        // monitor tap, folding each plugin's mono output into the mix.
+        // Plugin chains: run the held-back track sums (pre-pan) and the
+        // monitor tap through their full chains block-wise, folding each
+        // result into the mix at the track's pan / the monitor level.
         if has_vst {
             for t in 0..MAX_LOOPS {
                 if !vst_mask[t] {
                     continue;
                 }
-                if let Some(e) = &self.vsts_cache[t] {
-                    let (buf, tmp) = (&trk_bufs[t], &mut vst_tmp);
-                    e.process(buf, tmp);
-                    for i in 0..n {
-                        mix_l[i] += tmp[i] * pgl[t];
-                        mix_r[i] += tmp[i] * pgr[t];
-                    }
+                let (buf, tmp) = (&mut trk_bufs[t], &mut vst_tmp);
+                self.run_chain_block(t, buf, tmp);
+                for i in 0..n {
+                    mix_l[i] += buf[i] * pgl[t];
+                    mix_r[i] += buf[i] * pgr[t];
                 }
             }
             if sel_vst {
-                if let Some(e) = &self.vsts_cache[sel] {
-                    let tmp = &mut vst_tmp;
-                    e.process(&mon_buf, tmp);
-                    for i in 0..n {
-                        mix_l[i] += tmp[i] * mon_l;
-                        mix_r[i] += tmp[i] * mon_r;
-                    }
+                let (buf, tmp) = (&mut mon_buf, &mut vst_tmp);
+                self.run_chain_block(sel, buf, tmp);
+                for i in 0..n {
+                    mix_l[i] += buf[i] * mon_l;
+                    mix_r[i] += buf[i] * mon_r;
                 }
             }
         }
@@ -3364,10 +3590,7 @@ mod tests {
         e.set_track_fx(
             0,
             TrackFx {
-                slots: std::sync::Arc::new(vec![FxSlot {
-                    inst: inst0,
-                    desc: desc.clone(),
-                }]),
+                slots: std::sync::Arc::new(vec![FxSlot::scripted(inst0, desc.clone())]),
             },
         );
         assert_eq!(e.fx_gen(), 1);
@@ -3385,10 +3608,7 @@ mod tests {
         e.set_track_fx(
             0,
             TrackFx {
-                slots: std::sync::Arc::new(vec![FxSlot {
-                    inst: inst1.clone(),
-                    desc,
-                }]),
+                slots: std::sync::Arc::new(vec![FxSlot::scripted(inst1.clone(), desc)]),
             },
         );
         assert_eq!(e.fx_gen(), 2);

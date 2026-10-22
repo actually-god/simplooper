@@ -40,9 +40,10 @@ use egui::{Color32, RichText, Sense, Slider};
 use crate::arrange::{Arrangement, Clip};
 use crate::assets::{Asset, RackFolder};
 use crate::audio::{
-    Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS, TR_REC,
+    Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
+    TR_REC,
 };
-use crate::config::{Config, MidiAxisCal, MidiBinding, TrackFxSave, VstSave};
+use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, TrackFxSave};
 use crate::fx;
 use crate::midipat::{Pattern, PPQ};
 use crate::midi::{hex, scale_axis, MidiAction, MidiBind, MidiMsg};
@@ -270,6 +271,12 @@ struct PianoRoll {
     /// In-flight note gesture: (note index, offset of the grab point
     /// inside the note, seconds-per-snap at grab time).
     drag: Option<(usize, f64)>,
+    /// Canvas rect painted last frame (screen space) — the wheel router
+    /// claims ctrl/alt-wheel gestures only while the pointer is over it.
+    canvas_rect: Option<egui::Rect>,
+    /// Velocity the next drawn note gets (FL carries a velocity knob in
+    /// the roll toolbar instead of hard-coding one).
+    new_vel: u8,
 }
 
 /// In-flight three-step calibration for one continuous (knob) MIDI binding.
@@ -449,6 +456,43 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// One row of a track's mixer chain (ordered audio path). Scripted effects
+/// and hosted plugins are the same kind of slot — FL Studio's mixer model —
+/// so a plugin can sit anywhere in the chain and a track can host as many
+/// as the user likes.
+#[derive(Clone)]
+pub enum ChainRow {
+    /// Bundled/user effect script.
+    Script { stem: String, params: Vec<f32> },
+    /// Hosted plugin. `entry` is None until it is opened at the engine
+    /// sample rate (startup/Ready); `params` carries the latest snapshot
+    /// for persistence and reopen-after-failure.
+    Vst {
+        path: String,
+        kind: crate::vsthost::VstKind,
+        name: String,
+        params: Vec<f32>,
+        entry: Option<Arc<crate::vsthost::RtStageEntry>>,
+    },
+}
+
+/// Plugin-instrument synth bindings reuse the `track_synth` stem table with
+/// a scheme prefix: `"vst3:/abs/x.vst3"` / `"vst2:/abs/x.so"` — absolute
+/// paths can never collide with a script stem name.
+fn vst_synth_encode(kind: crate::vsthost::VstKind, path: &str) -> String {
+    format!("{}:{path}", kind.tag().to_lowercase())
+}
+
+fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str)> {
+    if let Some(p) = s.strip_prefix("vst3:") {
+        Some((crate::vsthost::VstKind::V3, p))
+    } else if let Some(p) = s.strip_prefix("vst2:") {
+        Some((crate::vsthost::VstKind::V2, p))
+    } else {
+        None
+    }
+}
+
 /// The whole application: engine backend handle, persistent UI state, and
 /// the per-frame layout cache (`row_h` → [`App::track_rows`]) that keeps the
 /// timeline blocks and the Mixer dock strip-per-track aligned.
@@ -569,6 +613,9 @@ pub struct App {
     preview_enabled: bool,
     /// Text box value for the preview length in seconds.
     preview_secs: String,
+    /// Synth stem used to audition MIDI (piano roll picker); `None` = the
+    /// bundled fallback, `"__track__"` = the selected track's binding.
+    preview_synth: Option<String>,
     /// Asset name currently auditioning (clicking it again toggles stop).
     preview_playing: Option<String>,
 
@@ -585,8 +632,9 @@ pub struct App {
     /// Per-track bound synth stem (None/"" = default piano fallback).
     track_synth: Vec<Option<String>>,
     track_synth_params: Vec<Vec<f32>>,
-    /// Live instances (mirrors `track_synth`; also pushed into the engine).
-    track_synth_inst: Vec<Option<Arc<synth::Instance>>>,
+    /// Live handles (mirrors `track_synth`; also pushed into the engine).
+    /// VST instruments are first-class synths, so this holds both kinds.
+    track_synth_inst: Vec<Option<Arc<crate::audio::SynthHandle>>>,
     /// Track whose synth sliders window is open.
     synth_win: Option<usize>,
     midi_rec: Vec<MidiRecState>,
@@ -594,11 +642,14 @@ pub struct App {
 
     // --- per-track effects framework ---
     fx_registry: fx::Registry,
-    fx_entries: Vec<Vec<fx::UiEntry>>,
-    fx_live: Vec<Vec<std::sync::Arc<fx::Instance>>>,
+    /// Per-track mixer chains (ordered): scripted effects and VST plugins
+    /// as one slot list — plugins sit anywhere in the chain.
+    fx_rows: Vec<Vec<ChainRow>>,
+    /// Script instances backing `fx_rows` (None on plugin rows; same order).
+    fx_live: Vec<Vec<Option<std::sync::Arc<fx::Instance>>>>,
     fx_window: Option<usize>,
-    /// VST insert window (track index).
-    vst_window: Option<usize>,
+    /// (track, chain row) whose plugin parameter window is open.
+    vst_edit: Option<(usize, usize)>,
     /// Scan of all VST folders (lazy on first window open, manual Rescan).
     vst_scan: Vec<crate::vsthost::VstEntry>,
     vst_scanned: bool,
@@ -607,11 +658,6 @@ pub struct App {
     vst_dirs: Vec<String>,
     /// One-line feedback under the folder row.
     vst_note: String,
-    /// Per-track live inserts (shared handles; params ride their atomics).
-    vst_slots: Vec<Option<std::sync::Arc<crate::vsthost::RtStageEntry>>>,
-    /// Per-track insert save metadata (path/kind/name; params are read from
-    /// the live slot at save time).
-    vst_saved: Vec<Option<VstSave>>,
     fx_editor: Option<Box<crate::fxgui::FxEditor>>,
     fx_dir_edit: String,
     fx_note: String,
@@ -654,19 +700,34 @@ impl App {
         });
         let mut fx_registry = fx::Registry::open(fx_dir.clone());
         fx_registry.rescan();
-        let fx_stems = fx_registry.stems();
-        let fx_entries: Vec<Vec<fx::UiEntry>> = (0..MAX_LOOPS)
+        // Mixer chain rows from the saved config (scripts materialize at
+        // rebuild; plugins open later, once the engine sample rate is known).
+        let chain_cfg = cfg.chain();
+        let fx_rows: Vec<Vec<ChainRow>> = (0..MAX_LOOPS)
             .map(|i| {
-                let saved: Vec<(String, Vec<f32>)> = cfg
-                    .track_fx
+                chain_cfg
                     .get(i)
                     .map(|v| {
                         v.iter()
-                            .map(|s| (s.stem.clone(), s.params.clone()))
+                            .filter_map(|s| match s {
+                                ChainSave::Fx { stem, params } => Some(ChainRow::Script {
+                                    stem: stem.clone(),
+                                    params: params.clone(),
+                                }),
+                                ChainSave::Vst { path, kind, name, params } => {
+                                    let kind = crate::vsthost::VstKind::parse(kind)?;
+                                    Some(ChainRow::Vst {
+                                        path: path.clone(),
+                                        kind,
+                                        name: name.clone(),
+                                        params: params.clone(),
+                                        entry: None,
+                                    })
+                                }
+                            })
                             .collect()
                     })
-                    .unwrap_or_default();
-                fx::merge_entries(&[], &fx_stems, &saved)
+                    .unwrap_or_default()
             })
             .collect();
         // Keyboard table: this layout is trusted verbatim; older persisted
@@ -748,7 +809,7 @@ impl App {
         let synth_registry = synth::Registry::open(synth::default_dir());
         let mut track_synth: Vec<Option<String>> = Vec::with_capacity(MAX_LOOPS);
         let mut track_synth_params: Vec<Vec<f32>> = Vec::with_capacity(MAX_LOOPS);
-        let mut track_synth_inst: Vec<Option<Arc<synth::Instance>>> = Vec::with_capacity(MAX_LOOPS);
+        let mut track_synth_inst: Vec<Option<Arc<SynthHandle>>> = Vec::with_capacity(MAX_LOOPS);
         for t in 0..MAX_LOOPS {
             let stem = cfg.track_synth.get(t).cloned().flatten().filter(|s| !s.is_empty());
             track_synth.push(stem);
@@ -820,6 +881,7 @@ impl App {
             monitor_enabled: cfg.monitor_on,
             preview_enabled: cfg.preview_on,
             preview_secs: cfg.preview_secs.max(0.0).to_string(),
+            preview_synth: cfg.preview_synth.clone().filter(|s| !s.is_empty()),
             preview_playing: None,
             proj_name: String::new(),
             project_dir: cfg.project_dir.clone(),
@@ -834,18 +896,14 @@ impl App {
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             piano_roll: None,
             fx_registry,
-            fx_entries,
+            fx_rows,
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
-            vst_window: None,
+            vst_edit: None,
             vst_scan: Vec::new(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
             vst_note: String::new(),
-            vst_slots: (0..MAX_LOOPS).map(|_| None).collect(),
-            vst_saved: (0..MAX_LOOPS)
-                .map(|i| cfg.track_vst.get(i).cloned().flatten())
-                .collect(),
             fx_editor: None,
             fx_dir_edit: fx_dir.display().to_string(),
             fx_note: String::new(),
@@ -1266,29 +1324,54 @@ impl App {
         if self.fx_editor.as_ref().is_some_and(|ed| ed.loop_i == i) {
             self.fx_editor = None;
         }
-        let mut live: Vec<std::sync::Arc<fx::Instance>> = Vec::new();
+        if self.vst_edit.is_some_and(|(t, _)| t == i) {
+            self.vst_edit = None;
+        }
+        let sr = self.sample_rate.max(48_000);
+        let mut live: Vec<Option<std::sync::Arc<fx::Instance>>> = Vec::new();
         let mut slots: Vec<FxSlot> = Vec::new();
-        for e in self.fx_entries[i].iter_mut() {
-            if !e.enabled {
-                continue;
-            }
-            if slots.len() >= fx::MAX_FX_PER_TRACK {
-                break;
-            }
-            let Some(desc) = self.fx_registry.desc(&e.stem).cloned() else {
-                continue;
-            };
-            let vals = fx::seed_values(&e.params, &desc);
-            e.params = vals.clone();
-            if let Some(inst) =
-                self.fx_registry
-                    .create_instance(&e.stem, self.sample_rate as f64, &vals)
-            {
-                slots.push(FxSlot {
-                    inst: inst.clone(),
-                    desc,
-                });
-                live.push(inst);
+        for row in self.fx_rows[i].iter_mut() {
+            match row {
+                ChainRow::Script { stem, params } => {
+                    if slots.len() >= fx::MAX_FX_PER_TRACK {
+                        continue; // scripted slots share the historic cap; plugins are uncapped
+                    }
+                    let Some(desc) = self.fx_registry.desc(stem).cloned() else {
+                        continue;
+                    };
+                    let vals = fx::seed_values(params, &desc);
+                    *params = vals.clone();
+                    if let Some(inst) =
+                        self.fx_registry.create_instance(stem, self.sample_rate as f64, &vals)
+                    {
+                        slots.push(FxSlot::scripted(inst.clone(), desc));
+                        live.push(Some(inst));
+                    } else {
+                        live.push(None);
+                    }
+                }
+                ChainRow::Vst { path, kind, name, params, entry } => {
+                    // Open lazily (first rebuild after load, or after the
+                    // folder rescan dropped a failed load).
+                    if entry.is_none() {
+                        let p = std::path::Path::new(path);
+                        if p.is_file() || p.is_dir() {
+                            match crate::vsthost::open(p, *kind, sr, Some(params)) {
+                                Ok(load) => *entry = Some(load.entry),
+                                Err(err) => {
+                                    self.vst_note = format!("{name}: {err}");
+                                }
+                            }
+                        }
+                    }
+                    match entry {
+                        Some(e) => {
+                            slots.push(FxSlot::vst(e.clone()));
+                            live.push(None);
+                        }
+                        None => live.push(None), // keep row/instance alignment
+                    }
+                }
             }
         }
         self.fx_live[i] = live;
@@ -1300,21 +1383,85 @@ impl App {
         });
     }
 
+    /// Append a script effect to track `i`'s chain (duplicates allowed —
+    /// FL lets the same effect sit in two slots).
+    fn add_fx_script(&mut self, i: usize, stem: &str) {
+        self.fx_rows[i].push(ChainRow::Script { stem: stem.to_string(), params: Vec::new() });
+        self.rebuild_fx(i);
+        self.fx_save_pending = true;
+        self.save_config();
+    }
+
+    /// Open a plugin from the scan list and append it to track `i`'s chain.
+    fn add_fx_plugin(&mut self, i: usize, e: &crate::vsthost::VstEntry) {
+        let sr = self.sample_rate.max(48_000);
+        match crate::vsthost::open(&e.path, e.kind, sr, None) {
+            Ok(load) => {
+                self.vst_note = format!("added {}", e.name);
+                self.fx_rows[i].push(ChainRow::Vst {
+                    path: e.path.to_string_lossy().into_owned(),
+                    kind: e.kind,
+                    name: e.name.clone(),
+                    params: Vec::new(),
+                    entry: Some(load.entry),
+                });
+                self.rebuild_fx(i);
+                self.save_config();
+            }
+            Err(err) => self.vst_note = format!("{}: {err}", e.name),
+        }
+    }
+
+    fn remove_fx_row(&mut self, i: usize, k: usize) {
+        if k < self.fx_rows[i].len() {
+            self.fx_rows[i].remove(k);
+            self.rebuild_fx(i);
+            self.save_config();
+        }
+    }
+
+    /// Swap chain slot `k` with its neighbour (rebuild re-pushes the order).
+    fn move_fx_row(&mut self, i: usize, k: usize, dir: i32) {
+        let n = self.fx_rows[i].len();
+        if k >= n {
+            return;
+        }
+        let j = if dir < 0 {
+            k.wrapping_sub(1)
+        } else {
+            k + 1
+        };
+        if j >= n {
+            return;
+        }
+        self.fx_rows[i].swap(k, j);
+        self.rebuild_fx(i);
+        self.save_config();
+    }
+
+    /// Plugin sliders live on the shared param store; mirror them back into
+    /// the chain row so the next config/project save persists them.
+    fn vst_row_params_sync(&mut self, t: usize, row: usize) {
+        if let Some(ChainRow::Vst { params, entry: Some(e), .. }) =
+            self.fx_rows.get_mut(t).and_then(|r| r.get_mut(row))
+        {
+            *params = (0..e.params().len()).map(|k| e.params().get(k)).collect();
+        }
+    }
+
     /// Open (or reopen) the child editor window for loop `i`'s chain slot
-    /// `slot`. Effects that export a custom GUI get their own canvas;
+    /// `row`. Effects that export a custom GUI get their own canvas;
     /// everything else gets the auto slider window. Params ride the same
     /// live instance the sliders used to sit next to on the loop row.
-    fn open_fx_editor(&mut self, i: usize, slot: usize) {
+    fn open_fx_editor(&mut self, i: usize, row: usize) {
         self.fx_editor = None; // closing an old window frees its GUI state
-        let Some(stem) = self.fx_entries[i]
-            .iter()
-            .filter(|e| e.enabled)
-            .nth(slot)
-            .map(|e| e.stem.clone())
-        else {
+        let Some(stem) = (match self.fx_rows[i].get(row) {
+            Some(ChainRow::Script { stem, .. }) => Some(stem.clone()),
+            _ => None,
+        }) else {
             return;
         };
-        let inst = self.fx_live[i].get(slot).cloned();
+        let inst = self.fx_live[i].get(row).cloned().flatten();
         let desc = self.fx_registry.desc(&stem).cloned();
         let (Some(inst), Some(desc)) = (inst, desc) else {
             return;
@@ -1322,7 +1469,7 @@ impl App {
         let gui = self.fx_registry.gui(&stem);
         self.fx_editor = Some(Box::new(crate::fxgui::FxEditor::new(
             i,
-            slot,
+            row,
             stem,
             desc,
             inst,
@@ -1342,13 +1489,11 @@ impl App {
             closed = !crate::fxgui::window(ui, ed);
             let pend = std::mem::take(&mut ed.pending);
             if !pend.is_empty() {
-                if let Some(e) = self.fx_entries[ed.loop_i]
-                    .iter_mut()
-                    .filter(|e| e.enabled)
-                    .nth(ed.slot)
+                if let Some(ChainRow::Script { params, .. }) =
+                    self.fx_rows[ed.loop_i].get_mut(ed.slot)
                 {
                     for (k, v) in pend {
-                        if let Some(p) = e.params.get_mut(k) {
+                        if let Some(p) = params.get_mut(k) {
                             *p = v;
                         }
                     }
@@ -1363,29 +1508,32 @@ impl App {
 
     /// Resolve the "effects location" text box, rescan, and re-point every
     /// loop's chain at the new folder (chains whose scripts vanished simply
-    /// drop those slots; slider values of survivors are kept).
+    /// drop those slots; slider values of survivors — and all plugin rows —
+    /// are kept).
     fn apply_fx_dir(&mut self) {
         let dir = fx::prepare_effects_dir(Some(self.fx_dir_edit.trim()));
         self.fx_registry.set_dir(dir.clone());
         self.fx_dir_edit = dir.display().to_string();
         self.fx_registry.rescan();
-        let stems = self.fx_registry.stems();
+        self.prune_dead_script_rows();
+        self.save_config();
+    }
+
+    /// Drop chain rows pointing at scripts the registry no longer loads.
+    fn prune_dead_script_rows(&mut self) {
         for i in 0..MAX_LOOPS {
-            self.fx_entries[i] = fx::merge_entries(&self.fx_entries[i], &stems, &[]);
+            self.fx_rows[i].retain(|r| match r {
+                ChainRow::Script { stem, .. } => self.fx_registry.desc(stem).is_some(),
+                ChainRow::Vst { .. } => true,
+            });
             self.rebuild_fx(i);
         }
-        self.fx_note = format!("folder: {}", dir.display());
-        self.save_config();
     }
 
     /// Compile/load every script in the folder again and refresh all rows.
     fn rescan_fx(&mut self) {
         self.fx_registry.rescan();
-        let stems = self.fx_registry.stems();
-        for i in 0..MAX_LOOPS {
-            self.fx_entries[i] = fx::merge_entries(&self.fx_entries[i], &stems, &[]);
-            self.rebuild_fx(i);
-        }
+        self.prune_dead_script_rows();
         let ok = self.fx_registry.stems().len();
         let bad = self
             .fx_registry
@@ -1804,62 +1952,6 @@ impl App {
         self.save_config();
     }
 
-    /// Replace (or clear) a track's VST insert. Loading happens on this
-    /// (UI) thread — same as every other window action — and the entry is
-    /// handed to the engine, which runs it until the next replace.
-    fn set_track_vst(
-        &mut self,
-        t: usize,
-        entry: Option<std::sync::Arc<crate::vsthost::RtStageEntry>>,
-        save: Option<VstSave>,
-    ) {
-        self.vst_slots[t] = entry.clone();
-        self.vst_saved[t] = save;
-        self.backend.cmd(Cmd::SetTrackVst { i: t, entry });
-        self.save_config();
-    }
-
-    /// Open a plugin picked from the scan list.
-    fn pick_vst(&mut self, t: usize, e: &crate::vsthost::VstEntry) {
-        let sr = self.sample_rate.max(48_000);
-        match crate::vsthost::open(&e.path, e.kind, sr, None) {
-            Ok(load) => {
-                self.vst_note = format!("loaded {}", e.name);
-                let save = VstSave {
-                    path: e.path.to_string_lossy().into_owned(),
-                    kind: e.kind.tag().to_string(),
-                    name: e.name.clone(),
-                    params: Vec::new(),
-                };
-                self.set_track_vst(t, Some(load.entry), Some(save));
-            }
-            Err(err) => self.vst_note = format!("{}: {err}", e.name),
-        }
-    }
-
-    /// Reopen a persisted insert at startup (or after a failed start).
-    fn open_saved_vst(&mut self, t: usize, save: &VstSave) {
-        let Some(kind) = crate::vsthost::VstKind::parse(&save.kind) else {
-            return;
-        };
-        let path = std::path::Path::new(&save.path);
-        if !(path.is_file() || path.is_dir()) {
-            return;
-        }
-        let sr = self.sample_rate.max(48_000);
-        match crate::vsthost::open(path, kind, sr, Some(&save.params)) {
-            Ok(load) => {
-                let entry = load.entry.clone();
-                self.vst_slots[t] = Some(load.entry);
-                self.backend.cmd(Cmd::SetTrackVst { i: t, entry: Some(entry) });
-            }
-            Err(err) => {
-                self.vst_note = format!("{}: {err}", save.name);
-                self.vst_saved[t] = None;
-            }
-        }
-    }
-
     /// Rescan the system folders plus the user's extra folders. Loads every
     /// plugin once (metadata), so it runs on explicit click / first window
     /// open, never per frame.
@@ -1951,33 +2043,36 @@ impl App {
             monitor_on: self.monitor_enabled,
             preview_on: self.preview_enabled,
             preview_secs: self.preview_secs_f(),
+            preview_synth: self.preview_synth.clone(),
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
-            track_vst: (0..MAX_LOOPS)
-                .map(|i| {
-                    let save = self.vst_saved[i].clone()?;
-                    let params = self.vst_slots[i]
-                        .as_ref()
-                        .map(|e| (0..e.params().len()).map(|k| e.params().get(k)).collect())
-                        .unwrap_or_default();
-                    Some(VstSave { params, ..save })
-                })
-                .collect(),
-            track_fx: (0..MAX_LOOPS)
-                .map(|i| {
-                    self.fx_entries[i]
-                        .iter()
-                        .filter(|e| e.enabled)
-                        .map(|e| TrackFxSave {
-                            stem: e.stem.clone(),
-                            params: e.params.clone(),
+            track_vst: Vec::new(),
+            track_chain: self
+                .fx_rows
+                .iter()
+                .map(|rows| {
+                    rows.iter()
+                        .map(|r| match r {
+                            ChainRow::Script { stem, params } => ChainSave::Fx {
+                                stem: stem.clone(),
+                                params: params.clone(),
+                            },
+                            ChainRow::Vst { path, kind, name, params, entry: _ } => {
+                                ChainSave::Vst {
+                                    path: path.clone(),
+                                    kind: kind.tag().to_string(),
+                                    name: name.clone(),
+                                    params: params.clone(),
+                                }
+                            }
                         })
                         .collect()
                 })
                 .collect(),
+            track_fx: Vec::new(),
             track_synth: self.track_synth.clone(),
             track_synth_params: self.track_synth_params.clone(),
         };
@@ -1998,6 +2093,21 @@ impl App {
     /// the default piano fallback). Returns success.
     fn rebuild_track_synth(&mut self, t: usize) -> bool {
         let inst = match self.track_synth[t].as_deref().filter(|s| !s.is_empty()) {
+            Some(stem) if vst_synth_decode(stem).is_some() => {
+                let (kind, path) = vst_synth_decode(stem).unwrap();
+                match crate::vsthost::open(
+                    std::path::Path::new(path),
+                    kind,
+                    self.sample_rate.max(1),
+                    None,
+                ) {
+                    Ok(load) => Some(std::sync::Arc::new(SynthHandle::Vst(load.entry))),
+                    Err(err) => {
+                        self.status = format!("synth: {err}");
+                        return false;
+                    }
+                }
+            }
             Some(stem) => {
                 let desc = match self.synth_registry.desc(stem) {
                     Some(d) => d.clone(),
@@ -2010,6 +2120,7 @@ impl App {
                 self.track_synth_params[t] = vals.clone();
                 self.synth_registry
                     .create_instance(stem, self.sample_rate.max(1) as f64, &vals)
+                    .map(|i| std::sync::Arc::new(SynthHandle::Script(i)))
             }
             None => None,
         };
@@ -2037,7 +2148,10 @@ impl App {
         if self.sample_rate == 0 {
             return; // instances are created at Evt::Ready
         }
-        let dflt = self.synth_registry.create_instance("piano", self.sample_rate as f64, &[]);
+        let dflt = self
+            .synth_registry
+            .create_instance("piano", self.sample_rate as f64, &[])
+            .map(|i| std::sync::Arc::new(SynthHandle::Script(i)));
         self.backend.cmd(Cmd::SetDefaultSynth(dflt));
         for t in 0..MAX_LOOPS {
             self.rebuild_track_synth(t);
@@ -2239,17 +2353,59 @@ impl App {
         self.status = format!("track {}: MIDI take → clip in lane {} (“{name}”)", t + 1, lane + 1);
     }
 
-    /// Render a pattern to a mono buffer through a throwaway piano copy
-    /// (shared by asset audition and the piano-roll preview).
+    /// The synth used for every MIDI audition (piano roll PREVIEW, key
+    /// clicks, rack MIDI rows): the user's pick from the roll toolbar
+    /// (`config.preview_synth`; the `__track__` sentinel follows the
+    /// selected track's binding), then the bundled piano, then any stem.
+    fn preview_synth_instance(&self) -> Option<std::sync::Arc<crate::synth::Instance>> {
+        let reg = &self.synth_registry;
+        let sr = self.sample_rate.max(1) as f64;
+        match self.preview_synth.as_deref() {
+            Some("__track__") => self
+                .track_synth_inst
+                .get(self.selected.min(self.n_tracks - 1))
+                .cloned()
+                .flatten()
+                // VSTi instruments preview through the fallback below;
+                // play them for real on their track's MIDI clips.
+                .and_then(|h| match h.as_ref() {
+                    SynthHandle::Script(i) => Some(i.clone()),
+                    SynthHandle::Vst(_) => None,
+                }),
+            Some(stem) => reg.create_instance(stem, sr, &[]),
+            None => None,
+        }
+        .or_else(|| reg.create_instance("piano", sr, &[]))
+        .or_else(|| {
+            let alt = reg.stems().into_iter().next()?;
+            reg.create_instance(&alt, sr, &[])
+        })
+    }
+
+    /// One short test note through the audition synth (piano-key click).
+    fn audition_note(&mut self, note: u8) {
+        let Some(inst) = self.preview_synth_instance() else {
+            self.status = "audition: no synth available".into();
+            return;
+        };
+        let sr = self.sample_rate.max(1);
+        let secs = 0.6f32;
+        let n = (secs * sr as f32) as usize;
+        let mut buf = vec![0.0f32; n];
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, note, 100),
+            ((sr as u64) / 3, 0, 0, note, 0),
+        ];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, n, &mut buf);
+        self.backend.cmd(Cmd::PreviewPlay {
+            samples: Arc::from(buf),
+        });
+        self.preview_playing = Some(format!("key {note}"));
+    }
+
+    /// Render a whole pattern through the audition synth for PREVIEW.
     fn render_pattern_preview(&mut self, pat: &Pattern) -> Option<Arc<[f32]>> {
-        let inst = self
-            .synth_registry
-            .create_instance("piano", self.sample_rate.max(1) as f64, &[])
-            .or_else(|| {
-                let alt = self.synth_registry.stems().into_iter().next()?;
-                self.synth_registry
-                    .create_instance(&alt, self.sample_rate.max(1) as f64, &[])
-            })?;
+        let inst = self.preview_synth_instance()?;
         let sr = self.sample_rate.max(1);
         let secs = self.preview_secs_f().min(30.0).min(pat.len_samples(sr) as f32 / sr as f32 + 2.0);
         let n = (secs as usize) * sr as usize;
@@ -2311,6 +2467,53 @@ impl App {
         let snap_steps = SUBDIVISIONS[self.snap_sub].0.max(1);
         let playhead = self.backend.engine.pos();
         let sel = self.selected;
+        let mut audition: Option<u8> = None;
+        // ---- roll wheel router ----
+        // Pointer over the canvas: ctrl/cmd+wheel zooms time, alt+wheel
+        // zooms rows. The global filter left these events alone while
+        // over the roll; claim them before the ScrollArea reads the
+        // deltas (window content paints after the panels).
+        let over_canvas = roll
+            .canvas_rect
+            .is_some_and(|r| ui.ctx().pointer_hover_pos().is_some_and(|p| r.contains(p)));
+        if over_canvas {
+            let mut tz = 0.0f32;
+            let mut rz = 0.0f32;
+            ui.ctx().input_mut(|i| {
+                i.events.retain(|e| match e {
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } => {
+                        let s = match unit {
+                            egui::MouseWheelUnit::Line => ZOOM_WHEEL_LINE,
+                            _ => ZOOM_WHEEL_PX,
+                        };
+                        if modifiers.alt {
+                            rz += (delta.y * s).clamp(-1.5, 1.5);
+                            false
+                        } else if modifiers.command || modifiers.ctrl {
+                            tz += (delta.y * s).clamp(-1.5, 1.5);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    _ => true,
+                });
+                if tz != 0.0 || rz != 0.0 {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                }
+            });
+            if tz != 0.0 {
+                roll.px_per_beat = (roll.px_per_beat * tz.exp()).clamp(30.0, 400.0);
+            }
+            if rz != 0.0 {
+                roll.row_h = (roll.row_h * rz.exp()).clamp(6.0, 22.0);
+            }
+        }
         egui::Window::new("\u{266b} Piano roll")
             .id(egui::Id::new("piano_roll_win"))
             .open(&mut open)
@@ -2331,6 +2534,50 @@ impl App {
                                     roll.changed = true;
                                 }
                             }
+                        }
+                        // FL-style channel picker: which synth auditions
+                        // this pattern (PREVIEW button + piano-key clicks).
+                        ui.label("synth:");
+                        let stems = self.synth_registry.stems();
+                        let cur = self.preview_synth.clone();
+                        let cur_label = match cur.as_deref() {
+                            Some("__track__") => "track synth".to_string(),
+                            Some(s) => s.to_string(),
+                            None => "piano (default)".into(),
+                        };
+                        let mut pick: Option<Option<String>> = None;
+                        egui::ComboBox::from_id_salt("roll_synth_pick")
+                            .width(110.0)
+                            .selected_text(RichText::new(cur_label).small())
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(cur.is_none(), "piano (default)")
+                                    .clicked()
+                                {
+                                    pick = Some(None);
+                                }
+                                if ui
+                                    .selectable_label(
+                                        cur.as_deref() == Some("__track__"),
+                                        "track synth",
+                                    )
+                                    .clicked()
+                                {
+                                    pick = Some(Some("__track__".into()));
+                                }
+                                ui.separator();
+                                for s in &stems {
+                                    if ui
+                                        .selectable_label(cur.as_deref() == Some(s.as_str()), s)
+                                        .clicked()
+                                    {
+                                        pick = Some(Some(s.clone()));
+                                    }
+                                }
+                            });
+                        if let Some(v) = pick {
+                            self.preview_synth = v;
+                            self.save_config();
                         }
                         if ui
                             .small_button("-bar")
@@ -2360,7 +2607,7 @@ impl App {
                                 RichText::new("\u{25b6} preview")
                                     .color(Color32::from_rgb(120, 220, 160)),
                             )
-                            .on_hover_text("Audition through the default synth")
+                            .on_hover_text("Audition through the picked synth (toolbar 'synth:')")
                             .clicked()
                         {
                             preview = true;
@@ -2408,6 +2655,9 @@ impl App {
                     if rect.width() <= 2.0 {
                         return;
                     }
+                    // Remembered for the wheel routers (global filter +
+                    // this window) on the NEXT frame.
+                    roll.canvas_rect = Some(rect);
                     let keys_w = 58.0f32;
                     let grid_x0 = rect.min.x + keys_w;
                     painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
@@ -2557,10 +2807,11 @@ impl App {
                                     }
                                     None => {
                                         let st = snap(sec);
+                                        let vel = roll.new_vel;
                                         roll.pat.notes.push(crate::midipat::Note {
                                             ch: 0,
                                             note: note_row,
-                                            vel: 100,
+                                            vel,
                                             press: 0,
                                             start: tick_of(st),
                                             len: (tick_of(snap_up(sec)) - tick_of(st))
@@ -2571,22 +2822,33 @@ impl App {
                                 }
                                 roll.changed = true;
                             } else if let Some((idx, off)) = roll.drag {
-                                                            if idx < roll.pat.notes.len() {
-                                                                let note = &mut roll.pat.notes[idx];
-                                                                if off == 0.0 {
-                                                                    // Fresh draw: stretch to the pointer.
-                                                                    let tail = tick_of(snap_up(sec)).max(note.start + 1);
-                                                                    note.len = tail - note.start;
-                                                                } else {
-                                                                    // Move: follow the pointer (snapped).
-                                                                    note.start = tick_of(snap(sec - off).max(0.0));
-                                                                    note.note = note_row;
-                                                                }
-                                                                roll.changed = true;
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                if idx < roll.pat.notes.len() {
+                                    let note = &mut roll.pat.notes[idx];
+                                    if off == 0.0 {
+                                        // Fresh draw: stretch to the pointer.
+                                        let tail = tick_of(snap_up(sec)).max(note.start + 1);
+                                        note.len = tail - note.start;
+                                    } else {
+                                        // Move: follow the pointer (snapped).
+                                        note.start = tick_of(snap(sec - off).max(0.0));
+                                        note.note = note_row;
+                                    }
+                                    roll.changed = true;
+                                }
+                            }
+                        } else if pt.x >= rect.min.x
+                            && pt.x < grid_x0
+                            && pt.y > rect.min.y
+                            && pt.y < rect.max.y
+                            && resp.clicked_by(egui::PointerButton::Primary)
+                        {
+                            // FL: clicking a piano key plays that note.
+                            audition = Some(
+                                (((rect.max.y - pt.y) / roll.row_h).floor() as i32 + lo)
+                                    .clamp(0, 127) as u8,
+                            );
+                        }
+                    }
                                                 if resp.drag_stopped() {
                                                     roll.drag = None;
                                                     roll.pat.sort();
@@ -2599,11 +2861,20 @@ impl App {
                     if ui.button("+ pitch").clicked() {
                         roll.lo_note = (roll.lo_note + 12).min(103);
                     }
+                    ui.add(Slider::new(&mut roll.new_vel, 1..=127).text("vel"))
+                        .on_hover_text("Velocity of newly drawn notes");
                     ui.label("zoom:");
-                    ui.add(Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("px/beat"));
-                    ui.add(Slider::new(&mut roll.row_h, 6.0..=22.0).text("row px"));
+                    ui.add(Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("px/beat"))
+                        .on_hover_text("Ctrl+wheel over the grid does this too");
+                    ui.add(Slider::new(&mut roll.row_h, 6.0..=22.0).text("row px"))
+                        .on_hover_text("Alt+wheel over the grid does this too");
                 });
             });
+        // A key in the piano strip was clicked: play it (deferred — the
+        // renderer needs &mut self, which the window closure holds open).
+        if let Some(n) = audition {
+            self.audition_note(n);
+        }
         // ---- toolbar actions deferred (need &mut self) ----
         if bar_delta != 0 {
             let bar = 4 * PPQ as u32;
@@ -2701,20 +2972,45 @@ impl App {
             self.synth_win = None;
             return;
         };
+        // A hosted VST3 instrument gets the plugin's own sliders instead of
+        // the script param list.
+        if let Some(SynthHandle::Vst(entry)) =
+            self.track_synth_inst[t].as_ref().map(|h| h.as_ref())
+        {
+            self.vsti_synth_window(ui, t, entry.clone());
+            return;
+        }
         let Some(desc) = self.synth_registry.desc(&stem).cloned() else {
             self.synth_win = None;
             return;
         };
-        let Some(inst) = self.track_synth_inst[t].clone() else {
+        let Some(handle) = self.track_synth_inst[t].clone() else {
             self.synth_win = None;
             return;
         };
+        let inst = match handle.as_ref() {
+            SynthHandle::Script(i) => i.clone(),
+            SynthHandle::Vst(_) => {
+                self.synth_win = None;
+                return;
+            }
+        };
+        // Snapshot of the AUDIO assets a sampler can play (MIDI assets are
+        // patterns, never samples). Taken outside the window closure — the
+        // closure already borrows the synth instance, not the App.
+        let audio_assets: Vec<(usize, String)> = self
+            .assets
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.pattern.is_none())
+            .map(|(k, a)| (k, a.name.clone()))
+            .collect();
         let mut open = true;
         let mut dirty = false;
         egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
             .id(egui::Id::new(("synthwin", t)))
             .open(&mut open)
-            .default_size([280.0, 340.0])
+            .default_size([320.0, 340.0])
             .show(ui, |ui| {
                 if let Some(d) = &desc.description {
                     ui.label(RichText::new(d).weak().small());
@@ -2724,7 +3020,102 @@ impl App {
                 }
                 ui.separator();
                 let vals = inst.values();
+                // A synth whose FIRST param is named "asset" samples rack
+                // audio (the bundled sampler): give it a named picker and a
+                // drop target instead of a blind 0..63 id slider — the user
+                // could not tell which asset any id was, let alone pick one.
+                let sampler = desc.params.first().is_some_and(|p| p.label == "asset");
+                if sampler {
+                    let cur = vals.first().copied().unwrap_or(0.0).round() as usize;
+                    let cur_name = audio_assets
+                        .iter()
+                        .find(|(k, _)| *k == cur)
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "\u{2014} no sample \u{2014}".to_string());
+                    ui.label(RichText::new(format!("sample: {cur_name}")).strong().small());
+                    let mut picked = None;
+                    egui::ComboBox::from_id_salt(("sampler_asset_pick", t))
+                        .width(240.0)
+                        .selected_text(RichText::new(format!("#{cur}  {cur_name}")).small())
+                        .show_ui(ui, |ui| {
+                            if audio_assets.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "no audio assets yet \u{2014} add a rack folder or record",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            for (k, name) in &audio_assets {
+                                // ComboBox's button response never marks
+                                // `changed` on a pick — watch the popup rows.
+                                if ui
+                                    .selectable_label(cur == *k, format!("#{k} {name}"))
+                                    .clicked()
+                                {
+                                    picked = Some(*k);
+                                }
+                            }
+                        });
+                    if let Some(k) = picked {
+                        inst.set_param(0, k as f32);
+                        dirty = true;
+                    }
+                    ui.label(
+                        RichText::new("or drag an AUDIO asset from the rack onto this box:")
+                            .weak()
+                            .small(),
+                    );
+                    let (drect, dresp) = ui.allocate_at_least(
+                        egui::vec2(ui.available_width(), 34.0),
+                        egui::Sense::hover(),
+                    );
+                    let dragging =
+                        egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx());
+                    let col = if dragging {
+                        Color32::from_rgb(150, 200, 255)
+                    } else {
+                        Color32::from_gray(75)
+                    };
+                    ui.painter().rect_stroke(
+                        drect,
+                        3.0,
+                        egui::Stroke::new(if dragging { 2.0 } else { 1.0 }, col),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        drect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if dragging {
+                            "release to sample this asset"
+                        } else {
+                            "drop zone \u{b7} drag an asset here"
+                        },
+                        egui::FontId::proportional(10.0),
+                        col,
+                    );
+                    if let Some(a) = dresp.dnd_release_payload::<usize>().map(|a| *a) {
+                        if audio_assets.iter().any(|(k, _)| *k == a) {
+                            inst.set_param(0, a as f32);
+                            dirty = true;
+                            self.status = format!(
+                                "track {} sampler: {}",
+                                t + 1,
+                                audio_assets
+                                    .iter()
+                                    .find(|(k, _)| *k == a)
+                                    .map(|(_, n)| n.clone())
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
+                    ui.separator();
+                }
                 for (k, pd) in desc.params.iter().enumerate() {
+                    if sampler && k == 0 {
+                        continue; // the picker replaces the raw id slider
+                    }
                     let mut nv = vals.get(k).copied().unwrap_or(pd.default);
                     if ui
                         .add(Slider::new(&mut nv, pd.min..=pd.max).text(&pd.label))
@@ -2739,6 +3130,34 @@ impl App {
             self.track_synth_params[t] = inst.values();
             self.save_config();
         }
+        if !open {
+            self.synth_win = None;
+        }
+    }
+
+    /// Slider window for a track bound to a hosted VST instrument.
+    fn vsti_synth_window(
+        &mut self,
+        ui: &mut egui::Ui,
+        t: usize,
+        entry: std::sync::Arc<crate::vsthost::RtStageEntry>,
+    ) {
+        let mut open = true;
+        egui::Window::new(format!("\u{266a} {} \u{b7} track {}", entry.name(), t + 1))
+            .id(egui::Id::new(("synthwin", t)))
+            .open(&mut open)
+            .default_size([340.0, 340.0])
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "hosted VST instrument \u{2014} sliders set the plugin's own \
+                         parameters; MIDI clips on this track play it",
+                    )
+                    .weak()
+                    .small(),
+                );
+                vst_param_sliders(ui, &entry);
+            });
         if !open {
             self.synth_win = None;
         }
@@ -2950,12 +3369,28 @@ impl App {
                 gain: self.trk_gain[t],
                 pan: self.trk_pan[t],
                 on: self.backend.engine.track_on(t),
-                fx: self.fx_entries[t]
+                fx: self.fx_rows[t]
                     .iter()
-                    .filter(|e| e.enabled)
-                    .map(|e| TrackFxSave {
-                        stem: e.stem.clone(),
-                        params: e.params.clone(),
+                    .filter_map(|r| match r {
+                        ChainRow::Script { stem, params } => {
+                            Some(TrackFxSave { stem: stem.clone(), params: params.clone() })
+                        }
+                        ChainRow::Vst { .. } => None,
+                    })
+                    .collect(),
+                chain: self.fx_rows[t]
+                    .iter()
+                    .map(|r| match r {
+                        ChainRow::Script { stem, params } => ChainSave::Fx {
+                            stem: stem.clone(),
+                            params: params.clone(),
+                        },
+                        ChainRow::Vst { path, kind, name, params, entry: _ } => ChainSave::Vst {
+                            path: path.clone(),
+                            kind: kind.tag().to_string(),
+                            name: name.clone(),
+                            params: params.clone(),
+                        },
                     })
                     .collect(),
                 lanes: self.arr.tracks[t]
@@ -3173,13 +3608,29 @@ impl App {
                     );
                 }
             }
-            let saved: Vec<(String, Vec<f32>)> = pt
-                .fx
-                .iter()
-                .map(|s| (s.stem.clone(), s.params.clone()))
+            // Chains: prefer the full saved chain (scripts + plugins);
+            // legacy fx-only projects materialize script rows. Plugin rows
+            // open lazily on the first rebuild after the rate is known.
+            let chain_src: Vec<ChainSave> = if !pt.chain.is_empty() {
+                pt.chain.clone()
+            } else {
+                pt.fx
+                    .iter()
+                    .map(|s| ChainSave::Fx { stem: s.stem.clone(), params: s.params.clone() })
+                    .collect()
+            };
+            self.fx_rows[t] = chain_src
+                .into_iter()
+                .filter_map(|s| match s {
+                    ChainSave::Fx { stem, params } => {
+                        Some(ChainRow::Script { stem, params })
+                    }
+                    ChainSave::Vst { path, kind, name, params } => {
+                        let kind = crate::vsthost::VstKind::parse(&kind)?;
+                        Some(ChainRow::Vst { path, kind, name, params, entry: None })
+                    }
+                })
                 .collect();
-            let stems = self.fx_registry.stems();
-            self.fx_entries[t] = fx::merge_entries(&[], &stems, &saved);
             self.rebuild_fx(t);
         }
         self.assets = assets;
@@ -3337,18 +3788,12 @@ impl App {
                 self.send_metro();
                 // Effect instances made before the backend was up were
                 // created with rate 0; rebuild every chain at the real rate.
+                // Chains (scripts + plugin rows) rebuild now at the real
+                // rate; plugin rows still unopened open here (a plugin
+                // whose file vanished simply stays unopened).
                 for t in 0..MAX_LOOPS {
-                    if self.fx_entries[t].iter().any(|e| e.enabled) {
+                    if !self.fx_rows[t].is_empty() {
                         self.rebuild_fx(t);
-                    }
-                }
-                // Saved VST inserts load now that the rate is known (a
-                // plugin whose file vanished simply stays unset).
-                for t in 0..MAX_LOOPS {
-                    if self.vst_slots[t].is_none() {
-                        if let Some(save) = self.vst_saved[t].clone() {
-                            self.open_saved_vst(t, &save);
-                        }
                     }
                 }
                 // Re-apply the port bindings persisted from the previous
@@ -3615,6 +4060,18 @@ impl App {
         // flick reports PIXELS.
         let mut zoom_ln = 0.0f32;
         let mut pan = 0.0f32;
+        // While the pointer sits over an open piano-roll canvas its
+        // ctrl/alt-wheel gestures belong to the ROLL (time / row zoom) —
+        // leave those events for `piano_roll_window`'s own router.
+        let over_roll = self
+            .piano_roll
+            .as_ref()
+            .and_then(|r| r.canvas_rect)
+            .is_some_and(|r| {
+                ui.ctx()
+                    .pointer_hover_pos()
+                    .is_some_and(|p| r.contains(p))
+            });
         ui.ctx().input_mut(|i| {
             i.events.retain(|e| match e {
                 egui::Event::MouseWheel {
@@ -3623,7 +4080,8 @@ impl App {
                     modifiers,
                     ..
                 } => {
-                    if modifiers.command || modifiers.ctrl {
+                    if (modifiers.command || modifiers.ctrl) && !(over_roll && !modifiers.shift)
+                    {
                         let s = match unit {
                             egui::MouseWheelUnit::Line => ZOOM_WHEEL_LINE,
                             _ => ZOOM_WHEEL_PX,
@@ -3709,8 +4167,8 @@ impl App {
         if self.fx_window.is_some() {
             effects_window(ui, self);
         }
-        if self.vst_window.is_some() {
-            vst_window(ui, self);
+        if self.vst_edit.is_some() {
+            vst_params_window(ui, self);
         }
         if self.fx_editor.is_some() {
             self.fx_editor_window(ui);
@@ -3894,7 +4352,7 @@ type RackRow = (String, Vec<(String, PathBuf, bool)>, Option<String>);
 
 /// One rack file row: click = load + audition, drag = place a clip.
 /// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
-fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &Path) {
+fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &Path, midi: bool) {
     let sel = app
         .sel_asset
         .is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
@@ -3906,6 +4364,9 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
         egui::vec2(w, 20.0),
         egui::Button::selectable(sel, RichText::new(name).small()),
     );
+    // Right-edge kind badge (audio vs MIDI). Painted into the row's own
+    // rect, so it costs no layout width and never wraps the name.
+    rack_kind_badge(ui, row.rect, midi);
     // ONE click_and_drag response for the row: a separate drag-sense
     // overlay on top would CAPTURE the press and kill clicked().
     let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, name)), Sense::click_and_drag());
@@ -3924,9 +4385,34 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
         }
     }
     row.on_hover_text(format!(
-        "{} \u{b7} click to audition (preview), drag onto a lane to place a clip",
-        fp.display()
+        "{} \u{b7} {} \u{b7} click to audition (preview), drag onto a lane to place a clip{}",
+        fp.display(),
+        if midi { "MIDI pattern" } else { "audio" },
+        if midi {
+            " \u{b7} plays through the track's synth"
+        } else {
+            ""
+        }
     ));
+}
+
+/// Tiny right-aligned kind badge drawn inside an asset row: amber
+/// "AUDIO" / blue "MIDI" (the same blue the MREC button uses, so MIDI
+/// assets read as MIDI everywhere). Painted into the row rect after the
+/// button — no layout width, no wrapping risk (the justified-label trap).
+fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, midi: bool) {
+    let (txt, col) = if midi {
+        ("MIDI", Color32::from_rgb(150, 200, 255))
+    } else {
+        ("AUDIO", Color32::from_rgb(210, 175, 120))
+    };
+    ui.painter().text(
+        egui::pos2(row.max.x - 5.0, row.center().y),
+        egui::Align2::RIGHT_CENTER,
+        txt.to_string(),
+        egui::FontId::proportional(9.0),
+        col,
+    );
 }
 
 /// The asset rack: folders (primary first = recordings land there), one
@@ -4006,6 +4492,10 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         ui.label(RichText::new(format!("× {}", e)).color(Color32::from_rgb(220, 120, 120)).small());
                     }
                     // Two sections per folder: AUDIO then MIDI clips.
+                    // Section headers show whenever a section has entries
+                    // (previously only when BOTH did, so a folder of pure
+                    // MIDI files carried no label at all), and every row
+                    // additionally carries a kind badge.
                     let audio: Vec<(String, PathBuf)> = files
                         .iter()
                         .filter(|(_, _, m)| !*m)
@@ -4016,18 +4506,27 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         .filter(|(_, _, m)| *m)
                         .map(|(n, p, _)| (n.clone(), p.clone()))
                         .collect();
-                    let mixed = !audio.is_empty() && !midis.is_empty();
-                    if mixed {
-                        ui.label(RichText::new("audio").weak().small());
+                    if !audio.is_empty() {
+                        ui.label(
+                            RichText::new("audio")
+                                .weak()
+                                .small()
+                                .color(Color32::from_rgb(210, 175, 120)),
+                        );
                     }
                     for (name, fp) in audio {
-                        rack_file_row(ui, app, fi, &name, &fp);
+                        rack_file_row(ui, app, fi, &name, &fp, false);
                     }
-                    if mixed {
-                        ui.label(RichText::new("MIDI").weak().small());
+                    if !midis.is_empty() {
+                        ui.label(
+                            RichText::new("MIDI")
+                                .weak()
+                                .small()
+                                .color(Color32::from_rgb(150, 200, 255)),
+                        );
                     }
                     for (name, fp) in midis {
-                        rack_file_row(ui, app, fi, &name, &fp);
+                        rack_file_row(ui, app, fi, &name, &fp, true);
                     }
                 }
                 if let Some(fi) = rescan {
@@ -4053,21 +4552,21 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
 
                 // Project-only assets: recordings with no rack folder,
                 // dirty edits, and files whose folder was removed.
-                let mut extra: Vec<(usize, String, bool)> = Vec::new();
+                let mut extra: Vec<(usize, String, bool, bool)> = Vec::new();
                 for (k, a) in app.assets.iter().enumerate() {
                     let in_rack = app
                         .rack
                         .iter()
                         .any(|f| f.files.iter().any(|r| r.path == a.path && !a.dirty));
                     if !in_rack {
-                        extra.push((k, a.name.clone(), a.dirty));
+                        extra.push((k, a.name.clone(), a.dirty, a.pattern.is_some()));
                     }
                 }
                 if !extra.is_empty() {
                     ui.add_space(3.0);
                     ui.separator();
                     ui.label(RichText::new("project assets").weak().small());
-                    for (k, name, dirty) in extra {
+                    for (k, name, dirty, midi) in extra {
                         let sel = app.sel_asset == Some(k);
                         let w = ui.available_width();
                         let row = ui.add_sized(
@@ -4077,6 +4576,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 RichText::new(format!("{}{}", name, if dirty { " *" } else { "" })).small(),
                             ),
                         );
+                        rack_kind_badge(ui, row.rect, midi);
                         // Merged click+drag response (see rack rows above).
                         let dr = ui.interact(row.rect, ui.id().with(("assetdrag", k)), Sense::click_and_drag());
                         if dr.clicked() {
@@ -4234,11 +4734,21 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
             // Master strip in the header band: from the panel header down
             // to where the track stack begins — the band level with the
             // timeline grid header, directly above the Track 1 strip.
+            // The band gets an OPAQUE backdrop that belongs to it: without
+            // one, scrolled track-strip widgets show through the transparent
+            // header and overlay the master controls (user report).
             let band_bottom = top.max(base.min.y);
             if band_bottom - base.min.y > 24.0 {
                 let band = egui::Rect::from_min_max(
                     egui::pos2(base.min.x, base.min.y),
                     egui::pos2(base.max.x, band_bottom),
+                );
+                let pfill = ui.visuals().panel_fill;
+                ui.painter().rect_filled(band, 0.0, pfill);
+                ui.painter().hline(
+                    band.x_range(),
+                    band.bottom() - 0.5,
+                    egui::Stroke::new(1.0, Color32::from_gray(64)),
                 );
                 ui.scope_builder(
                     egui::UiBuilder::new()
@@ -4250,6 +4760,13 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
                     |ui| master_strip(ui, app),
                 );
             }
+            // Track strips may only paint BELOW the band — their absolute
+            // rects shift with the shared vertical scroll, so without this
+            // they'd draw over the master header when scrolled up.
+            ui.shrink_clip_rect(egui::Rect::from_min_max(
+                egui::pos2(base.min.x, band_bottom.max(base.min.y)),
+                base.max,
+            ));
             for t in 0..app.n_tracks {
                 let th = app.track_h(t);
                 if y + th >= base.min.y && y <= base.max.y {
@@ -4355,38 +4872,54 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
     ui.horizontal(|ui| {
         if ui
             .small_button("FX")
-            .on_hover_text("This track's effects: enable scripts, reorder the chain, open editors")
+            .on_hover_text("This track's mixer chain: effects scripts and VST plugins in one ordered list")
             .clicked()
         {
             app.fx_window = Some(t);
         }
-        if ui
-            .small_button("VST")
-            .on_hover_text(
-                "This track's VST insert: pick a plugin, adjust its sliders, \
-                 manage the scan folders",
-            )
-            .clicked()
-        {
-            app.vst_window = Some(t);
-        }
         fx_buttons(ui, app, t);
     });
     ui.horizontal(|ui| {
-        // Per-track synthesizer for MIDI clips (default: bundled piano).
+        // Per-track synthesizer for MIDI clips (default: bundled piano;
+        // scanned VST instruments can be bound as "vst:<path>").
         let cur = app.track_synth[t].clone().unwrap_or_default();
         let stems = app.synth_registry.stems();
+        let show = if cur.is_empty() {
+            "piano".to_string()
+        } else if let Some((_, p)) = vst_synth_decode(&cur) {
+            let name = app
+                .vst_scan
+                .iter()
+                .find(|e| e.path.to_string_lossy() == p)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.to_string())
+                });
+            format!("{name} (VSTi)")
+        } else {
+            cur.clone()
+        };
         let mut rescan = false;
         egui::ComboBox::from_id_salt(("synthpick", t))
-            .selected_text(RichText::new(format!(
-                "\u{266a} {}",
-                if cur.is_empty() { "piano".to_string() } else { cur.clone() }
-            )))
+            .selected_text(RichText::new(format!("\u{266a} {show}")))
             .show_ui(ui, |ui| {
                 let mut tmp = cur.clone();
                 ui.selectable_value(&mut tmp, String::new(), "default (piano)");
                 for stem in &stems {
                     ui.selectable_value(&mut tmp, stem.clone(), stem.as_str());
+                }
+                if !app.vst_scanned {
+                    app.vst_rescan();
+                }
+                for e in app.vst_scan.clone() {
+                    if !e.instrument || e.error.is_some() {
+                        continue;
+                    }
+                    let val = vst_synth_encode(e.kind, &e.path.to_string_lossy());
+                    ui.selectable_value(&mut tmp, val, format!("\u{266a} {} (VSTi)", e.name));
                 }
                 if ui.small_button("\u{21bb}").on_hover_text("Re-scan the synths folder").clicked()
                 {
@@ -4435,6 +4968,8 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 scroll_sec: 0.0,
                 changed: false,
                 drag: None,
+                canvas_rect: None,
+                new_vel: 100,
             }));
         }
         ui.label(RichText::new("grid:").strong());
@@ -5525,42 +6060,47 @@ fn level_parse(kind: u8, s: &str) -> Option<u8> {
     }
 }
 
-/// Enabled effects drawn on the loop row as plain name buttons, left to
-/// right in chain order. The buttons replace the old inline sliders: a
-/// click opens the effect's child editor window (auto sliders, or the
-/// effect's own custom GUI if it scripts one).
+/// One small chip per mixer-chain slot on the track header; clicking opens
+/// that slot's controls (script editor window or plugin slider window).
 fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
     let mut open_slot: Option<usize> = None;
-    let mut k = 0usize; // chain index (enabled entries only)
-    for e in app.fx_entries[i].iter() {
-        if !e.enabled {
-            continue;
-        }
-        let Some(desc) = app.fx_registry.desc(&e.stem).cloned() else {
-            continue;
+    for (k, row) in app.fx_rows[i].clone().iter().enumerate() {
+        let (label, ok) = match row {
+            ChainRow::Script { stem, .. } => {
+                let d = app.fx_registry.desc(stem);
+                (d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()), d.is_some())
+            }
+            ChainRow::Vst { name, entry, .. } => (name.clone(), entry.is_some()),
         };
         let mut hover = String::new();
-        if let Some(d) = desc.description.as_deref() {
-            hover.push_str(d);
-            hover.push('\n');
+        if let ChainRow::Script { stem, .. } = row {
+            if let Some(d) = app.fx_registry.desc(stem) {
+                if let Some(d) = d.description.as_deref() {
+                    hover.push_str(d);
+                    hover.push('\n');
+                }
+            }
         }
-        hover.push_str("Click to open this effect's controls window.");
-        let color = if app.fx_live[i].get(k).is_some() {
+        hover.push_str("Click to open this slot's controls window.");
+        let color = if ok {
             Color32::from_rgb(150, 200, 255)
         } else {
             Color32::from_gray(140)
         };
         if ui
-            .button(RichText::new(&desc.name).small().color(color))
+            .button(RichText::new(label).small().color(color))
             .on_hover_text(hover)
             .clicked()
         {
             open_slot = Some(k);
         }
-        k += 1;
     }
     if let Some(k) = open_slot {
-        app.open_fx_editor(i, k);
+        match &app.fx_rows[i][k] {
+            ChainRow::Script { .. } => app.open_fx_editor(i, k),
+            ChainRow::Vst { entry: Some(_), .. } => app.vst_edit = Some((i, k)),
+            ChainRow::Vst { .. } => app.fx_window = Some(i),
+        }
     }
 }
 
@@ -5956,26 +6496,232 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
     app.show_export = open && !cancelled && !done;
 }
 
-/// The per-loop effects window: folder picker ("effects location"), one
-/// row per script with a toggle (disabled by default), reorder arrows for
-/// enabled ones (enabled effects snap to the top of the list, in chain
-/// order), plus rescan / add-template helpers. Rejected scripts are listed
-/// with their compile/load error so effect authors can fix them.
-/// VST insert window: per-track plugin pick + sliders, plus the folder
-/// manager that feeds the scan. Mirrors the effects window's layout.
-fn vst_window(ui: &mut egui::Ui, app: &mut App) {
-    let Some(track) = app.vst_window else { return };
+/// The unified per-track mixer chain window. Scripted effects and hosted
+/// VST plugins are one ordered slot list (FL Studio's mixer model): a
+/// plugin can sit anywhere in the chain, in any number. Each row opens its
+/// own controls; "Add" popups pull from the script folder and the plugin
+/// scan; rejected scripts and the plugin folder manager sit below.
+fn effects_window(ui: &mut egui::Ui, app: &mut App) {
+    let Some(loop_i) = app.fx_window else { return };
     if !app.vst_scanned {
         app.vst_rescan();
     }
     let mut open = true;
-    egui::Window::new(RichText::new(format!("VST — track {}", track + 1)).strong())
+    egui::Window::new(RichText::new(format!("MIXER CHAIN — track {}", loop_i + 1)).strong())
         .open(&mut open)
         .min_width(560.0)
-        .default_height(440.0)
+        .default_height(480.0)
         .show(ui, |ui| {
-            // --- folders ---------------------------------------------------
-            ui.label("VST folders:");
+            // --- chain (audio order, top first) ---------------------------
+            ui.label(RichText::new("Chain (top = first):").strong());
+            let mut act: Option<(u8, usize)> = None; // 0 open, 1 up, 2 down, 3 remove
+            let rows = app.fx_rows[loop_i].clone();
+            egui::ScrollArea::vertical()
+                .max_height(210.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (k, row) in rows.iter().enumerate() {
+                        let (tag, label, ok) = match row {
+                            ChainRow::Script { stem, .. } => {
+                                let d = app.fx_registry.desc(stem);
+                                (
+                                    "fx",
+                                    d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
+                                    d.is_some(),
+                                )
+                            }
+                            ChainRow::Vst { kind, name, entry, .. } => {
+                                (kind.tag(), name.clone(), entry.is_some())
+                            }
+                        };
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("[{tag}]"));
+                            let txt = if ok {
+                                RichText::new(&label).strong()
+                            } else {
+                                RichText::new(&label).weak()
+                            };
+                            let resp = ui.add(egui::Button::new(txt).frame(false));
+                            if resp.clicked() {
+                                act = Some((0, k));
+                            }
+                            if matches!(row, ChainRow::Vst { entry: None, .. }) {
+                                ui.label(
+                                    RichText::new("× not loaded (Rescan Plugins below)")
+                                        .color(Color32::from_rgb(220, 120, 120))
+                                        .small(),
+                                );
+                            } else if !ok {
+                                ui.label(
+                                    RichText::new("× script missing (Rescan effects below)")
+                                        .color(Color32::from_rgb(220, 120, 120))
+                                        .small(),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("click to open controls")
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("×").on_hover_text("Remove from chain").clicked()
+                                {
+                                    act = Some((3, k));
+                                }
+                                if arrow_button(ui, false).clicked() {
+                                    act = Some((2, k));
+                                }
+                                if arrow_button(ui, true).clicked() {
+                                    act = Some((1, k));
+                                }
+                            });
+                        });
+                    }
+                    if rows.is_empty() {
+                        ui.label(
+                            RichText::new("(chain empty — add an effect or a plugin below)")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+            match act {
+                Some((0, k)) => match &app.fx_rows[loop_i][k] {
+                    ChainRow::Script { .. } => app.open_fx_editor(loop_i, k),
+                    ChainRow::Vst { entry: Some(_), .. } => {
+                        app.vst_edit = Some((loop_i, k));
+                    }
+                    ChainRow::Vst { .. } => {}
+                },
+                Some((1, k)) => app.move_fx_row(loop_i, k, -1),
+                Some((2, k)) => app.move_fx_row(loop_i, k, 1),
+                Some((3, k)) => app.remove_fx_row(loop_i, k),
+                _ => {}
+            }
+            ui.separator();
+
+            // --- add ------------------------------------------------------
+            ui.horizontal(|ui| {
+                let stems = app.fx_registry.stems();
+                egui::ComboBox::from_id_salt(("addfx", loop_i))
+                    .selected_text("+ effect")
+                    .show_ui(ui, |ui| {
+                        for s in &stems {
+                            let name = app
+                                .fx_registry
+                                .desc(s)
+                                .map(|d| d.name.clone())
+                                .unwrap_or_else(|| s.clone());
+                            if ui.selectable_label(false, format!("{name}  ({s})")).clicked() {
+                                app.add_fx_script(loop_i, s);
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt(("addvst", loop_i))
+                    .selected_text("+ VST plugin")
+                    .width(320.0)
+                    .show_ui(ui, |ui| {
+                        if app.vst_scan.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "no plugins found — add the folder your plugins live \
+                                     in (drag-and-drop installs included) and press \
+                                     Rescan Plugins below",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(240.0)
+                            .show(ui, |ui| {
+                                for e in app.vst_scan.clone() {
+                                    if e.error.is_some() {
+                                        continue;
+                                    }
+                                    let label = format!(
+                                        "[{}] {}{} — {}",
+                                        e.kind.tag(),
+                                        e.name,
+                                        if e.instrument { " ♪" } else { "" },
+                                        e.vendor
+                                    );
+                                    let hover = if e.instrument {
+                                        "Instrument: also selectable as this track's synth \
+                                         (♪ button on the track header)"
+                                    } else {
+                                        "Effect plugin for this track's chain"
+                                    };
+                                    if ui.selectable_label(false, &label).on_hover_text(hover).clicked()
+                                    {
+                                        app.add_fx_plugin(loop_i, &e);
+                                    }
+                                }
+                            });
+                    });
+            });
+            ui.separator();
+
+            // --- effects script folder ------------------------------------
+            ui.label("Effects folder (Rust scripts):");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().set_title("Effects folder").pick_folder()
+                    {
+                        app.fx_dir_edit = p.to_string_lossy().into_owned();
+                        app.apply_fx_dir();
+                    }
+                }
+                if ui.button("Apply").clicked() {
+                    app.apply_fx_dir();
+                }
+                if ui.button("Rescan").clicked() {
+                    app.rescan_fx();
+                }
+                if ui.button("Add template").clicked() {
+                    match app.fx_registry.add_template() {
+                        Ok(stem) => {
+                            app.add_fx_script(loop_i, &stem);
+                            app.fx_note =
+                                format!("created {stem}.rs — added to this track's chain");
+                        }
+                        Err(e) => app.fx_note = e,
+                    }
+                }
+            });
+            if !fx::rustc_available() {
+                ui.label(
+                    RichText::new(
+                        "rustc is not on PATH — effect scripts cannot compile. Install Rust (rustup).",
+                    )
+                    .color(Color32::YELLOW),
+                );
+            }
+            // Scripts that failed to compile or load: dimmed rows with the
+            // rejection reason, so an effect author can fix the script in
+            // place and Rescan.
+            for it in app.fx_registry.items().iter().filter(|it| it.desc.is_none()) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&it.stem).weak().monospace());
+                    let t = it.error.clone().unwrap_or_else(|| "invalid".into());
+                    let short: String = t.chars().take(140).collect();
+                    ui.label(
+                        RichText::new(format!("× {}", short.replace('\n', " · ")))
+                            .color(Color32::from_rgb(220, 120, 120))
+                            .small(),
+                    )
+                    .on_hover_text(t);
+                });
+            }
+            if !app.fx_note.is_empty() {
+                ui.label(RichText::new(&app.fx_note).weak().small());
+            }
+            ui.separator();
+
+            // --- plugin scan folders ---------------------------------------
+            ui.label("Plugin folders:");
             if app.vst_dirs.is_empty() {
                 ui.label(RichText::new("(standard system folders only)").weak().small());
             }
@@ -5998,7 +6744,7 @@ fn vst_window(ui: &mut egui::Ui, app: &mut App) {
                         }
                     }
                 }
-                if ui.button("Rescan").clicked() {
+                if ui.button("Rescan Plugins").clicked() {
                     app.vst_rescan();
                 }
             });
@@ -6006,273 +6752,83 @@ fn vst_window(ui: &mut egui::Ui, app: &mut App) {
                 ui.label(RichText::new(&app.vst_note).weak().small());
             }
             ui.separator();
-
-            // --- insert + sliders, or plugin picker --------------------------
-            match app.vst_slots[track].clone() {
-                Some(slot) => {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(slot.name()).strong());
-                        if ui
-                            .small_button("Remove")
-                            .on_hover_text("Drop the insert from this track")
-                            .clicked()
-                        {
-                            app.set_track_vst(track, None, None);
-                        }
-                    });
-                    let writable: Vec<(usize, String)> = slot
-                        .descs()
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, d)| d.writable)
-                        .map(|(k, d)| (k, d.name.clone()))
-                        .collect();
-                    if writable.is_empty() {
-                        ui.label(RichText::new("(no controllable parameters)").weak().small());
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(300.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for (k, name) in writable {
-                                let mut v = slot.params().get(k);
-                                let r = ui.add(
-                                    egui::Slider::new(&mut v, 0.0..=1.0)
-                                        .text(name)
-                                        .show_value(false)
-                                        .custom_formatter(|x, _| format!("{:.0}%", x * 100.0)),
-                                );
-                                if r.changed() {
-                                    slot.set_param(k, v);
-                                }
-                            }
-                        });
-                }
-                None => {
-                    if app.vst_scan.iter().all(|e| e.error.is_some()) {
-                        ui.label(
-                            RichText::new(
-                                "No plugins found — add the folder your plugins live in \
-                                 (drag-and-drop installs included) and press Rescan.",
-                            )
-                            .weak()
-                            .small(),
-                        );
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(330.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for e in app.vst_scan.clone() {
-                                if let Some(err) = &e.error {
-                                    ui.horizontal(|ui| {
-                                        ui.add_enabled_ui(false, |ui| {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "[{}] {}",
-                                                    e.kind.tag(),
-                                                    e.name
-                                                ))
-                                                .weak(),
-                                            );
-                                        });
-                                        let short: String = err.chars().take(60).collect();
-                                        ui.label(
-                                            RichText::new(format!("× {}", short.replace('\n', " · ")))
-                                                .color(Color32::from_rgb(220, 120, 120))
-                                                .small(),
-                                        )
-                                        .on_hover_text(err.clone());
-                                    });
-                                } else if ui
-                                    .button(format!(
-                                        "[{}] {} — {}",
-                                        e.kind.tag(),
-                                        e.name,
-                                        e.vendor
-                                    ))
-                                    .clicked()
-                                {
-                                    app.pick_vst(track, &e);
-                                }
-                            }
-                        });
-                }
-            }
-            ui.separator();
             ui.label(
                 RichText::new(
-                    "The insert runs after this track's effects chain, before its pan/volume. \
-                     VST2 (`.so`) and VST3 (`.vst3`) instruments and effects are hosted \
-                     in-process; sliders control the plugin's own parameters.",
-                )
-                .weak()
-                .small(),
-            );
-        });
-    app.vst_window = if open { Some(track) } else { None };
-}
-
-fn effects_window(ui: &mut egui::Ui, app: &mut App) {
-    let Some(loop_i) = app.fx_window else { return };
-    let mut open = true;
-    egui::Window::new(RichText::new(format!("EFFECTS — track {}", loop_i + 1)).strong())
-        .open(&mut open)
-        .min_width(520.0)
-        .default_height(420.0)
-        .show(ui, |ui| {
-            ui.label("Effects location:");
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
-                if ui.button("Browse…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Effects folder").pick_folder()
-                    {
-                        app.fx_dir_edit = p.to_string_lossy().into_owned();
-                        app.apply_fx_dir();
-                    }
-                }
-                if ui.button("Apply").clicked() {
-                    app.apply_fx_dir();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Rescan").clicked() {
-                    app.rescan_fx();
-                }
-                if ui.button("Add template").clicked() {
-                    match app.fx_registry.add_template() {
-                        Ok(stem) => {
-                            let stems = app.fx_registry.stems();
-                            for i in 0..MAX_LOOPS {
-                                app.fx_entries[i] =
-                                    fx::merge_entries(&app.fx_entries[i], &stems, &[]);
-                                app.rebuild_fx(i);
-                            }
-                            app.fx_note =
-                                format!("created {stem}.rs — enable it below to hear it");
-                        }
-                        Err(e) => app.fx_note = e,
-                    }
-                }
-            });
-            if !fx::rustc_available() {
-                ui.label(
-                    RichText::new(
-                        "rustc is not on PATH — effect scripts cannot compile. Install Rust (rustup).",
-                    )
-                    .color(Color32::YELLOW),
-                );
-            }
-            if !app.fx_note.is_empty() {
-                ui.label(RichText::new(&app.fx_note).weak().small());
-            }
-            ui.separator();
-
-            // One row per script: valid ones get a toggle (+ arrows when
-            // enabled); invalid ones show the rejection reason instead.
-            let mut act: Option<(u8, usize)> = None; // (0 toggle, 1 up, 2 down)
-            for (k, e) in app.fx_entries[loop_i].clone().iter().enumerate() {
-                let desc = app.fx_registry.desc(&e.stem).cloned();
-                let err = app
-                    .fx_registry
-                    .items()
-                    .iter()
-                    .find(|it| it.stem == e.stem)
-                    .and_then(|it| it.error.clone());
-                ui.horizontal(|ui| {
-                    let mut en = e.enabled;
-                    let cb = ui.checkbox(&mut en, "");
-                    if cb.changed() {
-                        act = Some((0, k));
-                    }
-                    let label = desc.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| e.stem.clone());
-                    let txt = if e.enabled && desc.is_some() {
-                        RichText::new(&label).strong()
-                    } else {
-                        RichText::new(&label)
-                    };
-                    let hover = match (&desc, &err) {
-                        (Some(d), _) => {
-                            let mut h = String::new();
-                            if let Some(a) = &d.author {
-                                h.push_str(&format!("by {a}\n"));
-                            }
-                            if let Some(t) = &d.description {
-                                h.push_str(t);
-                            }
-                            if d.params.is_empty() {
-                                h.push_str("\n(no parameters)");
-                            } else {
-                                h.push_str(&format!("\nparams: {}", d.params.len()));
-                            }
-                            h
-                        }
-                        (None, Some(t)) => t.clone(),
-                        (None, None) => label.clone(),
-                    };
-                    ui.add_enabled_ui(desc.is_some(), |ui| {
-                        ui.label(txt).on_hover_text(hover);
-                        if e.enabled {
-                            if arrow_button(ui, true).clicked() {
-                                act = Some((1, k));
-                            }
-                            if arrow_button(ui, false).clicked() {
-                                act = Some((2, k));
-                            }
-                        }
-                    });
-                    if let Some(t) = &err {
-                        let short: String = t.chars().take(72).collect();
-                        ui.label(RichText::new(format!("× {short}")).color(Color32::from_rgb(220, 120, 120)).small());
-                    }
-                });
-            }
-            // Scripts that failed to compile or load: dimmed rows with the
-            // rejection reason, so an effect author can fix the script in
-            // place and Rescan.
-            for it in app.fx_registry.items().iter().filter(|it| it.desc.is_none()) {
-                ui.horizontal(|ui| {
-                    let mut dim = false;
-                    ui.add_enabled_ui(false, |ui| {
-                        ui.checkbox(&mut dim, "");
-                        ui.label(RichText::new(&it.stem).weak().monospace());
-                    });
-                    let t = it.error.clone().unwrap_or_else(|| "invalid".into());
-                    let short: String = t.chars().take(140).collect();
-                    ui.label(
-                        RichText::new(format!("× {}", short.replace('\n', " · ")))
-                            .color(Color32::from_rgb(220, 120, 120))
-                            .small(),
-                    )
-                    .on_hover_text(t);
-                });
-            }
-            if let Some((m, k)) = act {
-                let changed = if m == 0 {
-                    app.fx_entries[loop_i][k].enabled ^= true;
-                    let stems = app.fx_registry.stems();
-                    fx::resort_entries(&mut app.fx_entries[loop_i], &stems);
-                    true
-                } else {
-                    fx::move_enabled(&mut app.fx_entries[loop_i], k, m == 1)
-                };
-                if changed {
-                    app.rebuild_fx(loop_i);
-                    app.save_config();
-                }
-            }
-            ui.separator();
-            ui.label(
-                RichText::new(
-                    "Enabled effects run in list order (top first) on this loop's playback, \
-                     after gain and volume. Drop a Rust script into the folder above, \
-                     press Rescan, and toggle it — see template.rs for the contract.",
+                    "Chain slots run top-down on this track's signal, after gain and volume, \
+                     before pan. Effects scripts and VST2 (`.so`) / VST3 (`.vst3`) plugins mix \
+                     freely in any order; click a slot to open its controls.",
                 )
                 .weak()
                 .small(),
             );
         });
     app.fx_window = if open { Some(loop_i) } else { None };
+}
+
+/// Plugin parameter sliders shared by the chain slot window and the VSTi
+/// synth window. Returns true when the user moved anything.
+fn vst_param_sliders(ui: &mut egui::Ui, e: &crate::vsthost::RtStageEntry) -> bool {
+    let writable: Vec<(usize, String)> = e
+        .descs()
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.writable)
+        .map(|(k, d)| (k, d.name.clone()))
+        .collect();
+    if writable.is_empty() {
+        ui.label(RichText::new("(no controllable parameters)").weak().small());
+        return false;
+    }
+    let mut changed = false;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (k, name) in writable {
+                let mut v = e.params().get(k);
+                let r = ui.add(
+                    egui::Slider::new(&mut v, 0.0..=1.0)
+                        .text(name)
+                        .show_value(false)
+                        .custom_formatter(|x, _| format!("{:.0}%", x * 100.0)),
+                );
+                if r.changed() {
+                    e.set_param(k, v);
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+/// Slider window for one plugin chain slot.
+fn vst_params_window(ui: &mut egui::Ui, app: &mut App) {
+    let Some((t, row)) = app.vst_edit else { return };
+    let Some(entry) = app
+        .fx_rows
+        .get(t)
+        .and_then(|r| r.get(row))
+        .and_then(|r| match r {
+            ChainRow::Vst { entry, .. } => entry.clone(),
+            _ => None,
+        })
+    else {
+        app.vst_edit = None;
+        return;
+    };
+    let mut open = true;
+    let mut changed = false;
+    egui::Window::new(RichText::new(format!("{} — track {}", entry.name(), t + 1)).strong())
+        .id(egui::Id::new(("vstedit", t, row)))
+        .open(&mut open)
+        .default_size([360.0, 320.0])
+        .show(ui, |ui| {
+            changed = vst_param_sliders(ui, &entry);
+        });
+    if changed {
+        app.vst_row_params_sync(t, row);
+        app.fx_save_pending = true;
+    }
+    app.vst_edit = if open { Some((t, row)) } else { None };
 }
 
 /// Small ↑/↓ reorder button with a DRAWN arrow. egui's default font stack
@@ -7956,6 +8512,179 @@ mod tests {
         assert!(!free);
     }
 
+    /// Full piano-roll I/O path: the toolbar button opens the window, a
+    /// drag on the canvas draws a note, and PREVIEW renders audio through
+    /// the chosen synth (regression pin for the "does nothing" report).
+    #[test]
+    fn piano_roll_opens_draws_and_previews() {
+        let sdir = std::env::temp_dir().join("sp-rollsynths");
+        let _ = std::fs::remove_dir_all(&sdir);
+        std::env::set_var("SLOOPER_SYNTHS_DIR", &sdir);
+        std::env::remove_var("SLOOPER_SYNTH"); // not relevant, hygiene
+        let mut app = headless_app("rollio");
+        let ctx = egui::Context::default();
+
+        // Scan painted galleys for a text; return its screen rect.
+        fn find_galley(app: &mut App, ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text().contains(needle) {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.map(|p| egui::Rect::from_min_size(p, egui::vec2(4.0, 12.0)))
+        }
+
+        frame(&mut app, &ctx, vec![]);
+        // 1) Open via the real toolbar button.
+        let btn = find_galley(&mut app, &ctx, "Piano roll").expect("toolbar button painted");
+        let p = btn.center();
+        frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(p, false)]);
+        assert!(app.piano_roll.is_some(), "button opens the roll");
+        // Let the window's open animation finish (each frame ticks ~25 ms)
+        // so shapes reach full alpha before being matched.
+        for _ in 0..24 {
+            frame(&mut app, &ctx, vec![]);
+        }
+
+        // 2) Locate the canvas: it paints itself with the dark 22,22,26 fill.
+        let canvas = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let rect = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                    let (rr, gg, bb, aa) = r.fill.to_tuple();
+                    if aa == 255
+                        && (rr as i16 - 22).abs() <= 2
+                        && (gg as i16 - 22).abs() <= 2
+                        && (bb as i16 - 26).abs() <= 2
+                        && r.rect.width() > 200.0
+                        && r.rect.height() > 100.0
+                    {
+                        return Some(r.rect);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            rect.expect("roll canvas painted")
+        };
+
+        // 3) Drag on the grid (right of the 58px keys strip) draws a note.
+        let x0 = canvas.min.x + 58.0 + 60.0;
+        let y = canvas.center().y;
+        let start = egui::pos2(x0, y);
+        frame(&mut app, &ctx, vec![moved(start), btn_btn(start, true)]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(x0 + 30.0, y))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(x0 + 70.0, y))]);
+        frame(&mut app, &ctx, vec![btn_btn(egui::pos2(x0 + 70.0, y), false)]);
+        let n_notes = app.piano_roll.as_ref().unwrap().pat.notes.len();
+        assert_eq!(n_notes, 1, "drag draws exactly one note");
+        // Fresh draw stretches the note to the pointer (FL-style).
+        assert!(
+            app.piano_roll.as_ref().unwrap().pat.notes[0].len > 0,
+            "drawn note has length"
+        );
+
+        // 4) Preview renders audio: PreviewPlay fires and the status is not
+        // the "no synth available" failure.
+        app.drain_events();
+        let pv = find_galley(&mut app, &ctx, "preview")
+            .expect("preview button")
+            .center();
+        frame(&mut app, &ctx, vec![moved(pv), btn_btn(pv, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(pv, false)]);
+        assert!(
+            !app.status.contains("no synth"),
+            "preview synth available: {}",
+            app.status
+        );
+        assert_eq!(app.preview_playing.as_deref(), Some("piano roll"));
+
+        // 5) The toolbar synth picker: open the combo, pick "track synth",
+        // the choice lands in App state (and is persisted from there).
+        let combo = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == "synth:" {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.expect("synth picker painted")
+        };
+        let cb = egui::pos2(combo.x + 60.0, combo.y + 6.0);
+        frame(&mut app, &ctx, vec![moved(cb), btn_btn(cb, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(cb, false)]);
+        frame(&mut app, &ctx, vec![]); // popup opens
+        let ts = find_galley(&mut app, &ctx, "track synth")
+            .expect("track synth popup row")
+            .center();
+        frame(&mut app, &ctx, vec![moved(ts), btn_btn(ts, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(ts, false)]);
+        assert_eq!(app.preview_synth.as_deref(), Some("__track__"));
+        // Track 1 has no synth binding → the fallback keeps preview alive.
+        let pv2 = find_galley(&mut app, &ctx, "preview")
+            .expect("preview button")
+            .center();
+        frame(&mut app, &ctx, vec![moved(pv2), btn_btn(pv2, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(pv2, false)]);
+        assert!(!app.status.contains("no synth"), "{}", app.status);
+
+        // 6) Clicking a piano key auditions that single note.
+        let kc = egui::pos2(canvas.min.x + 25.0, canvas.center().y);
+        frame(&mut app, &ctx, vec![moved(kc), btn_btn(kc, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(kc, false)]);
+        assert!(
+            app.preview_playing
+                .as_deref()
+                .is_some_and(|p| p.starts_with("key ")),
+            "key click auditions: {:?}",
+            app.preview_playing
+        );
+
+        std::env::remove_var("SLOOPER_SYNTHS_DIR");
+        let _ = std::fs::remove_dir_all(&sdir);
+    }
+
+    fn btn_btn(p: egui::Pos2, down: bool) -> egui::Event {
+        btn(p, egui::PointerButton::Primary, down)
+    }
+
     #[test]
     fn piano_roll_save_writes_asset_and_clip() {
         let mut app = headless_app("rollsave");
@@ -7990,17 +8719,17 @@ mod tests {
         assert!(app.assets.last().unwrap().name.contains("roll-2"));
     }
 
-    /// VST insert regression pin: the mixer "VST" chip opens the per-track
-    /// window, the folder-scanned plugin list renders, and clicking a row
-    /// loads the plugin into App state (the same path hands it to the
-    /// engine) and persists it. Uses a private scan folder; skips without
-    /// a local plugin.
+    /// Mixer chain regression pin: the "FX" chip opens the unified per-track
+    /// chain window, the "+ VST plugin" picker lists the folder-scanned
+    /// plugin, and clicking its row appends a loaded plugin slot to the
+    /// chain and persists it in `track_chain`. Uses a private scan folder;
+    /// skips without a local plugin.
     #[test]
-    fn vst_chip_opens_window_and_loads_picked_plugin() {
+    fn chain_window_adds_scanned_plugin_slot() {
         let home = std::env::var("HOME").unwrap_or_default();
         let plugin = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
         if !plugin.is_file() {
-            eprintln!("skipping vst pin: no VST2 test plugin installed");
+            eprintln!("skipping chain plugin pin: no VST2 test plugin installed");
             return;
         }
         let dir = std::env::temp_dir().join(format!("sp-vstpin-{}", std::process::id()));
@@ -8016,14 +8745,15 @@ mod tests {
         let ctx = egui::Context::default();
 
         frame(&mut app, &ctx, vec![]);
-        let p = label_center(&mut app, &ctx, "VST").expect("VST chip painted on the mixer");
+        let p = label_center(&mut app, &ctx, "FX").expect("FX chip painted on the mixer");
         frame(&mut app, &ctx, vec![moved(p)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
-        assert_eq!(app.vst_window, Some(0), "chip opens the track's VST window");
+        assert_eq!(app.fx_window, Some(0), "chip opens the track's chain window");
 
-        // The first window frame ran the sync scan; locate the plugin row.
-        let q = {
+        // One text scan per frame (the plugin row label carries vendor
+        // text, so match by substring, like the old VST window pin did).
+        let find_contains = |app: &mut App, ctx: &egui::Context, want: &str| -> Option<egui::Pos2> {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -8032,11 +8762,11 @@ mod tests {
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
-            let mut q = None;
+            let mut c = None;
             for cs in &out.shapes {
                 if let egui::epaint::Shape::Text(t) = &cs.shape {
-                    if t.galley.text().contains("Dragonfly") {
-                        q = Some(t.pos + t.galley.rect.center().to_vec2());
+                    if t.galley.text().contains(want) {
+                        c = Some(t.pos + t.galley.rect.center().to_vec2());
                         break;
                     }
                 }
@@ -8044,25 +8774,35 @@ mod tests {
             let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
             drop(prims);
             out.textures_delta.clear();
-            q
+            c
         };
-        let q = q.expect("scanned plugin row listed in the window");
+
+        // The first window frame ran the sync scan; open the plugin picker.
+        frame(&mut app, &ctx, vec![]);
+        let q = label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
         frame(&mut app, &ctx, vec![moved(q)]);
         frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]); // the popup paints on the next frame
+        let d = find_contains(&mut app, &ctx, "Dragonfly").expect("scanned plugin row listed");
+        frame(&mut app, &ctx, vec![moved(d)]);
+        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, false)]);
         std::env::set_var("HOME", &home);
-        assert!(app.vst_slots[0].is_some(), "picked plugin loaded and wired to the track");
-        assert!(app.vst_note.contains("loaded"), "{}", app.vst_note);
+        assert!(
+            matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. })),
+            "picked plugin loaded into a chain slot"
+        );
+        assert!(app.vst_note.contains("added"), "{}", app.vst_note);
         // Persisted state must survive a config round-trip.
         app.save_config();
         let cfg = crate::config::Config::load();
-        let saved = cfg.track_vst.first().and_then(|o| o.as_ref());
+        let saved = cfg.track_chain.first().and_then(|v| v.first());
         assert!(
-            saved.is_some_and(|s| s.path.contains("dfhall.so") && s.kind == "VST2"
-                && !s.name.is_empty()),
-            "saved insert round-trips: "
+            matches!(saved, Some(crate::config::ChainSave::Vst { path, kind, .. })
+                if path.contains("dfhall.so") && kind == "VST2"),
+            "saved chain round-trips"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

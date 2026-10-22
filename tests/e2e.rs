@@ -26,7 +26,7 @@ use jack::{
 };
 
 use slooper::arrange::{Arrangement, Clip};
-use slooper::audio::{Backend, Cmd, Evt};
+use slooper::audio::{Backend, Cmd, Evt, FxSlot, TrackFx};
 use slooper::midi::MidiMsg;
 
 /// Serialize the e2e tests. Each drives the live audio server in real time
@@ -1343,9 +1343,11 @@ fn e2e_vst_insert_export() {
 
     // Attach the reverb (same open path the UI uses) and export again.
     let load = open(&plugin, kind, sr, None).expect("open reverb plugin");
-    b.cmd(Cmd::SetTrackVst {
+    b.cmd(Cmd::SetTrackEffects {
         i: 0,
-        entry: Some(load.entry.clone()),
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::vst(load.entry.clone())]),
+        },
     });
     // Same command queue: the export below necessarily runs after the swap.
 
@@ -1358,7 +1360,7 @@ fn e2e_vst_insert_export() {
     );
 
     // Removing the insert restores the dry export.
-    b.cmd(Cmd::SetTrackVst { i: 0, entry: None });
+    b.cmd(Cmd::SetTrackEffects { i: 0, chain: TrackFx::default() });
     drop(load);
     let back = export("back");
     assert!(energy(&back[8_000..]) < 1e-9, "tail gone after removing insert");

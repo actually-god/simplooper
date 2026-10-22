@@ -73,10 +73,34 @@ pub struct VstEntry {
     pub kind: VstKind,
     pub name: String,
     pub vendor: String,
+    /// Plugin takes no audio inputs (VST2 `inputs == 0`, VST3 empty input
+    /// buses): it generates sound from MIDI, so the UI offers it in the
+    /// per-track synthesizer slot as well as the effects chain.
+    pub instrument: bool,
     /// Set when the file looked like a plugin but failed to probe; the
     /// picker shows it greyed out instead of silently hiding broken files.
     pub error: Option<String>,
 }
+
+/// 0-based MIDI channel index -> vst3-host channel enum (no `from_index` there).
+const MIDI_CHANNELS: [vst3_host::midi::MidiChannel; 16] = [
+    vst3_host::midi::MidiChannel::Ch1,
+    vst3_host::midi::MidiChannel::Ch2,
+    vst3_host::midi::MidiChannel::Ch3,
+    vst3_host::midi::MidiChannel::Ch4,
+    vst3_host::midi::MidiChannel::Ch5,
+    vst3_host::midi::MidiChannel::Ch6,
+    vst3_host::midi::MidiChannel::Ch7,
+    vst3_host::midi::MidiChannel::Ch8,
+    vst3_host::midi::MidiChannel::Ch9,
+    vst3_host::midi::MidiChannel::Ch10,
+    vst3_host::midi::MidiChannel::Ch11,
+    vst3_host::midi::MidiChannel::Ch12,
+    vst3_host::midi::MidiChannel::Ch13,
+    vst3_host::midi::MidiChannel::Ch14,
+    vst3_host::midi::MidiChannel::Ch15,
+    vst3_host::midi::MidiChannel::Ch16,
+];
 
 /// Default VST search folders (the usual Linux conventions), existing ones
 /// only. Users may add their own folders in the VST window.
@@ -149,18 +173,29 @@ fn base_label(path: &Path) -> String {
 
 fn probe_vst3(path: &Path) -> VstEntry {
     match vst3_host::discovery::get_plugin_info(path) {
-        Ok(info) => VstEntry {
-            path: path.to_path_buf(),
-            kind: VstKind::V3,
-            name: info.name,
-            vendor: info.vendor,
-            error: None,
-        },
+        Ok(info) => {
+            // Instrument or effect? Instantiate once (UI thread, scan only)
+            // and look at the audio buses: a synth has no audio inputs.
+            let instrument = vst3_host::simple::load_plugin(path)
+                .ok()
+                .and_then(|p| p.bus_arrangements().ok())
+                .map(|b| b.inputs.is_empty())
+                .unwrap_or(false);
+            VstEntry {
+                path: path.to_path_buf(),
+                kind: VstKind::V3,
+                name: info.name,
+                vendor: info.vendor,
+                instrument,
+                error: None,
+            }
+        }
         Err(err) => VstEntry {
             path: path.to_path_buf(),
             kind: VstKind::V3,
             name: base_label(path),
             vendor: String::new(),
+            instrument: false,
             error: Some(err.to_string()),
         },
     }
@@ -178,6 +213,7 @@ fn probe_vst2(path: &Path) -> VstEntry {
                 kind: VstKind::V2,
                 name: info.name,
                 vendor: info.vendor,
+                instrument: info.inputs == 0,
                 error: None,
             }
         }
@@ -186,6 +222,7 @@ fn probe_vst2(path: &Path) -> VstEntry {
             kind: VstKind::V2,
             name: base_label(path),
             vendor: String::new(),
+            instrument: false,
             error: Some(err.to_string()),
         },
     }
@@ -302,6 +339,14 @@ struct RtState {
     /// Dry echo filling the startup window until the plugin (plus any
     /// latency it adds) produces its first samples.
     echo: VecDeque<f32>,
+    /// Channel voice messages fed for instrument use, delivered at the next
+    /// internal 512-block boundary (audio-thread contract, like `process`).
+    pending_midi: Vec<[u8; 3]>,
+    /// VST2-only: stable heap slots for raw events — `api::Events` carries
+    /// pointers, so the events must not move. Filled on first use, reused.
+    // The Box is load-bearing (address stability), hence no Vec::into_boxed-slice style fix.
+    #[allow(clippy::vec_box)]
+    ev_pool: Vec<Box<vst2::api::Event>>,
     errors: u32,
 }
 
@@ -392,6 +437,8 @@ fn assemble(name: String, parts: RtParts, params: Arc<VstParams>, descs: Vec<Vst
         in_ring: VecDeque::with_capacity(RING_CAP),
         out_ring: VecDeque::with_capacity(RING_CAP),
         echo: VecDeque::with_capacity(RING_CAP),
+        pending_midi: Vec::new(),
+        ev_pool: Vec::new(),
         errors: 0,
     };
     RtStageEntry {
@@ -541,6 +588,41 @@ impl RtStageEntry {
         }
     }
 
+    /// Feed one channel voice message (raw status byte with channel low
+    /// nibble). Audio thread only — same contract as [`Self::process`];
+    /// the message is delivered at the start of the next internal block.
+    pub fn feed_midi(&self, msg: [u8; 3]) {
+        // SAFETY: audio-thread-only access to `state` (see `flush`).
+        let s = unsafe { &mut *self.state.get() };
+        if s.pending_midi.len() < 512 {
+            s.pending_midi.push(msg);
+        }
+    }
+
+    /// Note on (channel 0-15). Audio thread only.
+    pub fn note_on(&self, ch: u8, note: u8, vel: u8) {
+        self.feed_midi([0x90 | ch & 0x0F, note & 0x7F, vel.clamp(1, 127)]);
+    }
+
+    /// Note off (channel 0-15). Audio thread only.
+    pub fn note_off(&self, ch: u8, note: u8) {
+        self.feed_midi([0x80 | ch & 0x0F, note & 0x7F, 0]);
+    }
+
+    /// Control change (channel 0-15). Audio thread only.
+    pub fn cc(&self, ch: u8, ctl: u8, val: u8) {
+        self.feed_midi([0xB0 | ch & 0x0F, ctl & 0x7F, val & 0x7F]);
+    }
+
+    /// Panic switch: all-notes-off + all-sounds-off on every channel.
+    /// Audio thread only.
+    pub fn all_notes_off(&self) {
+        for c in 0..16u8 {
+            self.cc(c, 123, 0);
+            self.cc(c, 120, 0);
+        }
+    }
+
     /// Drop all buffered audio. Audio thread only (called from the engine's
     /// seek handling).
     pub fn flush(&self) {
@@ -550,6 +632,7 @@ impl RtStageEntry {
         s.in_ring.clear();
         s.out_ring.clear();
         s.echo.clear();
+        s.pending_midi.clear();
     }
 
     /// Process one engine block: mono in, mono out, internally chunked to
@@ -597,10 +680,97 @@ impl RtStageEntry {
         }
     }
 
+    /// Hand pending channel-voice messages to the plugin. VST2 gets raw
+    /// `api::Events` (batches of 2 — the C struct's fixed pointer array);
+    /// VST3 goes through the runner's command ring (pushes never block).
+    fn deliver_midi(&self, s: &mut RtState) {
+        if s.pending_midi.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut s.pending_midi);
+        if matches!(s.backend, Backend::V3(_)) {
+            // The UI holds this lock only for µs-long ring pushes; a brief
+            // wait here is bounded well below any block period.
+            if let Ok(mut g) = self.control.lock() {
+                if let Some(c) = g.as_mut() {
+                    use vst3_host::midi::MidiEvent;
+                    for m in pending {
+                        let ch = MIDI_CHANNELS[(m[0] & 0x0F) as usize];
+                        let (d1, d2) = (m[1], m[2]);
+                        let _ = match m[0] & 0xF0 {
+                            0x90 if d2 > 0 => c.send_midi(MidiEvent::NoteOn {
+                                channel: ch,
+                                note: d1,
+                                velocity: d2,
+                            }),
+                            0x80 | 0x90 => c.send_midi(MidiEvent::NoteOff {
+                                channel: ch,
+                                note: d1,
+                                velocity: d2,
+                            }),
+                            0xB0 => c.send_midi(MidiEvent::ControlChange {
+                                channel: ch,
+                                controller: d1,
+                                value: d2,
+                            }),
+                            0xC0 => {
+                                c.send_midi(MidiEvent::ProgramChange { channel: ch, program: d1 })
+                            }
+                            _ => false,
+                        };
+                    }
+                }
+            }
+            return;
+        }
+        // VST2: the pool grows once, then every event is a reuse.
+        while s.ev_pool.len() < 2 {
+            // Zeroed raw event: a benign null record until overwritten.
+            s.ev_pool.push(Box::new(unsafe { std::mem::zeroed() }));
+        }
+        let mut i = 0usize;
+        while i < pending.len() {
+            let take = 2usize.min(pending.len() - i);
+            if let Backend::V2(inst) = &mut s.backend {
+                use vst2::{api, plugin::Plugin};
+                for (k, m) in pending[i..i + take].iter().enumerate() {
+                    let me = api::MidiEvent {
+                        event_type: api::EventType::Midi,
+                        byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
+                        delta_frames: 0,
+                        flags: 0,
+                        note_length: 0,
+                        note_offset: 0,
+                        midi_data: [m[0], m[1], m[2]],
+                        _midi_reserved: 0,
+                        detune: 0,
+                        note_off_velocity: 0,
+                        _reserved1: 0,
+                        _reserved2: 0,
+                    };
+                    // Identical layout — the crate's own transmute idiom.
+                    let mut raw: api::Event = unsafe { std::mem::transmute(me) };
+                    raw.event_type = api::EventType::Midi;
+                    *s.ev_pool[k] = raw;
+                }
+                let events = api::Events {
+                    num_events: take as i32,
+                    _reserved: 0,
+                    // Boxed slots keep the pointers stable; slot 1 is a
+                    // dummy whenever `take == 1`.
+                    events: [s.ev_pool[0].as_mut(), s.ev_pool[1].as_mut()],
+                };
+                inst.0.process_events(&events);
+            }
+            i += take;
+        }
+    }
+
     /// One VST_BLOCK-sized plugin call; the mono result lands in
     /// `stage_ol` (downmixed from the plugin's output bus). On error the
     /// block passes silence (and `errors` accumulates for diagnostics).
     fn process_block(&self, s: &mut RtState) {
+        self.deliver_midi(s);
         match &mut s.backend {
             Backend::V3(runner) => {
                 let mut ok = false;

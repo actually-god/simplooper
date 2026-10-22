@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 1
+// slooper-synth-version: 2
 // sampler.rs — pitch-following audio-clip synthesizer.
 //
 // Plays ANY audio asset from the rack as an instrument: pick the asset id,
@@ -174,7 +174,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
 }
 
 static PARAMS: [SynthParamV1; 3] = [
-    SynthParamV1 { label: c"asset".as_ptr(), min: 0.0, max: 63.0, default: 0.0 },
+    SynthParamV1 { label: c"asset".as_ptr(), min: 0.0, max: 4095.0, default: 0.0 },
     SynthParamV1 { label: c"root note".as_ptr(), min: 12.0, max: 108.0, default: 48.0 },
     SynthParamV1 { label: c"gain".as_ptr(), min: 0.0, max: 1.0, default: 0.8 },
 ];
