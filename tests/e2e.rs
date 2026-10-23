@@ -1512,3 +1512,421 @@ fn e2e_vst_insert_export() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------- midi sustain --
+
+/// Build a one-note pattern (start 0, `len_secs` long) at 120 BPM.
+fn one_note_pattern(sr: u32, note: u8, len_secs: f64) -> slooper::midipat::Pattern {
+    let mut pat = slooper::midipat::Pattern::new(120);
+    let ticks = (len_secs * 2.0 * slooper::midipat::PPQ as f64) as u32;
+    pat.notes.push(slooper::midipat::Note {
+        ch: 0,
+        note,
+        vel: 110,
+        press: 0,
+        start: 0,
+        len: ticks,
+    });
+    pat.len_ticks = ticks;
+    pat.sort();
+    let _ = sr;
+    pat
+}
+
+/// RMS of a capture window.
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+/// A single LONG note must keep sounding across the blocks where the
+/// schedule carries NO events — the v0.7.1 regression that made every MIDI
+/// track a short blip: `render_midi_block` skipped advancing the synth
+/// whenever a block had no staged events, so only the attack block of each
+/// note ever rendered. The body of the note lives INSIDE the instrument.
+#[test]
+fn e2e_midi_note_sustains_across_blocks() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("midi_sus", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // Default piano; one whole-note pattern (2 s), NOT a run of quarter
+    // notes — attacks alone must not be able to pass this test.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(slooper::audio::SynthHandle::Script(inst)))));
+    let pat = one_note_pattern(sr, 57, 2.0);
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: (sr as u64) * 3,
+    });
+    b.cmd(Cmd::SetLoop(false));
+
+    std::thread::sleep(Duration::from_millis(150));
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(5),
+        "note attack audible",
+    );
+    let head = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
+        .expect("head window");
+    let head_rms = rms(&head);
+    assert!(head_rms > 1e-3, "attack body must carry audio: {head_rms}");
+
+    // ~1.1 s into the 2 s note: no event has been staged for ~100 blocks.
+    // The note must still be sounding. (Before the v0.7.1 fix this window
+    // was exact silence: the synth sat frozen between events.)
+    std::thread::sleep(Duration::from_millis(950));
+    let mid = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
+        .expect("mid-note window");
+    let mid_rms = rms(&mid);
+    assert!(mid_rms > 2e-3, "sustained note must keep sounding mid-body: {mid_rms}");
+    assert!(
+        mid_rms > 0.2 * head_rms,
+        "note body collapsed to a blip: mid {mid_rms} vs head {head_rms}"
+    );
+
+    // 0.5 s after the note ended (damper on): back to quiet.
+    std::thread::sleep(Duration::from_millis(1400));
+    let tail = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
+        .expect("release window");
+    let tail_rms = rms(&tail);
+    assert!(
+        tail_rms < 0.25 * mid_rms.max(1e-9),
+        "released note must decay: tail {tail_rms} vs mid {mid_rms}"
+    );
+
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(500));
+    wait_until(
+        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(5),
+        "silence after StopAll (sustain state must reset on stop)",
+    );
+    let _ = active;
+}
+
+/// The VSTi path of the same contract: a plugin instrument must keep being
+/// PROCESSED through event-free blocks (its output lives in the host staging
+/// ring; pausing starves it), StopAll must flush the ring AND kill plugin
+/// voices so nothing leaks into the next run. Skips without the plugin.
+#[test]
+fn e2e_midi_vsti_sustains_live() {
+    let _g = e2e_lock();
+    let path = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h).join(".vst3/vitalium.vst3"),
+        Err(_) => return,
+    };
+    if !path.exists() {
+        eprintln!("skipping: {} not installed", path.display());
+        return;
+    }
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("vsti_sus", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    let load = slooper::vsthost::open(&path, slooper::vsthost::VstKind::V3, sr, None)
+        .expect("vitalium must load");
+    b.cmd(Cmd::SetTrackSynth {
+        i: 0,
+        synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(load.entry.clone()))),
+    });
+    let pat = one_note_pattern(sr, 60, 2.0);
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: (sr as u64) * 3,
+    });
+    b.cmd(Cmd::SetLoop(false));
+
+    std::thread::sleep(Duration::from_millis(150));
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(6),
+        "VSTi note audible",
+    );
+    let head = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
+        .expect("head window");
+    let head_rms = rms(&head);
+    assert!(head_rms > 1e-3, "VSTi attack must carry audio: {head_rms}");
+
+    std::thread::sleep(Duration::from_millis(950));
+    let mid = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
+        .expect("mid-note window");
+    let mid_rms = rms(&mid);
+    assert!(mid_rms > 2e-3, "VSTi must keep producing through event-free blocks: {mid_rms}");
+    assert!(
+        mid_rms > 0.2 * head_rms,
+        "VSTi note collapsed to a blip: mid {mid_rms} vs head {head_rms}"
+    );
+
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(600));
+    wait_until(
+        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(5),
+        "StopAll must silence the plugin (flush ring + all-notes-off)",
+    );
+    let _ = active;
+}
+
+/// The audition/preview chain end to end: `bounce_track_preview` must
+/// render a SUSTAINED tone (not an attack blip) through the track's synth,
+/// and the rendered buffer must actually reach the master output via
+/// `Cmd::PreviewPlay` while the transport is stopped, then auto-stop.
+#[test]
+fn e2e_preview_renders_and_plays() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("preview_e2e", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // Track 0 gets the bundled piano; audition one staged note (on @0,
+    // off @1.5 s) through the exact UI preview path.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg.create_instance("piano", sr as f64, &[]).expect("piano");
+    b.cmd(Cmd::SetTrackSynth {
+        i: 0,
+        synth: Some(Arc::new(slooper::audio::SynthHandle::Script(inst))),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let n = (sr as usize) * 3;
+    let mut ev = vec![
+        (0u64, 3u8, 0u8, 57u8, 110u8),
+        ((sr as u64) * 3 / 2, 0, 0, 57, 0),
+    ];
+    let buf = b
+        .engine
+        .bounce_track_preview(0, &mut ev, n)
+        .expect("preview bounce (track 0)");
+    let win = (sr as usize) / 10;
+    let head_rms = rms(&buf[(sr as usize) / 20..(sr as usize) / 20 + win]);
+    let mid_rms = rms(&buf[(sr as usize)..(sr as usize) + win]);
+    assert!(head_rms > 1e-3, "preview head must carry audio: {head_rms}");
+    assert!(
+        mid_rms > 0.2 * head_rms && mid_rms > 2e-3,
+        "preview must sustain, not blip: mid {mid_rms} vs head {head_rms}"
+    );
+
+    // Play it: audible at the sink with the transport STOPPED, then silent
+    // once the buffer ran out (auto-stop).
+    std::thread::sleep(Duration::from_millis(150));
+    b.cmd(Cmd::PreviewPlay { samples: Arc::from(buf) });
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(5),
+        "preview audible at the master out",
+    );
+    std::thread::sleep(Duration::from_millis(3100));
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(5),
+        "preview auto-stops at the end of its buffer",
+    );
+
+    // The user's real setting: audition THROUGH A TRACK whose instrument is
+    // a VSTi (`preview_track` points at it from the piano roll). The
+    // offline plugin render must also produce a sustained tone, not a blip.
+    let vst_path = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h).join(".vst3/vitalium.vst3"),
+        Err(_) => std::path::PathBuf::from("/nonexistent"),
+    };
+    if vst_path.exists() {
+        let load = slooper::vsthost::open(&vst_path, slooper::vsthost::VstKind::V3, sr, None)
+            .expect("vitalium must load");
+        b.cmd(Cmd::SetTrackSynth {
+            i: 0,
+            synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(load.entry.clone()))),
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let mut ev = vec![
+            (0u64, 3u8, 0u8, 60u8, 110u8),
+            ((sr as u64) * 3 / 2, 0, 0, 60, 0),
+        ];
+        let buf = b
+            .engine
+            .bounce_track_preview(0, &mut ev, n)
+            .expect("VSTi preview bounce");
+        let head_rms = rms(&buf[(sr as usize) / 20..(sr as usize) / 20 + win]);
+        let mid_rms = rms(&buf[(sr as usize)..(sr as usize) + win]);
+        assert!(head_rms > 1e-3, "VSTi preview head: {head_rms}");
+        assert!(
+            mid_rms > 0.2 * head_rms && mid_rms > 2e-3,
+            "VSTi preview must sustain through the whole window: mid {mid_rms} vs head {head_rms}"
+        );
+    }
+    let _ = active;
+}
+
+/// Seeking away from a LONG held note must silence it: the seek handler
+/// all-`off`s every synth AND drops the sustain bookkeeping, so a held
+/// note cannot keep rendering after its timeline window is gone.
+#[test]
+fn e2e_midi_seek_silences_held_note() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("midi_seek", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg.create_instance("piano", sr as f64, &[]).expect("piano");
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(slooper::audio::SynthHandle::Script(inst)))));
+    let pat = one_note_pattern(sr, 57, 4.0);
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: (sr as u64) * 10,
+    });
+    b.cmd(Cmd::SetLoop(false));
+
+    std::thread::sleep(Duration::from_millis(150));
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(5),
+        "note audible before the seek",
+    );
+    // Jump to 6 s — past the clip end, mid-note. Nothing may keep ringing.
+    b.cmd(Cmd::Seek { pos: (sr as u64) * 6 });
+    wait_until(
+        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(4),
+        "seek must silence the held note (sustain state resets with the position)",
+    );
+    // And stay silent while the transport keeps running over empty bars.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        ring_peak(&ring, &widx, 4800).map(|p| p < 0.002).unwrap_or(false),
+        "held note resurrected after the seek (sustain kept advancing)"
+    );
+    b.cmd(Cmd::StopAll);
+    let _ = active;
+}
+
+
+
+
+

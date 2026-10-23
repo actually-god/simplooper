@@ -14,6 +14,14 @@ and **binary VST2/VST3 plugins** loaded from `vst_dirs`.
   the track's synth window.
 - VST2 plugins load through the vendored, host-patched `vendor/vst2` crate
   (see `VENDOR-NOTES.md`); VST3 through `vst3-host`.
+- Instrument playback keeps the plugin PROCESSING through event-free
+  blocks, so sustained notes, long pads and the plugin's own release tails
+  sound fully — and StopAll/seek flush both the plugin's staging ring and
+  its voices, so nothing leaks into the next run.
+- distrho-ports / JUCE-wrapper builds (Vitalium, SwankyAmp, …) advertise
+  their audio buses as inactive, which naive hosts honour into permanent
+  silence; slooper detects the zero-channel case and activates the output
+  buses itself, so these plugins play normally as track instruments.
 
 ## VSTi custom GUIs (VST2)
 

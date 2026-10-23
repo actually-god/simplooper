@@ -496,9 +496,27 @@ fn assemble(
 }
 
 fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtStageEntry, String> {
-    use vst3_host::{audio::AudioBuffers, realtime::RealtimePluginRunner, simple};
+    use vst3_host::{
+        audio::{AudioBuffers, BusDirection, MediaType},
+        realtime::RealtimePluginRunner,
+        simple,
+    };
     let mut plugin = simple::load_plugin_with_settings(path, sample_rate as f64, VST_BLOCK)
         .map_err(|e| format!("load: {e}"))?;
+    // JUCE-wrapper plugins (Vitalium, SwankyAmp — distrho-ports builds) advertise
+    // their buses with `active = 0` in `getBusInfo`, and the loader honours that.
+    // An unactivated output bus renders NOTHING: `output_channel_count` collapses
+    // to 0 and the plugin "loads fine" but is permanently silent. If we see zero
+    // active output channels, activate every output bus and re-measure. Only in
+    // that broken case — plugins that advertise correctly (Geonkick with its 16
+    // auxiliary out buses!) keep their activation and channel accounting intact.
+    if plugin.output_channel_count() == 0 {
+        if let Ok(layout) = plugin.audio_bus_layout() {
+            for i in 0..layout.outputs.len() as i32 {
+                let _ = plugin.set_bus_active(MediaType::Audio, BusDirection::Output, i, true);
+            }
+        }
+    }
     let ps = plugin.get_parameters().map_err(|e| format!("params: {e}"))?;
     let descs: Vec<VstParamDesc> = ps
         .iter()
@@ -997,5 +1015,41 @@ mod tests {
         }
         // Informational, not an assertion: CI has no plugins installed.
         let _ = ran;
+    }
+
+    /// Every installed instrument VST3 must actually SOUND when fed a
+    /// note. Regression pin for the JUCE-wrapper silent-bus bug:
+    /// distrho-ports builds (Vitalium et al.) advertise their buses with
+    /// `active = 0`; a host that honours that renders nothing, and the
+    /// plugin silently never plays as a track instrument. `open` must leave
+    /// every loadable instrument on an activated output bus.
+    #[test]
+    fn every_local_instrument_makes_sound() {
+        let found = scan(&default_vst_dirs());
+        let mut checked = 0;
+        for e in found.iter().filter(|e| e.error.is_none() && e.instrument) {
+            if !e.path.extension().is_some_and(|x| x == "vst3") {
+                continue; // VST2 instruments are covered by the smoke test
+            }
+            let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else { continue };
+            load.entry.note_on(0, 60, 110);
+            let mut peak = 0.0f32;
+            // ~1 second at 48k in ring-sized chunks.
+            for _ in 0..96 {
+                let mut out = [0.0f32; 512];
+                load.entry.process(&[0.0f32; 512], &mut out);
+                peak = peak.max(out.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+            }
+            load.entry.all_notes_off();
+            assert!(
+                peak > 1e-4,
+                "{}: instrument VST3 produced silence from a held note \
+                 (unactivated output bus?)",
+                e.path.display()
+            );
+            checked += 1;
+        }
+        // Informational: CI has no instruments installed.
+        let _ = checked;
     }
 }

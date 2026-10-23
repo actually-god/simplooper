@@ -163,11 +163,18 @@ pub enum SynthHandle {
 }
 
 impl SynthHandle {
-    /// Silence every ringing voice (transport seek).
+    /// Silence every ringing voice (transport seek/stop).
     pub fn all_off(&self) {
         match self {
             SynthHandle::Script(i) => i.all_off(),
-            SynthHandle::Vst(e) => e.all_notes_off(),
+            // A plugin's already-produced samples live in its staging
+            // ring: drop them FIRST, then stop the notes — the all-notes-
+            // off messages ride in `pending_midi`, and flushing after
+            // would drop them too, leaving plugin voices ringing forever.
+            SynthHandle::Vst(e) => {
+                e.flush();
+                e.all_notes_off();
+            }
         }
     }
 }
@@ -1508,6 +1515,9 @@ fn run(
         // empty vector there aborted the RT thread (v0.6/v0.7 MIDI crash).
         midi_scratch: vec![Vec::new(); MAX_LOOPS],
         midi_live: [false; MAX_LOOPS],
+        midi_ring_to: [0u64; MAX_LOOPS],
+        midi_sustain: [false; MAX_LOOPS],
+        midi_quiet: [0u32; MAX_LOOPS],
         synth_p: [0.0f32; crate::synth::MAX_PARAMS],
         synth_pg: [0u64; MAX_LOOPS],
         mono: Vec::new(),
@@ -2298,13 +2308,25 @@ pub fn render_midi_events(
     inst.all_off();
 }
 
+/// Peak level below which a rendered MIDI block counts as silent
+/// (~ -80 dBFS): only such blocks advance the synth's stop-the-clock timer.
+const MIDI_SILENCE_FLOOR: f32 = 1e-4;
+/// Consecutive silent blocks (nothing scheduled) after which a track's
+/// synth stops advancing — a few tens of ms, far below any real tail but
+/// long enough for the piano's ~70 ms damper release.
+const MIDI_QUIET_BLOCKS: u32 = 6;
+
 impl Proc {
     /// Render every MIDI pattern clip sounding this block through each
     /// track's synth into `midi_scratch[t]` (mono). Notes are triggered by
     /// the pattern; a note whose head was trimmed away (`cut`) stays silent,
     /// one already ringing keeps ringing inside the synth until its off
     /// event — contiguous blocks make that seamless, and a transport seek
-    /// `all_off`s everything. Returns whether any track produced sound.
+    /// `all_off`s everything. A track whose schedule is still ringing (or
+    /// whose tail has not decayed yet) keeps ADVANCING its synth even on
+    /// event-free blocks: the sound lives inside the instrument, and
+    /// pausing the synth between events turned every sustained note into a
+    /// one-block blip. Returns whether any track produced sound.
     fn render_midi_block(&mut self, p0: u64, block_n: usize) -> bool {
         // Clear last block's scratch first (only rows that actually sounded).
         for (t, live) in self.midi_live.iter_mut().enumerate() {
@@ -2314,6 +2336,23 @@ impl Proc {
             }
         }
         if !self.engine.transport_on() || self.midi_cache.is_empty() || block_n == 0 {
+            // Transport stopped (or the pattern table went away) while
+            // something was sounding: silence every voice once so nothing
+            // leaks into the next run, and drop all sustain bookkeeping.
+            if self.midi_sustain.iter().any(|s| *s) || self.midi_ring_to.iter().any(|r| *r != 0)
+            {
+                for h in self.synths_cache.iter().flatten() {
+                    h.all_off();
+                }
+                if let Some(d) = &self.dflt_synth {
+                    d.all_off();
+                }
+            }
+            for t in 0..MAX_LOOPS {
+                self.midi_sustain[t] = false;
+                self.midi_quiet[t] = 0;
+                self.midi_ring_to[t] = 0;
+            }
             return false;
         }
         let sr = self.sr.max(1);
@@ -2327,6 +2366,9 @@ impl Proc {
             mono,
             midi_scratch,
             midi_live,
+            midi_ring_to,
+            midi_sustain,
+            midi_quiet,
             synth_p,
             synth_pg,
             synths_cache,
@@ -2343,6 +2385,9 @@ impl Proc {
                 None => continue, // no synth loaded at all: silence
             };
             midi_ev.clear();
+            // Ring horizon: the latest sample this track must keep the
+            // synth advancing to (updated from every note staged here).
+            let mut ring = midi_ring_to[t];
             for l in arr.tracks[t].lanes.iter() {
                 for cl in l.clips.iter() {
                     let Some(Some(pat)) = midi_cache.get(cl.asset as usize) else {
@@ -2368,9 +2413,11 @@ impl Proc {
                             if off_tl >= p0 && off_tl < span_end {
                                 midi_ev.push(((off_tl - p0) as usize, 0, note.ch, note.note, 0));
                             }
+                            ring = ring.max(off_tl);
                         } else if on < p0 && on + len_s > p0 && on + len_s <= span_end {
                             // Rang in earlier; its off lands in this block.
                             midi_ev.push(((on + len_s - p0) as usize, 0, note.ch, note.note, 0));
+                            ring = ring.max(on + len_s);
                         }
                     }
                     for m in pat.ccs.iter() {
@@ -2395,7 +2442,14 @@ impl Proc {
                     }
                 }
             }
-            if midi_ev.is_empty() {
+            // Render this block when it carries staged events OR when the
+            // track is still sustaining (a scheduled note rings past this
+            // block, or the synth's tail has not decayed yet). Pausing the
+            // instrument on event-free blocks is what made every note a
+            // one-block blip — the sound between events lives INSIDE the
+            // synth (script voices / the plugin's own ring).
+            let has_ev = !midi_ev.is_empty();
+            if !has_ev && !midi_sustain[t] {
                 continue;
             }
             let row = &mut midi_scratch[t];
@@ -2477,6 +2531,27 @@ impl Proc {
             }
             midi_live[t] = true;
             any = true;
+            // Sustain bookkeeping. Keep advancing while the schedule rings
+            // past this block; once nothing is scheduled, stop only after a
+            // few near-silent rendered blocks, so the instrument's release
+            // tail plays out fully but a dead track costs no CPU.
+            midi_ring_to[t] = ring;
+            if has_ev {
+                midi_sustain[t] = true;
+                midi_quiet[t] = 0;
+            }
+            if ring <= span_end {
+                let peak = row[..block_n].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                if peak < MIDI_SILENCE_FLOOR {
+                    midi_quiet[t] = midi_quiet[t].saturating_add(1);
+                    if midi_quiet[t] >= MIDI_QUIET_BLOCKS {
+                        midi_sustain[t] = false;
+                        midi_quiet[t] = 0;
+                    }
+                } else {
+                    midi_quiet[t] = 0;
+                }
+            }
         }
         any
     }
@@ -2574,6 +2649,16 @@ struct Proc {
     /// Per-track synth render output for this block (mixed into `acc`).
     midi_scratch: Vec<Vec<f32>>,
     midi_live: [bool; MAX_LOOPS],
+    /// Latest staged note-off per track (timeline samples): the synth keeps
+    /// rendering while the schedule is still ringing. The note sounds
+    /// INSIDE the instrument between events, so event-free blocks must not
+    /// pause it — skipping them rendered every sustained note as a blip.
+    midi_ring_to: [u64; MAX_LOOPS],
+    /// Track's synth is still advancing (until its tail falls silent).
+    midi_sustain: [bool; MAX_LOOPS],
+    /// Consecutive rendered near-silent blocks with nothing scheduled:
+    /// this many and the synth stops advancing until the next note.
+    midi_quiet: [u32; MAX_LOOPS],
     /// Per-track cached synth param snapshot + change counter.
     synth_p: [f32; crate::synth::MAX_PARAMS],
     synth_pg: [u64; MAX_LOOPS],
@@ -2875,6 +2960,12 @@ impl ProcessHandler for Proc {
             }
             if let Some(d) = &self.dflt_synth {
                 d.all_off();
+            }
+            // Sustain bookkeeping dies with the old timeline position.
+            for t in 0..MAX_LOOPS {
+                self.midi_sustain[t] = false;
+                self.midi_quiet[t] = 0;
+                self.midi_ring_to[t] = 0;
             }
             // Plugin buffers/rings in every chain: drop stale audio.
             for tf in self.fx_cache.iter() {
