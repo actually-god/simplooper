@@ -40,7 +40,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
 ];
 /// Bump when a bundled script changes, so shipped fixes replace the user
 /// folder's copy (with a `.bak` backup) instead of freezing at first seed.
-const BUNDLED_VERSION: &str = "3";
+const BUNDLED_VERSION: &str = "4";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
@@ -640,7 +640,7 @@ mod tests {
         seed_folder(&dir);
         let upd = std::fs::read_to_string(&piano).unwrap();
         assert!(
-            upd.contains("fan455"),
+            upd.contains("TimGM6mb"),
             "stale stamped piano.rs was not updated in place"
         );
         assert_eq!(
@@ -696,6 +696,50 @@ mod tests {
         }
     }
 
+    /// v0.8 item 2: "the sampler doesn't currently work" — beyond making
+    /// sound, the sampler must PITCH the rack asset by the semitone
+    /// distance from its root note: +12 st ⇒ exactly twice the rate.
+    #[test]
+    fn v08_sampler_plays_asset_pitched() {
+        let reg = test_registry("pitched");
+        let sine: Arc<[f32]> = (0..48000)
+            .map(|i| (i as f64 * 2.0 * std::f64::consts::TAU * 200.0 / 48000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let inst = reg.create_instance("sampler", 48_000.0, &[]).expect("sampler");
+        let desc = reg.desc("sampler").unwrap();
+        let mut p = [0.0f32; MAX_PARAMS];
+        for (k, pd) in desc.params.iter().enumerate() {
+            p[k] = pd.default;
+        }
+        p[1] = 60.0; // root note = C4
+        let render = |note: u8| -> Vec<f32> {
+            let mut out = vec![0.0f32; 8192];
+            unsafe { inst.process_into(&mut out, &p) }; // asset sync block
+            inst.note_on(0, note, 110);
+            let mut out = vec![0.0f32; 8192];
+            unsafe { inst.process_into(&mut out, &p) };
+            inst.all_off();
+            out
+        };
+        let zc = |x: &[f32]| -> f64 {
+            x.iter()
+                .skip(256)
+                .zip(x.iter().skip(257))
+                .filter(|(a, b)| **a * **b < 0.0)
+                .count() as f64
+        };
+        let r60 = render(60); // at root: the sample's own 200 Hz
+        let r72 = render(72); // +12 st: 400 Hz
+        let (z0, z1) = (zc(&r60), zc(&r72));
+        assert!(z0 > 100.0, "root render must be real signal (zc {z0})");
+        let ratio = z1 / z0;
+        assert!(
+            (ratio - 2.0).abs() < 0.25,
+            "+12 st must double the pitch: zc {z0} vs {z1} (ratio {ratio})"
+        );
+    }
+
     /// Goertzel-style squared magnitude of `x` at frequency `f` over
     /// `x[a..b]` — enough to tell a harmonic line from the noise floor.
     fn tone_power(x: &[f32], f: f64, sr: f64, a: usize, b: usize) -> f64 {
@@ -724,12 +768,13 @@ mod tests {
     }
 
     #[test]
-    fn piano_is_modal_not_static() {
-        // AC2.2: the replacement piano must sound like DECAYING PARTIALS —
-        // strong lines at the harmonics, upper partials dying faster than
-        // the fundamental, and definitely not a flat (white-noise-like)
-        // spectrum nor the old fixed-ratio FM buzz.
-        let reg = test_registry("modal");
+    fn v08_piano_is_a_recorded_grand() {
+        // AC2.2 (v0.8): the bundled piano is now real recorded grand-
+        // piano multisamples (TimGM6mb 'Piano 1'). Pin the properties
+        // that make it a piano and not a toy: correct pitch, harmonic
+        // spectrum that falls with frequency, sustain with a live decay,
+        // real velocity dynamics, a damper that stops sound, and no NaN.
+        let reg = test_registry("grand");
         let inst = reg.create_instance("piano", 48_000.0, &[]).expect("piano");
         let desc = reg.desc("piano").unwrap().clone();
         let mut p = [0.0f32; MAX_PARAMS];
@@ -737,54 +782,73 @@ mod tests {
             p[k] = pd.default;
         }
         let sr = 48_000.0f64;
-        let note = 57u8; // A3 = 220 Hz
+        let render = |note: u8, vel: u8, secs: f64| -> Vec<f32> {
+            inst.all_off();
+            inst.note_on(0, note, vel);
+            let n = (secs * sr) as usize;
+            let mut out = vec![0.0f32; n];
+            let mut at = 0usize;
+            while at < n {
+                let end = (at + 1024).min(n);
+                let mut blk = vec![0.0f32; end - at];
+                unsafe { inst.process_into(&mut blk, &p) };
+                out[at..end].copy_from_slice(&blk);
+                at = end;
+            }
+            out
+        };
+        let rms = |a: &[f32]| -> f64 {
+            a.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / a.len() as f64
+        };
+        let out = render(57, 110, 3.0); // A3
+        assert!(out.iter().all(|s| s.is_finite()), "NaN/inf in piano");
         let f0 = 220.0f64;
-        inst.note_on(0, note, 110);
-        let secs = 4.0;
-        let n = (secs * sr) as usize;
-        let mut out = vec![0.0f32; n];
-        let mut at = 0usize;
-        while at < n {
-            let end = (at + 1024).min(n);
-            let mut blk = vec![0.0f32; end - at];
-            unsafe { inst.process_into(&mut blk, &p) };
-            out[at..end].copy_from_slice(&blk);
-            at = end;
-        }
-        let rms = |a: usize, b: usize| -> f64 {
-            out[a..b].iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>()
-                / (b - a) as f64
-        };
-        let head = (0.10 * sr) as usize..(0.60 * sr) as usize;
-        let tail = (3.40 * sr) as usize..(3.90 * sr) as usize;
-        assert!(rms(head.start, head.end) > 1e-4, "piano must make sound");
-        assert!(rms(tail.start, tail.end) > 1e-8, "must still ring at 3.4 s");
-        assert!(
-            rms(head.start, head.end) > 2.0 * rms(tail.start, tail.end),
-            "must DECAY: head rms {} vs tail rms {}",
-            rms(head.start, head.end),
-            rms(tail.start, tail.end)
+        let head = &out[(0.08 * sr) as usize..(0.8 * sr) as usize];
+        let tail = &out[(2.3 * sr) as usize..(2.9 * sr) as usize];
+        assert!(rms(head) > 1e-4, "piano must make sound");
+        assert!(rms(tail) > 1e-9, "a real piano still rings at 2.3 s");
+        assert!(rms(head) > 1.3 * rms(tail), "the note must decay");
+        // Pitch: strong line at A3 (all zone/octave math baked in).
+        let on = line_power(&out, f0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
+        let off = tone_power(&out, 253.0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
+        assert!(on > 25.0 * off, "fundamental must sit at 220 Hz: {on} vs {off}");
+        // Harmonic spectrum falling with frequency (no static, no buzz).
+        let low = line_power(&out, f0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
+        let high = line_power(&out, 7000.0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
+        assert!(low > 10.0 * high, "spectrum must fall with frequency");
+        // Velocity dynamics: 4x softer hit is dramatically quieter. The
+        // recorded source enforces a power curve too ((vel/127)^1.55), but
+        // sampled instruments breathe ~half as loud per velocity step as
+        // a raw oscillator did — 6x is what a real grand gives here.
+        let loud = render(60, 127, 0.5);
+        let soft = render(60, 40, 0.5);
+        let (ml, ms) = (
+            loud.iter().fold(0f32, |m, s| m.max(s.abs())),
+            soft.iter().fold(0f32, |m, s| m.max(s.abs())),
         );
-        // Harmonic lines dominate the inter-harmonic floor at the head.
-        for h in [2.0, 3.0, 5.0] {
-            let on = line_power(&out, h * f0, sr, head.start, head.end);
-            let off = tone_power(&out, (h + 0.5) * f0, sr, head.start, head.end);
-            assert!(
-                on > 25.0 * off.max(1e-12),
-                "harmonic {h} must stand out: on {on} off {off}"
-            );
+        assert!(ml > 0.05 && ml < 1.2, "sane peak level, got {ml}");
+        assert!(ml > 4.0 * ms, "velocity must move the dynamic (loud {ml} soft {ms})");
+        // Damper: sound gone a short while after note-off.
+        inst.all_off();
+        inst.note_on(0, 60, 110);
+        for _ in 0..10 {
+            let mut blk = vec![0.0f32; 512];
+            unsafe { inst.process_into(&mut blk, &p) };
         }
-        // Not white noise: fundamentals-side energy dwarfs the high band.
-        let low = line_power(&out, f0, sr, head.start, head.end);
-        let high = line_power(&out, 7000.0, sr, head.start, head.end);
-        assert!(low > 10.0 * high, "spectrum must fall with frequency: {low} vs {high}");
-        // PARTIAL-dependent decay (the modal signature): the 6th partial's
-        // level RELATIVE to the fundamental drops strongly by the tail.
-        let rel = |a: usize, b: usize| -> f64 {
-            line_power(&out, 6.0 * f0, sr, a, b) / line_power(&out, f0, sr, a, b).max(1e-12)
-        };
-        let (rh, rt) = (rel(head.start, head.end), rel(tail.start, tail.end));
-        assert!(rt < 0.7 * rh, "upper partials must decay faster: head {rh} tail {rt}");
+        inst.note_off(0, 60);
+        // The damper is a ~120 ms mute ramp, so measure the TAIL after it,
+        // not the release transient itself.
+        let mut blk = vec![0.0f32; 512];
+        for _ in 0..18 {
+            unsafe { inst.process_into(&mut blk, &p) };
+        }
+        let mut quiet = 0.0f32;
+        for _ in 0..40 {
+            let mut blk = vec![0.0f32; 512];
+            unsafe { inst.process_into(&mut blk, &p) };
+            quiet = quiet.max(blk.iter().fold(0f32, |m, s| m.max(s.abs())));
+        }
+        assert!(quiet < 0.02 * ml, "damper must stop the note, tail peak {quiet}");
         inst.all_off();
     }
 

@@ -1,0 +1,449 @@
+// ============================================================ slooper ==
+// slooper-synth-version: 4
+// piano.rs — the default slooper synthesizer: a REAL piano.
+//
+// A compact sample-player for the 'Piano 1' (GM acoustic grand)
+// instrument extracted from the open-source TimGM6mb soundfont by
+// tools/build_piano.py. Tim Brechbill curated this grand piano from
+// public-domain and GPL samples; the blob below is that instrument's
+// mono multisamples (~0.2 MB of 22 kHz PCM: 33 key-split zones with
+// SF2 loop points, attenuation and tuning generators honoured), played
+// back with cubic-interpolated pitch, velocity amplitude, damper and
+// sustain-pedal behaviour, and up to 16 voices. It is a recording of a
+// real grand piano — hammer touch, body resonance, natural decay —
+// which no fixed-spectrum synth fully fakes.
+//
+// Data provenance & license: the blob is derived from TimGM6mb.sf2
+// (© 2004 Tim Brechbill, © 2010 David Bolton), licensed GNU GPL-2.
+// THIRD-PARTY-NOTICES.md next to this file carries the full notice and
+// the exact extraction procedure. The player code (everything outside
+// the blob) is MIT like slooper.
+// ---------------------------------------------------------------------------
+
+include!("synth_api.rs");
+
+const VOICES: usize = 16;
+
+const BLOB_B64: &str = "%%BLOB%%";
+
+#[derive(Clone, Copy)]
+struct Zone {
+    hi: u8,
+    sample: u32,
+    looping: bool,
+    ls: u32,
+    le: u32,
+    att: f32,   // linear (from SF2 centibels)
+}
+
+#[derive(Clone, Copy)]
+struct Sample {
+    off: u32,
+    len: u32,
+    cents: f32, // measured natural pitch, cents rel. A4=440
+    sr: f32,    // the sample's own rate
+}
+
+#[derive(Clone, Copy)]
+struct Voice {
+    on: bool,
+    key: u8,
+    zi: u32,
+    pos: f64,
+    rate: f64,
+    gain: f32,
+    rel: bool,
+    age: u32,
+}
+
+impl Voice {
+    const fn silent() -> Voice {
+        Voice {
+            on: false,
+            key: 0,
+            zi: 0,
+            pos: 0.0,
+            rate: 0.0,
+            gain: 0.0,
+            rel: false,
+            age: 0,
+        }
+    }
+}
+
+struct Piano {
+    sr: f64,
+    zones: Vec<Zone>,
+    samples: Vec<Sample>,
+    pcm: Vec<f32>,
+    voices: [Voice; VOICES],
+    sustain: bool,
+    pressed: [bool; 128],
+    hold_rel: [bool; 128],
+}
+
+fn b64_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4 + 3);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    out
+}
+
+fn rd_u32(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+fn rd_i32(b: &[u8], i: usize) -> i32 {
+    i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+fn rd_i16(b: &[u8], i: usize) -> i16 {
+    i16::from_le_bytes([b[i], b[i + 1]])
+}
+
+/// Parse the SLPZ blob (see tools/build_piano.py). Any mismatch yields
+/// empty tables — the instrument then stays silent instead of crashing.
+fn parse(blob: &[u8]) -> (Vec<Zone>, Vec<Sample>, Vec<f32>) {
+    let mut zones = Vec::new();
+    let mut samples = Vec::new();
+    let mut pcm = Vec::new();
+    if blob.len() < 16 || &blob[0..4] != b"SLPZ" {
+        return (zones, samples, pcm);
+    }
+    let (ver, nz, ns) = (
+        rd_u32(blob, 4),
+        rd_u32(blob, 8) as usize,
+        rd_u32(blob, 12) as usize,
+    );
+    let need = 16 + nz * 24 + ns * (12 + 4);
+    if ver != 2 || blob.len() < need {
+        return (zones, samples, pcm);
+    }
+    zones.reserve(nz);
+    let mut p = 16usize;
+    for _ in 0..nz {
+        zones.push(Zone {
+            hi: blob[p + 1],
+            sample: u16::from_le_bytes([blob[p + 2], blob[p + 3]]) as u32,
+            looping: blob[p + 5] != 0,
+            ls: rd_u32(blob, p + 6),
+            le: rd_u32(blob, p + 10),
+            att: (10f32).powf(-(rd_i16(blob, p + 14) as f32) / 200.0),
+        });
+        p += 24;
+    }
+    samples.reserve(ns);
+    for _ in 0..ns {
+        samples.push(Sample {
+            off: rd_u32(blob, p),
+            len: rd_u32(blob, p + 4),
+            cents: rd_i32(blob, p + 8) as f32,
+            sr: 0.0,
+        });
+        p += 12;
+    }
+    for s in samples.iter_mut() {
+        s.sr = rd_u32(blob, p) as f32;
+        p += 4;
+    }
+    let n_i16 = (blob.len() - p) / 2;
+    pcm.resize(n_i16, 0.0);
+    for i in 0..n_i16 {
+        pcm[i] = rd_i16(blob, p + i * 2) as f32 / 32768.0;
+    }
+    (zones, samples, pcm)
+}
+
+extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    let blob = b64_decode(BLOB_B64);
+    let (zones, samples, pcm) = parse(&blob);
+    let p = Box::new(Piano {
+        sr,
+        zones,
+        samples,
+        pcm,
+        voices: [Voice::silent(); VOICES],
+        sustain: false,
+        pressed: [false; 128],
+        hold_rel: [false; 128],
+    });
+    Box::into_raw(p) as *mut core::ffi::c_void
+}
+
+extern "C" fn destroy(s: *mut core::ffi::c_void) {
+    if !s.is_null() {
+        drop(unsafe { Box::from_raw(s as *mut Piano) });
+    }
+}
+
+extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
+    if s.is_null() || note > 127 || vel == 0 {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Piano) };
+    if p.zones.is_empty() {
+        return;
+    }
+    // Zones are key-sorted and contiguous; the top zone extends past its
+    // recorded hi so keys above the piano's range still sound.
+    let mut zi = p.zones.len() - 1;
+    for (i, z) in p.zones.iter().enumerate() {
+        if note <= z.hi {
+            zi = i;
+            break;
+        }
+    }
+    let z = p.zones[zi];
+    let amp = (vel as f32 / 127.0).powf(1.55) * z.att;
+    // The sample table stores each recording's MEASURED natural pitch
+    // (cents rel. A4); rate places it exactly on the tempered key.
+    let s = p.samples[z.sample as usize];
+    let cents = (note as f32 - 69.0) * 100.0 - s.cents;
+    let rate = (s.sr as f64 / p.sr) * 2f64.powf(cents as f64 / 1200.0);
+
+    let mut slot = 0usize;
+    let mut found = false;
+    for (i, v) in p.voices.iter().enumerate() {
+        if !v.on {
+            slot = i;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        for (i, v) in p.voices.iter().enumerate() {
+            if v.rel {
+                slot = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        let mut best = u32::MAX;
+        for (i, v) in p.voices.iter().enumerate() {
+            if v.age < best {
+                best = v.age;
+                slot = i;
+            }
+        }
+    }
+    p.voices[slot] = Voice {
+        on: true,
+        key: note,
+        zi: zi as u32,
+        pos: 0.0,
+        rate,
+        gain: amp,
+        rel: false,
+        age: 0,
+    };
+    p.pressed[note as usize] = true;
+}
+
+extern "C" fn note_off(s: *mut core::ffi::c_void, _ch: u8, note: u8) {
+    if s.is_null() || note > 127 {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Piano) };
+    p.pressed[note as usize] = false;
+    for v in p.voices.iter_mut() {
+        if v.on && v.key == note {
+            if p.sustain {
+                p.hold_rel[note as usize] = true;
+            } else {
+                v.rel = true;
+            }
+        }
+    }
+}
+
+extern "C" fn all_off(s: *mut core::ffi::c_void) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Piano) };
+    for v in p.voices.iter_mut() {
+        *v = Voice::silent();
+    }
+    p.pressed = [false; 128];
+    p.hold_rel = [false; 128];
+}
+
+extern "C" fn cc(s: *mut core::ffi::c_void, _ch: u8, num: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    if num == 123 || num == 120 {
+        all_off(s);
+        return;
+    }
+    if num != 64 {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Piano) };
+    let on = val >= 64;
+    if !on && p.sustain {
+        // Pedal lifted: damp everything released while it was down.
+        for k in 0..128 {
+            if p.hold_rel[k] && !p.pressed[k] {
+                for v in p.voices.iter_mut() {
+                    if v.on && v.key as usize == k {
+                        v.rel = true;
+                    }
+                }
+                p.hold_rel[k] = false;
+            }
+        }
+    }
+    p.sustain = on;
+}
+
+extern "C" fn press(_s: *mut core::ffi::c_void, _ch: u8, _val: u8) {}
+
+/// Catmull-Rom cubic interpolation.
+#[inline(always)]
+fn cr(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+    b + 0.5 * t * (c - a + t * (2.0 * a - 5.0 * b + 4.0 * c - d + t * (-a + 3.0 * b - 3.0 * c + d)))
+}
+
+extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Piano) };
+    if p.zones.is_empty() {
+        for k in 0..n {
+            unsafe { *out.add(k) = 0.0 };
+        }
+        return;
+    }
+    let tone = unsafe { *params.add(0) }.clamp(0.0, 1.0);
+    let level = unsafe { *params.add(1) }.clamp(0.0, 1.0);
+    // tone: 0 = felt-damped dark, 1 = lid open. Scales how much of the
+    // raw (bright) signal survives the 9 kHz one-pole.
+    let lp_mix = (0.25 + 0.95 * tone).clamp(0.0, 1.0);
+    let lp_a = {
+        let x = 9000.0;
+        let sr = p.sr as f32;
+        1.0 - (-6.2831853 * x / sr).exp()
+    };
+    let mk = level * 3.0; // make-up so vel-110 notes peak near 0.4
+    let rel_step = 1.0 / (0.12 * p.sr); // ~120 ms damper
+
+    let zones = &p.zones;
+    let samples = &p.samples;
+    let pcm = &p.pcm;
+    for k in 0..n {
+        let mut acc = 0f32;
+        for v in p.voices.iter_mut() {
+            if !v.on {
+                continue;
+            }
+            let z = zones[v.zi as usize];
+            let sm = samples[z.sample as usize];
+            let len = sm.len as usize;
+            let lstart = z.ls as usize;
+            let lend = z.le as usize;
+            if v.pos >= len as f64 {
+                if z.looping && lend > lstart && lend <= len {
+                    v.pos = lstart as f64 + (v.pos - lend as f64);
+                } else {
+                    *v = Voice::silent();
+                    continue;
+                }
+            }
+            let i = v.pos as usize;
+            let f = (v.pos - i as f64) as f32;
+            let g = |j: isize| -> f32 {
+                let jj = if j < 0 {
+                    0
+                } else if j >= len as isize {
+                    len as isize - 1
+                } else {
+                    j
+                };
+                pcm[sm.off as usize + jj as usize]
+            };
+            let raw = cr(g(i as isize - 1), g(i as isize), g(i as isize + 1), g(i as isize + 2), f);
+            let mut env = v.gain;
+            if v.rel {
+                // LINEAR damper ramp: rel_step is the per-sample step, so a
+                // note mutes in ~120 ms whatever its level (multiplying by
+                // gain made it exponential and it never reached silence).
+                env -= rel_step as f32;
+                if env <= 0.0 {
+                    *v = Voice::silent();
+                    continue;
+                }
+                v.gain = env;
+            }
+            acc += raw * env;
+            v.pos += v.rate;
+            if z.looping && lend > lstart && v.pos >= lend as f64 {
+                v.pos -= (lend - lstart) as f64;
+            }
+            v.age = v.age.wrapping_add(1);
+        }
+        unsafe { *out.add(k) = acc };
+    }
+    // Master tone (one-pole blend) + level.
+    let mut lp = 0f32;
+    for k in 0..n {
+        let x = unsafe { *out.add(k) };
+        lp += lp_a * (x - lp);
+        let y = lp + (x - lp) * lp_mix;
+        unsafe { *out.add(k) = y * mk };
+    }
+}
+
+static PARAMS: [SynthParamV1; 2] = [
+    SynthParamV1 {
+        label: c"tone".as_ptr(),
+        min: 0.0,
+        max: 1.0,
+        default: 0.65,
+    },
+    SynthParamV1 {
+        label: c"level".as_ptr(),
+        min: 0.0,
+        max: 1.0,
+        default: 0.8,
+    },
+];
+
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: SLOOPER_SYNTH_ABI,
+    name: c"piano".as_ptr(),
+    author: c"slooper; samples Tim Brechbill (TimGM6mb, GPL-2)".as_ptr(),
+    description: c"Real grand-piano multisamples from the open TimGM6mb soundfont: hammer touch, sustain loops, natural decay.".as_ptr(),
+    n_params: 2,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    note_on,
+    note_off,
+    all_off,
+    cc,
+    press,
+    process,
+};
+
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
+    &DESC
+}
