@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 4
+// slooper-synth-version: 5
 // piano.rs — the default slooper synthesizer: a REAL piano.
 //
 // A compact sample-player for the 'Piano 1' (GM acoustic grand)

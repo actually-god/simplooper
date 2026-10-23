@@ -40,7 +40,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
 ];
 /// Bump when a bundled script changes, so shipped fixes replace the user
 /// folder's copy (with a `.bak` backup) instead of freezing at first seed.
-const BUNDLED_VERSION: &str = "4";
+const BUNDLED_VERSION: &str = "5";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
