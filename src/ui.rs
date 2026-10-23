@@ -421,6 +421,9 @@ struct ClipboardItem {
     cut: u64,
     play_len: Option<u64>,
     pos_off: u64,
+    gain: f32,
+    fade_in: u64,
+    fade_out: u64,
 }
 
 /// The clipboard: one copied group (pasted at the playhead on the target
@@ -1228,6 +1231,24 @@ impl App {
             return;
         }
 
+        // Ctrl+D duplicates the selection at the playhead (documented).
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+            self.duplicate_selection();
+            return;
+        }
+        // Bare S splits the selection at the playhead (plain keyboard only:
+        // Ctrl+S saved long before this point, and text fields returned).
+        if ctx.input(|i| {
+            i.key_pressed(egui::Key::S)
+                && !i.modifiers.command
+                && !i.modifiers.alt
+                && !i.modifiers.ctrl
+                && !i.modifiers.shift
+        }) {
+            self.split_selection();
+            return;
+        }
+
         // The knob wizard is its own learn mode: it does NOT set
         // `midi_learning_slot` (arm_knob_learn clears it), so it needs its
         // own key branch. Escape cancels; Delete clears the slot's binding
@@ -1909,6 +1930,47 @@ impl App {
         self.status = format!("{n} clip(s) removed (assets stay in the rack)");
     }
 
+    /// S / toolbar: split every selected clip at the playhead. Clips the
+    /// playhead does not cross stay untouched; the right halves keep the
+    /// selection, so repeating S walks a long clip into pieces.
+    fn split_selection(&mut self) {
+        if self.sel_clips.is_empty() {
+            self.status = "split: select a clip first (S splits at the playhead)".into();
+            return;
+        }
+        let ph = self.backend.engine.pos();
+        let mut ids = self.sel_clips.clone();
+        ids.sort();
+        let mut n = 0usize;
+        // Reverse order: inserting at c+1 never disturbs earlier indices.
+        for (t, k, c) in ids.into_iter().rev() {
+            let Some(cl) = self.arr.tracks[t].lanes[k].clips.get(c) else { continue };
+            let alen = self.asset_len(cl.asset);
+            let Some((l, r)) = cl.split_at(ph, alen) else { continue };
+            let lane = &mut self.arr.tracks[t].lanes[k];
+            lane.clips[c] = l;
+            lane.clips.insert(c + 1, r);
+            n += 1;
+        }
+        if n == 0 {
+            self.status = "split: the playhead is not inside any selected clip".into();
+            return;
+        }
+        self.sel_anchor = self.sel_clips.first().copied();
+        self.push_project();
+        self.status = format!("split {n} clip(s) at the playhead");
+    }
+
+    /// Ctrl+D (documented): copy + paste the selection at the playhead.
+    fn duplicate_selection(&mut self) {
+        if self.sel_clips.is_empty() {
+            self.status = "duplicate: select clips first".into();
+            return;
+        }
+        self.clipboard_copy();
+        self.clipboard_paste();
+    }
+
     /// Ctrl+C: copy the whole selection as a group (track offsets from the
     /// topmost selected track, position offsets from the leftmost clip).
     /// With no clip selected, falls back to the selected rack asset.
@@ -1923,6 +1985,9 @@ impl App {
                             cut: 0,
                             play_len: None,
                             pos_off: 0,
+                            gain: 1.0,
+                            fade_in: 0,
+                            fade_out: 0,
                         }],
                     });
                     let nm = a.name.clone();
@@ -1952,6 +2017,9 @@ impl App {
                     cut: cl.cut,
                     play_len: cl.play_len,
                     pos_off: cl.pos - p0,
+                    gain: cl.gain,
+                    fade_in: cl.fade_in,
+                    fade_out: cl.fade_out,
                 })
             })
             .collect();
@@ -1989,6 +2057,9 @@ impl App {
                     pos: pos + it.pos_off,
                     cut: it.cut,
                     play_len: it.play_len,
+                    gain: it.gain,
+                    fade_in: it.fade_in,
+                    fade_out: it.fade_out,
                 },
                 span,
             );
@@ -4119,6 +4190,9 @@ impl App {
                                 pos: c.pos,
                                 cut: c.cut,
                                 play_len: c.play_len,
+                                gain: c.gain,
+                                fade_in: c.fade_in,
+                                fade_out: c.fade_out,
                             })
                             .collect()
                     })
@@ -4319,6 +4393,9 @@ impl App {
                             pos: c.pos,
                             cut: c.cut,
                             play_len: c.play_len,
+                            gain: c.gain,
+                            fade_in: c.fade_in,
+                            fade_out: c.fade_out,
                         },
                     );
                 }
@@ -5817,6 +5894,17 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             ui.label(RichText::new("(drag the ruler handles)").weak().small());
         }
         ui.separator();
+        if ui
+            .button(RichText::new("\u{2702} split").strong())
+            .on_hover_text(
+                "Split the selected clip(s) at the playhead (key: S). The two \\
+                 halves keep playing seamlessly; fades stay on the left half.",
+            )
+            .clicked()
+        {
+            app.split_selection();
+        }
+        ui.separator();
         ui.label("zoom");
         // Logarithmic so the default (160 px/s) sits near the centre of the
         // 3..2400 range: max-out shows ~100 bars, max-in edits samples.
@@ -5834,6 +5922,7 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
 fn central_panels(ui: &mut egui::Ui, app: &mut App) {
     egui::CentralPanel::default().show(ui, |ui| {
         grid_toolbar(ui, app);
+        clip_props_strip(ui, app);
         ui.separator();
         let sr = app.sample_rate.max(1) as f64;
         let total = app.total_len().max(1);
@@ -5878,6 +5967,83 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                 [egui::pos2(gx, gr.min.y), egui::pos2(gx, gr.max.y)],
                 egui::Stroke::new(1.6, COL_PLAYHEAD),
             );
+        }
+    });
+}
+
+/// Exactly one clip selected: an inline property row under the toolbar —
+/// per-clip **gain** (dB), **fade in** / **fade out** (ms) and length.
+/// Values write through live; the engine snapshot rides on drag release.
+fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
+    if app.sel_clips.len() != 1 {
+        return;
+    }
+    let (t, k, c) = app.sel_clips[0];
+    let Some(cl) = app.arr.tracks[t].lanes[k].clips.get(c).copied() else {
+        return;
+    };
+    let Some(a) = app.assets.get(cl.asset as usize) else {
+        return;
+    };
+    let name = a.name.clone();
+    let sr = app.sample_rate.max(1) as f64;
+    let span = cl.span(a.samples());
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("clip: {name} \u{b7} {:.2}s", span as f64 / sr))
+                .strong()
+                .small(),
+        );
+        // gain, in dB (the house convention: everything the user edits is dB)
+        let mut db: f32 = (20.0f32 * cl.gain.max(1e-4).log10()).clamp(-60.0, 12.0);
+        let r = ui.add(
+            Slider::new(&mut db, -60.0..=12.0)
+                .text("gain")
+                .step_by(0.5)
+                .trailing_fill(true),
+        );
+        if r.changed() {
+            if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
+                cl.gain = 10f32.powf(db / 20.0);
+            }
+        }
+        if r.drag_stopped() {
+            app.push_project();
+        }
+        for (label, cur, is_in) in [
+            ("fade in", cl.fade_in, true),
+            ("fade out", cl.fade_out, false),
+        ] {
+            let mut ms = cur as f64 * 1000.0 / sr;
+            let r = ui.add(
+                Slider::new(&mut ms, 0.0..=5000.0)
+                    .text(label)
+                    .step_by(5.0)
+                    .trailing_fill(true),
+            );
+            if r.changed() {
+                if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
+                    let samples = (ms * sr / 1000.0) as u64;
+                    if is_in {
+                        cl.fade_in = samples;
+                    } else {
+                        cl.fade_out = samples;
+                    }
+                }
+            }
+            if r.drag_stopped() {
+                app.push_project();
+            }
+        }
+        if (cl.gain != 1.0 || cl.fade_in > 0 || cl.fade_out > 0)
+            && ui.button("reset").on_hover_text("Unity gain, no fades").clicked()
+        {
+            if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
+                cl.gain = 1.0;
+                cl.fade_in = 0;
+                cl.fade_out = 0;
+            }
+            app.push_project();
         }
     });
 }
@@ -6218,6 +6384,37 @@ fn lane_row(
                 0.0,
                 Color32::from_rgba_premultiplied(10, 10, 14, 160),
             );
+        }
+        // Fade wedges visualise the envelope the sliders control: the
+        // shaded triangle is where the clip is quieter than full level.
+        let wedge = Color32::from_black_alpha(120);
+        if c.fade_in > 0 {
+            let fx = ((c.fade_in as f64 / sr * px) as f32).min(cres.width());
+            if fx > 1.0 {
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(cres.min.x, cres.min.y),
+                        egui::pos2(cres.min.x, cres.max.y),
+                        egui::pos2(cres.min.x + fx, cres.min.y),
+                    ],
+                    wedge,
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+        if c.fade_out > 0 {
+            let fx = ((c.fade_out as f64 / sr * px) as f32).min(cres.width());
+            if fx > 1.0 {
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(cres.max.x - fx, cres.max.y),
+                        egui::pos2(cres.max.x, cres.min.y),
+                        egui::pos2(cres.max.x, cres.max.y),
+                    ],
+                    wedge,
+                    egui::Stroke::NONE,
+                ));
+            }
         }
         if cx1 - cx0 > 36.0 && !name.is_empty() {
             ui.painter().text(
@@ -9226,12 +9423,7 @@ mod tests {
         app.arr.insert(
             2,
             0,
-            Clip {
-                asset: 0,
-                pos: 9_600,
-                cut: 480,
-                play_len: Some(2_400),
-            },
+            Clip { asset: 0, pos: 9_600, cut: 480, play_len: Some(2_400), gain: 1.0, fade_in: 0, fade_out: 0 },
         );
         app.sel_clips = vec![(0, 0, 0), (2, 0, 0)];
         app.clipboard_copy();
@@ -10401,9 +10593,9 @@ mod tests {
         // around them. NOTE: Clip::new's second arg is the POSITION, so
         // the old "length" numbers stacked all three at the same x; the
         // timeline length goes in play_len.
-        app.arr.insert(0, 0, Clip { asset: a, pos: 60_000, cut: 0, play_len: Some(40_000) });
-        app.arr.insert(0, 0, Clip { asset: a, pos: 130_000, cut: 0, play_len: Some(40_000) });
-        app.arr.insert(0, 0, Clip { asset: a, pos: 200_000, cut: 0, play_len: Some(40_000) });
+        app.arr.insert(0, 0, Clip { asset: a, pos: 60_000, cut: 0, play_len: Some(40_000), gain: 1.0, fade_in: 0, fade_out: 0 });
+        app.arr.insert(0, 0, Clip { asset: a, pos: 130_000, cut: 0, play_len: Some(40_000), gain: 1.0, fade_in: 0, fade_out: 0 });
+        app.arr.insert(0, 0, Clip { asset: a, pos: 200_000, cut: 0, play_len: Some(40_000), gain: 1.0, fade_in: 0, fade_out: 0 });
         frame(&mut app, &ctx, vec![]);
         let body = {
             let c = COL_CLIP.linear_multiply(0.45);
@@ -10490,5 +10682,75 @@ mod tests {
             g.iter().any(|s| s == "C3"),
             "root-note slider must paint 'C3' (default 48), galleys: {g:?}"
         );
+    }
+
+    /// v0.9: bare S splits the selected clip at the playhead; the clip
+    /// property strip (gain / fade in / fade out) paints for exactly one
+    /// selection and hides otherwise.
+    #[test]
+    fn v09_ui_split_gain_strip() {
+        fn has_text(app: &mut App, _ctx: &egui::Context, needle: &str) -> bool {
+            // Fresh context: egui skips `run` on a warm context that sees no
+            // new input, which would yield empty shapes. The App itself holds
+            // all state, so a cold context paints the same frame.
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let texts: Vec<String> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            texts.iter().any(|x| x.contains(needle))
+        }
+
+        let mut app = headless_app("v09split");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 96_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "sine".into(),
+            std::path::PathBuf::from("/tmp/v09-sine.wav"),
+            data,
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.select_one((0, 0, 0));
+        app.last_click_track = Some(0);
+        app.backend.engine.seek_to(48_000);
+        frame_keys(&mut app, &ctx, vec![]);
+
+        // Property strip for exactly one selected clip.
+        assert!(has_text(&mut app, &ctx, "clip: sine"), "strip names the clip");
+        assert!(has_text(&mut app, &ctx, "fade in"), "fade-in slider present");
+        assert!(has_text(&mut app, &ctx, "fade out"), "fade-out slider present");
+
+        // S splits at the playhead.
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        let lane = &app.arr.tracks[0].lanes[0];
+        assert_eq!(lane.clips.len(), 2, "S split the clip");
+        assert_eq!(lane.clips[1].pos, 48_000);
+        assert_eq!(lane.clips[1].cut, 48_000, "right half resumes the source");
+        assert_eq!(lane.clips[0].play_len, Some(48_000));
+
+        // Playhead at a clip boundary is not inside anything: no-op.
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.arr.tracks[0].lanes[0].clips.len(), 2, "edge is not a split");
+
+        // No selection: the strip is gone.
+        app.sel_clips.clear();
+        frame_keys(&mut app, &ctx, vec![]);
+        assert!(!has_text(&mut app, &ctx, "clip: sine"), "strip hides without a selection");
     }
 }

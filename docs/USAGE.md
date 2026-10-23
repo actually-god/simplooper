@@ -223,6 +223,24 @@ The preview path is the same: piano-roll and rack auditions of MIDI go
 through the *picked track's* synth + chain, so what you audition is what
 mixes.
 
+## Clip gain, fades & splitting
+
+Click exactly **one clip** and a property row appears under the grid
+toolbar: **gain** (dB; scales the clip — audio samples and MIDI note
+velocities alike), **fade in** / **fade out** (ms; linear ramps applied
+sample-accurately in playback, bounce and export), plus clip length. A
+dark triangle drawn into the clip corner previews each fade; **reset**
+returns the clip to unity, no fades. Fades live on the clip, not the
+asset — the same take can fade differently in two places.
+
+**✂ split** (toolbar) or **`S`** cuts every selected clip at the
+playhead into two halves that keep playing seamlessly (the right half
+continues the source at the matching offset). The playhead must be
+strictly inside the clip; fades stay with the left half, and the halves
+keep the selection so repeated `S` walks a long clip into pieces. This
+is the standard way to place a crossfade: overlap two faded clips on
+child lanes, or fade the halves around a cut.
+
 ## Piano roll
 
 The grid toolbar's **♫ Piano roll** opens a full-window MIDI note editor.
@@ -397,7 +415,8 @@ in **any** text box, and auto-repeat never re-fires):
 | `Ctrl+A` | select all clips |
 | `Ctrl+C` | copy the selection (or the selected rack asset) |
 | `Ctrl+V` | paste at the playhead, on the track nearest your last click |
-| `Ctrl+D` | duplicate the selection |
+| `Ctrl+D` | duplicate the selection at the playhead |
+| `S` | split the selected clip(s) at the playhead |
 
 While the **piano roll has focus**, `Ctrl + A/C/V` and `Delete` edit notes
 instead, and transport keys stay quiet until focus leaves the roll.

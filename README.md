@@ -67,6 +67,10 @@ guide](docs/AGENT-GUIDE.md)
   note names), or **any scanned VSTi**. Parameters open in a sliders window;
   VST2 instruments can open their native editor window (see
   [docs/PLUGINS.md](docs/PLUGINS.md)).
+- **Clip polish** — one click on a clip opens its property row: per-clip
+  **gain** (dB), **fade in / out** (ms, drawn as wedges on the clip),
+  and **✂ split** (`S`) cuts clips at the playhead into seamless halves.
+
 - **Piano roll** — the grid toolbar's **♫ Piano roll** opens a full-window
   note editor: with a MIDI clip or rack asset selected it **opens that
   asset for editing** (save overwrites it in place), otherwise it starts a
@@ -433,4 +437,4 @@ included, as long as the copyright notice travels with substantial copies.
 - [x] MIDI instruments: per-track synths (scripted + VSTi), piano roll,
       MIDI recording (MREC)
 - [x] VST2/VST3 hosting: one chain per track, params, native VST2 editors
-- [ ] Clip-level fades, split-at-playhead, per-clip gain strips
+- [x] Clip-level fades, split-at-playhead, per-clip gain (property row)

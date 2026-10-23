@@ -1145,21 +1145,20 @@ impl Engine {
                         }
                         s
                     };
-                    // Trimmed start shifts the read offset; `play_len` past
-                    // the source contributes silence (nothing summed).
+                    // The clip is pinned at `pos` and the source starts at
+                    // `cut` (identical to the live callback); `play_len`
+                    // past the source contributes silence (nothing summed).
                     let alen = data.len() as u64;
-                    let dstart = (cl.pos + cl.cut).min(cl.pos + alen) as usize;
+                    let dstart = cl.pos as usize;
                     let dend = cl
                         .data_end(alen)
                         .min(cl.end(alen))
                         .min(len as u64)
-                        .max(cl.pos + cl.cut) as usize;
-                    let dend = dend.max(dstart);
-                    // `start` may sit left of dstart? never: dstart >= pos.
-                    let hi = dend.min(dstart + data.len());
-                    for (j, k) in (dstart..hi).enumerate() {
+                        .max(cl.pos) as usize;
+                    for k in dstart..dend {
                         any = true;
-                        let m = mix(data[j]);
+                        let s = data[(cl.cut + (k as u64 - cl.pos)) as usize];
+                        let m = mix(s) * cl.gain * cl.fade_at(k as u64, alen);
                         if span {
                             trk[k] += m;
                         } else {
@@ -1305,21 +1304,32 @@ impl Engine {
                 s
             };
             let alen_u = data.len() as u64;
-            let dstart = (cl.pos + cl.cut) as usize;
+            // Same clip-pinned-at-pos mapping as live playback and
+            // render_tracks; the selection window slices the output.
+            let dstart = cl.pos as usize;
             let dend = cl
                 .data_end(alen_u)
                 .min(cl.end(alen_u))
-                .min(cl.pos + alen_u);
-            let hi = (dend as usize).min(dstart + data.len());
-            let mut chunk: Vec<f32> = data[..hi - dstart].iter().map(|x| mix(*x)).collect();
+                .min(cl.pos + alen_u) as usize;
+            let mut chunk: Vec<f32> = (dstart..dend)
+                .map(|k| data[(cl.cut + (k as u64 - cl.pos)) as usize])
+                .enumerate()
+                .map(|(j, x)| {
+                    mix(x) * cl.gain * cl.fade_at((dstart + j) as u64, alen_u)
+                })
+                .collect();
             if span {
                 // Fresh full-chain pass over this chunk (selection bounces
                 // stay clip-local, mirroring the scripted per-clip rule).
                 run_chain_over(&chain, sr, &mut chunk);
             }
-            for (j, k) in (dstart..hi).enumerate() {
-                let o = (k - from as usize).min(len - 1);
-                out[o] += chunk[j] * pdown;
+            for (j, k) in (dstart..dend).enumerate() {
+                if k >= from as usize {
+                    let o = k - from as usize;
+                    if o < len {
+                        out[o] += chunk[j] * pdown;
+                    }
+                }
             }
         }
         Some((from, out))
@@ -2083,6 +2093,16 @@ struct ClipEntry {
     ptr: *const f32,
     i0: usize,
     i1: usize,
+    /// Per-clip gain (linear) and a piecewise fade envelope evaluated at
+    /// ABSOLUTE timeline samples. No fade: `fi_end = 0` and
+    /// `fo_start = u64::MAX` so both window tests miss for every sample.
+    gain: f32,
+    pos: u64,
+    fi_end: u64,
+    fi_step: f32,
+    fo_start: u64,
+    fo_end: u64,
+    fo_step: f32,
 }
 
 unsafe impl Send for ClipEntry {}
@@ -2240,7 +2260,13 @@ fn stage_midi_events(
             continue;
         }
         let on = base + s0;
-        ev.push((on, 3, note.ch, note.note, note.vel));
+        let vel = (note.vel as f32 * cl.gain * cl.fade_at(on, avail))
+            .clamp(0.0, 127.0)
+            .round() as u8;
+        if vel == 0 {
+            continue;
+        }
+        ev.push((on, 3, note.ch, note.note, vel));
         let len_s = pat.ticks_to_samples(note.len, sr).max(1);
         ev.push((on + len_s, 0, note.ch, note.note, 0));
     }
@@ -2408,7 +2434,12 @@ impl Proc {
                         let on = base + s0;
                         let len_s = pat.ticks_to_samples(note.len, sr).max(1);
                         if on >= p0 && on < span_end {
-                            midi_ev.push(((on - p0) as usize, 3, note.ch, note.note, note.vel));
+                            let vel = (note.vel as f32 * cl.gain * cl.fade_at(on, avail))
+                                .clamp(0.0, 127.0)
+                                .round() as u8;
+                            if vel > 0 {
+                                midi_ev.push(((on - p0) as usize, 3, note.ch, note.note, vel));
+                            }
                             let off_tl = on + len_s;
                             if off_tl >= p0 && off_tl < span_end {
                                 midi_ev.push(((off_tl - p0) as usize, 0, note.ch, note.note, 0));
@@ -2782,11 +2813,21 @@ impl Proc {
                         let off = (cl.cut + (wd0 - dstart)) as usize;
                         let off = off.min(data.len().saturating_sub(1));
                         let base = unsafe { data.as_ptr().add(off) };
+                        let span = cl.span(alen);
+                        let fi = cl.fade_in.min(span / 2);
+                        let fo = cl.fade_out.min(span / 2);
                         entries.push(ClipEntry {
                             track: t as u8,
                             ptr: base,
                             i0: (wd0 - p0) as usize,
                             i1: (wd1 - p0) as usize,
+                            gain: cl.gain,
+                            pos: cl.pos,
+                            fi_end: if fi > 0 { cl.pos + fi } else { 0 },
+                            fi_step: if fi > 0 { 1.0 / fi as f32 } else { 0.0 },
+                            fo_start: if fo > 0 { cl.end(alen) - fo } else { u64::MAX },
+                            fo_end: cl.end(alen),
+                            fo_step: if fo > 0 { 1.0 / fo as f32 } else { 0.0 },
                         });
                     }
                 }
@@ -3213,7 +3254,14 @@ impl ProcessHandler for Proc {
                     acc.fill(0.0);
                     for e in entries.iter() {
                         if i >= e.i0 && i < e.i1 {
-                            acc[e.track as usize] += unsafe { *e.ptr.add(i - e.i0) };
+                            let mut v = unsafe { *e.ptr.add(i - e.i0) } * e.gain;
+                            let s = p0 + i as u64;
+                            if s < e.fi_end {
+                                v *= (s - e.pos) as f32 * e.fi_step;
+                            } else if s >= e.fo_start {
+                                v *= (e.fo_end - s) as f32 * e.fo_step;
+                            }
+                            acc[e.track as usize] += v;
                         }
                     }
                     if has_midi {
@@ -3622,6 +3670,99 @@ mod tests {
             assert!(e.rec_sample(0, 0.0));
         }
         assert_eq!(e.rec_len_of(0), LOOP_CAP);
+    }
+
+    /// v0.9: per-clip gain + fades must be sample-accurate in the mixdown
+    /// (this exercises the export path; the live path shares `fade_at`).
+    #[test]
+    fn v09_clip_gain_and_fade_shape_render() {
+        let a: Arc<[f32]> = Arc::from(vec![1.0f32; 4000]);
+        let mut arr = Arrangement::new();
+        let mut cl = Clip::new(0, 0);
+        cl.gain = 0.5;
+        cl.fade_in = 1000;
+        cl.fade_out = 1000;
+        arr.insert(0, 0, cl);
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![a]), Arc::new(arr), 4000);
+        let out = e.render_project().expect("clips exist");
+        assert!(out[0].abs() < 1e-4, "fade-in starts silent, got {}", out[0]);
+        assert!((out[500] - 0.25).abs() < 1e-3, "mid fade-in ~ half gain");
+        assert!((out[2000] - 0.5).abs() < 1e-3, "body carries the gain");
+        assert!((out[3500] - 0.25).abs() < 1e-3, "mid fade-out ~ half gain");
+        assert!(out[3999].abs() < 1e-3, "fade-out lands on silence");
+    }
+
+    /// v0.9: splitting a clip must not change a single sample — the right
+    /// half continues the source at the matching offset.
+    #[test]
+    fn v09_split_renders_identically() {
+        let a: Arc<[f32]> = Arc::from(
+            (0..4000)
+                .map(|k| if k < 2000 { 0.25f32 } else { 0.75 })
+                .collect::<Vec<f32>>(),
+        );
+        let whole = Clip::new(0, 0);
+        let mut arr1 = Arrangement::new();
+        arr1.insert(0, 0, whole);
+        let e1 = Engine::new();
+        e1.set_project(Arc::new(vec![a.clone()]), Arc::new(arr1), 4000);
+        let before = e1.render_project().unwrap();
+
+        let (l, r) = whole.split_at(2000, a.len() as u64).unwrap();
+        let mut arr2 = Arrangement::new();
+        arr2.insert(0, 0, l);
+        arr2.insert(0, 0, r);
+        let e2 = Engine::new();
+        e2.set_project(Arc::new(vec![a]), Arc::new(arr2), 4000);
+        let after = e2.render_project().unwrap();
+        let diff = before
+            .iter()
+            .zip(after.iter())
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff < 1e-9, "split changed the render by {diff}");
+    }
+
+    /// v0.9: MIDI clips carry the same clip properties — gain and the fade
+    /// ramp scale NOTE VELOCITY (reaper-style item volume), silent parts
+    /// drop the note entirely.
+    #[test]
+    fn v09_fade_scales_midi_velocity() {
+        use crate::midipat::{Pattern, PPQ};
+        let mut pat = Pattern::new(120);
+        // beat 0 (fade-in, sample 0), beat 1 (24000 samples: past the fade)
+        for start in [0u32, PPQ as u32] {
+            pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start,
+                len: (PPQ / 2) as u32,
+            });
+        }
+        let mut cl = Clip::new(0, 0);
+        cl.fade_in = 4800; // 100 ms
+        let mut ev = Vec::new();
+        stage_midi_events(&pat, &cl, 48_000, &mut ev);
+        let ons: Vec<_> = ev.iter().filter(|e| e.1 == 3).cloned().collect();
+        assert_eq!(ons.len(), 1, "note inside the silent fade start drops");
+        assert_eq!(ons[0].0, 24000);
+        assert_eq!(ons[0].4, 100);
+        // Pure gain halves the velocity; 4x clamps at 127.
+        let mut cl2 = Clip::new(0, 0);
+        cl2.gain = 0.5;
+        ev.clear();
+        stage_midi_events(&pat, &cl2, 48_000, &mut ev);
+        let ons: Vec<_> = ev.iter().filter(|e| e.1 == 3).cloned().collect();
+        assert_eq!(ons.len(), 2);
+        assert!(ons.iter().all(|e| e.4 == 50), "gain 0.5: {ons:?}");
+        let mut cl3 = Clip::new(0, 0);
+        cl3.gain = 4.0;
+        ev.clear();
+        stage_midi_events(&pat, &cl3, 48_000, &mut ev);
+        let ons: Vec<_> = ev.iter().filter(|e| e.1 == 3).cloned().collect();
+        assert!(ons.iter().all(|e| e.4 == 127), "gain clamps: {ons:?}");
     }
 
     /// Helper: two assets, track 0 clip at 0, track 1 clip offset by 1000.

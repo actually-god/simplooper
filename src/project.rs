@@ -49,6 +49,18 @@ pub struct ProjClip {
     /// Played length in samples; null/absent = rest of the source (v3).
     #[serde(default)]
     pub play_len: Option<u64>,
+    /// Per-clip gain, linear (v8; absent = 1.0 — never serde-default 0!).
+    #[serde(default = "unity_gain")]
+    pub gain: f32,
+    /// Fade-in / fade-out lengths in samples (v8; absent = 0).
+    #[serde(default)]
+    pub fade_in: u64,
+    #[serde(default)]
+    pub fade_out: u64,
+}
+
+fn unity_gain() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,12 +233,37 @@ mod tests {
                 on: true,
                 fx: vec![TrackFxSave { stem: "template".into(), params: vec![1.0] }],
                 chain: Vec::new(),
-                lanes: vec![vec![ProjClip { asset: 0, pos: 0, cut: 0, play_len: None }], vec![]],
+                lanes: vec![vec![ProjClip { asset: 0, pos: 0, cut: 0, play_len: None, gain: 1.0, fade_in: 0, fade_out: 0 }], vec![]],
             }],
             assets: vec![ProjAsset { name: "kick".into(), file: "/x/kick.wav".into() }],
             track_synths: vec![Some("piano".into())],
             track_synth_params: vec![vec![0.5]],
         }
+    }
+
+    #[test]
+    fn v09_project_roundtrip_keeps_clip_properties() {
+        // Old files (no clip-property keys) must load at UNITY gain — a
+        // plain serde default of 0.0 would silently mute every legacy clip.
+        let json = r#"{"asset": 3, "pos": 10, "cut": 5, "play_len": null}"#;
+        let pc: ProjClip = serde_json::from_str(json).unwrap();
+        assert_eq!(pc.gain, 1.0);
+        assert_eq!((pc.fade_in, pc.fade_out), (0, 0));
+        // Round trip keeps the properties.
+        let mut pc = pc;
+        pc.gain = 0.25;
+        pc.fade_in = 4800;
+        pc.fade_out = 9600;
+        let back: ProjClip = serde_json::from_str(&serde_json::to_string(&pc).unwrap()).unwrap();
+        assert_eq!((back.gain, back.fade_in, back.fade_out), (0.25, 4800, 9600));
+        // Full document with properties in it still loads.
+        let mut p = sample();
+        p.tracks[0].lanes[0][0].gain = 0.5;
+        p.tracks[0].lanes[0][0].fade_in = 100;
+        let s = serde_json::to_string(&p).unwrap();
+        let back: Project = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.tracks[0].lanes[0][0].gain, 0.5);
+        assert_eq!(back.tracks[0].lanes[0][0].fade_in, 100);
     }
 
     #[test]

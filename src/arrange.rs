@@ -37,12 +37,19 @@ pub struct Clip {
     /// Timeline length to play; `None` = as much of the source as remains
     /// after `cut`. Values past the source pad with silence.
     pub play_len: Option<u64>,
+    /// Per-clip playback gain, LINEAR (1.0 = unity; the UI edits dB).
+    /// Scales audio samples and MIDI note velocities alike.
+    pub gain: f32,
+    /// Fade-in length in timeline samples (linear 0 → gain).
+    pub fade_in: u64,
+    /// Fade-out length in timeline samples (linear gain → 0 at clip end).
+    pub fade_out: u64,
 }
 
 impl Clip {
     /// New untrimmed clip.
     pub fn new(asset: u32, pos: u64) -> Self {
-        Clip { asset, pos, cut: 0, play_len: None }
+        Clip { asset, pos, cut: 0, play_len: None, gain: 1.0, fade_in: 0, fade_out: 0 }
     }
     /// Samples of playable source left after `cut`.
     pub fn avail(&self, alen: u64) -> u64 {
@@ -60,6 +67,45 @@ impl Clip {
     /// Timeline sample where the SOURCE data ends (silence beyond this).
     pub fn data_end(&self, alen: u64) -> u64 {
         self.pos.saturating_add(self.avail(alen))
+    }
+    /// Split at absolute timeline sample `at` (strictly inside the clip's
+    /// span) into the left/right halves. `None` when `at` is not a valid
+    /// cut point. Works identically for audio and MIDI clips: the right
+    /// half keeps playing the same asset from the matching source offset.
+    /// Fades stay whole on the LEFT half (fading a fragment that no longer
+    /// ends where the fade lived would move it silently).
+    pub fn split_at(&self, at: u64, alen: u64) -> Option<(Clip, Clip)> {
+        if at <= self.pos || at >= self.end(alen) {
+            return None;
+        }
+        let left = Clip { play_len: Some(at - self.pos), fade_out: 0, ..*self };
+        let right = Clip {
+            pos: at,
+            cut: self.cut + (at - self.pos),
+            play_len: self.play_len.map(|l| l - (at - self.pos)),
+            fade_in: 0,
+            ..*self
+        };
+        Some((left, right))
+    }
+    /// Linear fade multiplier (0..1) at absolute timeline sample `s`,
+    /// clamped to the clip's fadeable length (a fade longer than the clip
+    /// still reaches the other end exactly). 1.0 outside both fades.
+    pub fn fade_at(&self, s: u64, alen: u64) -> f32 {
+        let span = self.span(alen);
+        let fi = self.fade_in.min(span / 2);
+        let fo = self.fade_out.min(span / 2);
+        if s < self.pos || s >= self.end(alen) {
+            return 0.0;
+        }
+        let off = s - self.pos;
+        if fi > 0 && off < fi {
+            return off as f32 / fi as f32;
+        }
+        if fo > 0 && off + fo >= span {
+            return (span - off) as f32 / fo as f32;
+        }
+        1.0
     }
 }
 
@@ -357,5 +403,59 @@ mod tests {
         assert!(a.remove_clip(2, 0, 5).is_none());
         assert!(a.remove_clip(9, 0, 0).is_none());
         assert!(a.remove_clip(2, 4, 0).is_none());
+    }
+
+    #[test]
+    fn v09_split_at_playhead_seamless() {
+        // A 1000-sample clip cut 100, split at 400: halves tile exactly,
+        // the right half continues the source at the matching offset, and
+        // play_len/None propagate.
+        let cl = Clip { asset: 3, pos: 1000, cut: 100, play_len: Some(1000), ..Clip::new(3, 1000) };
+        let alen = 5000;
+        let (l, r) = cl.split_at(1400, alen).expect("inside");
+        assert_eq!((l.pos, l.cut, l.play_len), (1000, 100, Some(400)));
+        assert_eq!((r.pos, r.cut, r.play_len), (1400, 500, Some(600)));
+        assert_eq!(l.end(alen) + r.span(alen), cl.end(alen)); // tile exactly
+        assert_eq!(l.span(alen) + r.span(alen), cl.span(alen));
+        // play_len None -> right None too (rest of source).
+        let cl2 = Clip { asset: 0, pos: 0, cut: 0, play_len: None, ..Clip::new(0, 0) };
+        let (_, r2) = cl2.split_at(200, 5000).unwrap();
+        assert_eq!(r2.play_len, None);
+        assert_eq!(r2.cut, 200);
+        // Edges are not splits; gain rides along.
+        assert!(cl.split_at(1000, alen).is_none());
+        assert!(cl.split_at(2000, alen).is_none());
+        let mut g = cl;
+        g.gain = 0.5;
+        let (l, _) = g.split_at(1200, alen).unwrap();
+        assert_eq!(l.gain, 0.5);
+    }
+
+    #[test]
+    fn v09_clip_fade_ramp_is_linear() {
+        let alen = 10_000;
+        let cl = Clip {
+            asset: 0,
+            pos: 1000,
+            cut: 0,
+            play_len: Some(1000),
+            gain: 1.0,
+            fade_in: 100,
+            fade_out: 200,
+        };
+        assert_eq!(cl.fade_at(999, alen), 0.0); // outside the clip
+        assert_eq!(cl.fade_at(1000, alen), 0.0); // fade-in starts silent
+        assert!((cl.fade_at(1050, alen) - 0.5).abs() < 1e-6); // linear mid
+        assert_eq!(cl.fade_at(1100, alen), 1.0); // after the ramp: unity
+        assert!((cl.fade_at(1900, alen) - 0.5).abs() < 1e-6); // fade-out mid
+        assert!((cl.fade_at(1999, alen) - 0.005).abs() < 1e-6); // ~0 at end
+        // Oversized fades clamp to half the span so they never cross.
+        let big = Clip { fade_in: 9999, fade_out: 9999, ..cl };
+        assert!((big.fade_at(1500, alen) - 1.0).abs() < 1e-9);
+        assert!(big.fade_at(1499, alen) < 1.0 && big.fade_at(1501, alen) < 1.0);
+        // No fades: unity everywhere inside.
+        let flat = Clip { fade_in: 0, fade_out: 0, ..cl };
+        assert_eq!(flat.fade_at(1000, alen), 1.0);
+        assert_eq!(flat.fade_at(1999, alen), 1.0);
     }
 }
