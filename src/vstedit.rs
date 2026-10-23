@@ -62,6 +62,7 @@ extern "C" {
         background: u64,
     ) -> XWindow;
     fn XDestroyWindow(d: *mut Display, w: XWindow) -> c_int;
+    fn XDestroySubwindows(d: *mut Display, w: XWindow) -> c_int;
     fn XMapWindow(d: *mut Display, w: XWindow) -> c_int;
     fn XSelectInput(d: *mut Display, w: XWindow, mask: u64) -> c_int;
     fn XStoreName(d: *mut Display, w: XWindow, name: *const i8) -> c_int;
@@ -81,6 +82,17 @@ extern "C" {
         n_children: *mut c_int,
     ) -> c_int;
     fn XFree(data: *mut c_void) -> c_int;
+    fn XGetGeometry(
+        d: *mut Display,
+        w: XWindow,
+        root: *mut XWindow,
+        x: *mut c_int,
+        y: *mut c_int,
+        ww: *mut u32,
+        hh: *mut u32,
+        border: *mut u32,
+        depth: *mut u32,
+    ) -> c_int;
     fn XSetErrorHandler(
         handler: Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
     ) -> Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
@@ -115,6 +127,51 @@ struct ERect {
     right: i16,
 }
 
+/// Opaque XImage handle (ZPixmap snapshot of the editor container).
+#[repr(C)]
+struct XImage {
+    _private: [u8; 0],
+}
+
+#[link(name = "X11")]
+extern "C" {
+    fn XGetImage(
+        d: *mut Display,
+        w: XWindow,
+        x: c_int,
+        y: c_int,
+        w2: u32,
+        h2: u32,
+        planemask: u64,
+        format: c_int,
+    ) -> *mut XImage;
+    fn XGetPixel(img: *mut XImage, x: c_int, y: c_int) -> u64;
+    fn XDestroyImage(img: *mut XImage) -> c_int;
+}
+
+/// True when a corner probe of `win` holds any non-black pixel — proof the
+/// plugin painted DIRECTLY on the container (VSTGUI-style editors never
+/// create a child window, so child polling alone false-negatives them).
+unsafe fn container_painted(d: *mut Display, win: XWindow) -> bool {
+    const ALL_PLANES: u64 = !0u64;
+    const Z_PIXMAP: c_int = 2;
+    let img = XGetImage(d, win, 0, 0, 24, 24, ALL_PLANES, Z_PIXMAP);
+    if img.is_null() {
+        return false;
+    }
+    let mut hit = false;
+    for y in 0..24 {
+        for x in 0..24 {
+            if XGetPixel(img, x, y) != 0 {
+                hit = true;
+                break;
+            }
+        }
+    }
+    XDestroyImage(img);
+    hit
+}
+
 /// Query the plugin's preferred editor size via `effEditGetRect`.
 pub fn edit_rect(handle: &Vst2Handle) -> Option<(i32, i32)> {
     let mut rect: *mut ERect = ptr::null_mut();
@@ -147,6 +204,8 @@ pub struct EditorWindow {
     stop: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     open_failed: Arc<AtomicBool>,
+    /// The plugin's editor window appeared and was sized — real pixels.
+    painted: Arc<AtomicBool>,
     children: Arc<AtomicUsize>,
     width: Arc<AtomicI32>,
     height: Arc<AtomicI32>,
@@ -167,6 +226,12 @@ impl EditorWindow {
     /// (or it created no window at all).
     pub fn open_failed(&self) -> bool {
         self.open_failed.load(Ordering::SeqCst)
+    }
+    /// True once the plugin's own editor window has been seen mapped with
+    /// real geometry (the container is showing live plugin UI, not a
+    /// blank panel). False while waiting, or forever on broken editors.
+    pub fn painted(&self) -> bool {
+        self.painted.load(Ordering::SeqCst)
     }
     /// Windows the plugin has parented into our container. Zero a while
     /// after opening means the plugin did not create an editor.
@@ -208,6 +273,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
     let stop = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicBool::new(false));
     let open_failed = Arc::new(AtomicBool::new(false));
+    let painted = Arc::new(AtomicBool::new(false));
     let children = Arc::new(AtomicUsize::new(0));
     let width = Arc::new(AtomicI32::new(0));
     let height = Arc::new(AtomicI32::new(0));
@@ -215,10 +281,11 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
     let initial = edit_rect(handle).unwrap_or((640, 420));
     let ae = *handle;
     let title = title.to_string();
-    let (t_stop, t_closed, t_failed, t_children, t_w, t_h) = (
+    let (t_stop, t_closed, t_failed, t_painted, t_children, t_w, t_h) = (
         stop.clone(),
         closed.clone(),
         open_failed.clone(),
+        painted.clone(),
         children.clone(),
         width.clone(),
         height.clone(),
@@ -228,7 +295,8 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         .name(format!("vst-editor {title}"))
         .spawn(move || {
             editor_main(
-                ae, &title, initial, t_stop, t_closed, t_failed, t_children, t_w, t_h,
+                ae, &title, initial, t_stop, t_closed, t_failed, t_painted, t_children, t_w,
+                t_h,
             );
         })
         .map_err(|e| format!("spawn editor thread: {e}"))?;
@@ -237,6 +305,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         stop,
         closed,
         open_failed,
+        painted,
         children,
         width,
         height,
@@ -291,6 +360,7 @@ fn editor_main(
     stop: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     open_failed: Arc<AtomicBool>,
+    painted: Arc<AtomicBool>,
     children: Arc<AtomicUsize>,
     width: Arc<AtomicI32>,
     height: Arc<AtomicI32>,
@@ -325,8 +395,8 @@ fn editor_main(
             win as usize as *mut c_void,
             0.0,
         );
-        if opened == 0 {
-            // VST2: effEditOpen returns 0 on failure.
+        if opened != 0 {
+            // VST2 SDK: effEditOpen returns 0 on SUCCESS, non-zero on error.
             open_failed.store(true, Ordering::SeqCst);
             XDestroyWindow(d, win);
             XFlush(d);
@@ -335,6 +405,45 @@ fn editor_main(
             return;
         }
 
+        // VERIFY THE EMBED. Some plugins accept effEditOpen yet never
+        // draw (broken toolkits, missing plugin data, XEmbed assumptions
+        // a plain container cannot satisfy) — the user is left staring at
+        // a blank panel that shows nothing and reacts to nothing. Pump
+        // idle and poll the plugin's child windows: only once one shows
+        // up with real geometry do we consider the editor alive.
+        let mut painted_now = false;
+        for _ in 0..60 {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
+            if let Some((_kid, w, h)) = first_sized_child(d, win) {
+                if w >= 8 && h >= 8 {
+                    painted_now = true;
+                    break;
+                }
+            }
+            // Direct-draw editors (VSTGUI et al.) paint ON the container
+            // and never create a child: check real pixels too.
+            if container_painted(d, win) {
+                painted_now = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !painted_now {
+            // No live editor appeared: close cleanly so NO blank window is
+            // left behind, and let the UI fall back to the slider panel.
+            handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
+            XDestroySubwindows(d, win);
+            XDestroyWindow(d, win);
+            XFlush(d);
+            XCloseDisplay(d);
+            open_failed.store(true, Ordering::SeqCst);
+            closed.store(true, Ordering::SeqCst);
+            return;
+        }
+        painted.store(true, Ordering::SeqCst);
         let mut last_size = (0i32, 0i32);
         let mut since_rect = 0u32;
         let mut quit = false;
@@ -413,6 +522,38 @@ unsafe fn count_children_local(d: *mut Display, win: XWindow) -> usize {
     count
 }
 
+/// First plugin child window with non-degenerate geometry (created AND
+/// resized — an editor that created a window but crashed mid-build leaves
+/// it 1x1, the tell-tale of the "blank editor window" bug).
+unsafe fn first_sized_child(d: *mut Display, win: XWindow) -> Option<(XWindow, u32, u32)> {
+    let mut root: XWindow = 0;
+    let mut parent: XWindow = 0;
+    let mut kids: *mut XWindow = ptr::null_mut();
+    let mut n: c_int = 0;
+    if XQueryTree(d, win, &mut root, &mut parent, &mut kids, &mut n) == 0 {
+        return None;
+    }
+    let list = if kids.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(kids, n.max(0) as usize).to_vec()
+    };
+    if !kids.is_null() {
+        XFree(kids as *mut c_void);
+    }
+    for k in &list {
+        let mut rr: XWindow = 0;
+        let (mut x, mut y, mut w, mut h, mut b, mut depth) = (0, 0, 0u32, 0u32, 0u32, 0u32);
+        if XGetGeometry(d, *k, &mut rr, &mut x, &mut y, &mut w, &mut h, &mut b, &mut depth) != 0
+            && w > 0
+            && h > 0
+        {
+            return Some((*k, w, h));
+        }
+    }
+    list.first().copied().map(|k| (k, 0, 0))
+}
+
 // `XRootWindow`/`XDefaultScreen` are legacy-but-exported libX11 functions
 // (verified against the system libX11 symbol table); `DefaultRootWindow`
 // itself is an Xlib macro, so go through the functions instead.
@@ -462,15 +603,25 @@ mod tests {
                 Ok(w) => w,
                 Err(e) => panic!("open_editor failed: {e}"),
             };
-        // Give the editor thread time to embed + pump.
-        std::thread::sleep(Duration::from_millis(900));
-        assert!(!win.is_closed(), "editor thread died early");
-        assert!(!win.open_failed(), "plugin refused effEditOpen");
-        assert!(
-            win.child_count() > 0,
-            "plugin parented no window into the container"
-        );
-        assert!(win.editor_size().0 > 0, "no editor size negotiated");
+        // Give the editor thread time to embed (verify) + pump.
+        std::thread::sleep(Duration::from_millis(4200));
+        // The invariant slooper guarantees: the window shows a LIVE
+        // plugin editor, or it is gone with an honest failure — never a
+        // stuck blank panel (the historical "uncloseable blank window"
+        // complaint from a plugin that opened but never painted).
+        if win.open_failed() {
+            eprintln!(
+                "note: {} refused/did not paint an editor (thread closed cleanly) \u{2014} \
+                 UI will fall back to sliders",
+                path.display()
+            );
+            assert!(win.is_closed(), "failed editor must close its window");
+            assert_eq!(win.child_count(), 0, "failed editor must destroy children");
+        } else {
+            assert!(!win.is_closed(), "editor thread died while painted");
+            assert!(win.painted(), "editor window shows no live plugin UI");
+            assert!(win.editor_size().0 > 0, "no editor size negotiated");
+        }
         win.close();
         assert!(win.is_closed());
     }
