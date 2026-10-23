@@ -31,7 +31,7 @@ pub const API_SRC: &str = include_str!("synth_api.rs");
 pub const BUNDLED: &[(&str, &str)] = &[
     ("piano.rs", include_str!("../synths/piano.rs")),
     ("sampler.rs", include_str!("../synths/sampler.rs")),
-    // Attribution for the piano's modal model (MIT, fan455); the registry
+    // Attribution for the piano samples (TimGM6mb, GPL-2); the registry
     // only compiles *.rs, so this rides along as documentation.
     (
         "THIRD-PARTY-NOTICES.md",

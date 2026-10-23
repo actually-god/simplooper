@@ -1,40 +1,31 @@
 # Third-party notices
 
-## fan455_piano_synthesis — the piano modal model
+## TimGM6mb soundfont — the recorded piano samples
 
-`slooper/synths/piano.rs` is a real-time translation of the string +
-hammer *modal synthesis* model from:
+`slooper/synths/piano.rs` embeds a PCM multisample blob (built by
+`tools/build_piano.py`) derived from:
 
-> **fan455_piano_synthesis** — an open-source piano sound synthesis
-> project using physical modelling.
-> Copyright (c) 2024 fan455
-> https://github.com/fan455/fan455_piano_synthesis
-> Working paper: arXiv:2409.03481
+> **TimGM6mb.sf2** — a compact General-MIDI soundfont by Tim Brechbill,
+> taken from Debian upstream:
+> http://deb.debian.org/debian/pool/main/t/timgm6mb-soundfont/
+> (timgm6mb-soundfont 1.3, `TimGM6mb.sf2`)
 
-The bundled piano keeps that project's core note-making algorithm — a
-sum of exponentially-decaying modal partials whose damping grows with
-mode number, 1/n spectral amplitudes, alternating initial phases for a
-hammer-struck string, and the hammer-force attack transient — adapted to
-an allocation-free fixed-voice real-time voice and extended with standard
-stiff-string inharmonicity and damper-pedal behaviour.
+The blob contains resampled grand-piano zones (pitch-verified per key)
+from that soundfont; the zone selection, loop points and player code are
+slooper's own. The soundfont is licensed under the GNU GPL version 2 (see
+the `debian/copyright` file of the upstream source package for the
+authoritative notice); the sample data shipped inside `piano.rs` is
+therefore covered by GPL-2 as well. The full GPL-2 text is at
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt .
 
-Licensed under the MIT License:
+## fan455_piano_synthesis — model of earlier releases (≤ 0.7)
 
-> Permission is hereby granted, free of charge, to any person obtaining a
-> copy of this software and associated documentation files (the
-> "Software"), to deal in the Software without restriction, including
-> without limitation the rights to use, copy, modify, merge, publish,
-> distribute, sublicense, and/or sell copies of the Software, and to
-> permit persons to whom the Software is furnished to do so, subject to
-> the following conditions:
->
-> The above copyright notice and this permission notice shall be included
-> in all copies or substantial portions of the Software.
->
-> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-> OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-> MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-> IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-> CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-> TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-> SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Versions up to 0.7 bundled a modal-synthesis piano translated from the
+open-source project:
+
+> **fan455_piano_synthesis** — piano sound synthesis using physical
+> modelling. Copyright (c) 2024 fan455
+> https://github.com/fan455/fan455_piano_synthesis (arXiv:2409.03481)
+
+That model (MIT-licensed) is no longer shipped; the notice remains for
+historical accuracy of those releases.

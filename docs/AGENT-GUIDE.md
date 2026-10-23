@@ -14,7 +14,7 @@ root `AGENTS.md`, this is it.)
   metronome-defined bar grid; asset-rack drag & drop; additive child lanes;
   audio takes **and MIDI takes (MREC)** → asset + auto-placed clip; clip
   edge trimming (cut / silent extension); a full piano-roll editor;
-  per-track **synths** (bundled modal piano, sampler script, scanned VSTi);
+  per-track **synths** (bundled recorded grand piano, sampler script, scanned VSTi);
   one **mixer chain** per track mixing runtime-compiled Rust effect scripts
   with binary **VST2/VST3 plugins**; group editing + clipboard;
   metronome-based quantize/trim; `.slooper` project files; MIDI + keyboard
@@ -62,7 +62,7 @@ src/            application source (Rust 2021 edition)
                   channel pressure, CC, channel pressure; read + write;
                   pattern length survives via a private text meta)
   synth.rs        scripted synth plugins (rust-script): own ABI v1 + host
-                  vtable, global-Mutex compile cache, bundled piano (modal
+                  vtable, global-Mutex compile cache, bundled piano (recorded
                   physical model) + sampler seeded/updated-in-place in the
                   synths folder (SLOOPER_SYNTHS_DIR override)
   vsthost.rs      VST2/VST3 hosting: folder scan, block-based processing
