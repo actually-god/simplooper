@@ -49,6 +49,7 @@ type Atom = u64;
 #[link(name = "X11")]
 extern "C" {
     fn XOpenDisplay(name: *const i8) -> *mut Display;
+    fn XInitThreads();
     fn XCloseDisplay(d: *mut Display) -> c_int;
     fn XCreateSimpleWindow(
         d: *mut Display,
@@ -313,11 +314,22 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
     })
 }
 
+/// Xlib is only thread-safe after `XInitThreads`; the editor threads and
+/// the UI thread's liveness probes open/close displays concurrently.
+/// Every entry point that touches Xlib funnels through this first.
+fn xlib_threads_ready() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        XInitThreads();
+    });
+}
+
 /// Whether an X server (or XWayland) is reachable.
 pub fn x11_available() -> bool {
     if std::env::var_os("DISPLAY").is_none() {
         return false;
     }
+    xlib_threads_ready();
     unsafe {
         let d = XOpenDisplay(ptr::null());
         if d.is_null() {
@@ -332,6 +344,7 @@ pub fn x11_available() -> bool {
 /// Read the child-window count of an XID from a fresh connection
 /// (integration tests; `0` on any failure).
 pub fn count_children(xid: u64) -> usize {
+    xlib_threads_ready();
     unsafe {
         let d = XOpenDisplay(ptr::null());
         if d.is_null() {
@@ -366,6 +379,10 @@ fn editor_main(
     height: Arc<AtomicI32>,
 ) {
     unsafe {
+        if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
+            eprintln!("[vstedit] {title}: editor thread alive");
+        }
+        xlib_threads_ready();
         XSetErrorHandler(Some(x_error_noop));
         let d = XOpenDisplay(ptr::null());
         if d.is_null() {
@@ -386,8 +403,14 @@ fn editor_main(
         XSetWMProtocols(d, win, protocols.as_mut_ptr(), 1);
         XMapWindow(d, win);
         XSync(d, 0);
+        let dbg = std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some();
 
         // effEditOpen: the XID travels as a pointer-sized value.
+        if dbg {
+            eprintln!("[vstedit] {title}: pre-effEditOpen (win mapped, ready)");
+        }
+        // Instantiation/editor-bootstrap serialization (see vsthost).
+        let _loader = crate::vsthost::vst_loader_lock();
         let opened = handle.dispatch(
             EFF_EDIT_OPEN,
             0,
@@ -395,15 +418,17 @@ fn editor_main(
             win as usize as *mut c_void,
             0.0,
         );
-        if opened != 0 {
-            // VST2 SDK: effEditOpen returns 0 on SUCCESS, non-zero on error.
-            open_failed.store(true, Ordering::SeqCst);
-            XDestroyWindow(d, win);
-            XFlush(d);
-            XCloseDisplay(d);
-            closed.store(true, Ordering::SeqCst);
-            return;
+        drop(_loader);
+        if dbg {
+            eprintln!("[vstedit] {title}: effEditOpen -> {opened} (win {win:#x})");
         }
+        // The VST2 spec says 0 == success, but plenty of toolkits return a
+        // "true" flag (1) for a SUCCESSFUL open — and refusing on a
+        // non-zero return silently killed editors that DO create their
+        // window (Wolf Shaper, Dragonfly: they returned 1 and were then
+        // torn down before their child ever mapped). Treat the return as
+        // advisory; the verification loop below is the real judge: if the
+        // plugin draws, it opened, whatever it said.
 
         // VERIFY THE EMBED. Some plugins accept effEditOpen yet never
         // draw (broken toolkits, missing plugin data, XEmbed assumptions
@@ -412,11 +437,18 @@ fn editor_main(
         // idle and poll the plugin's child windows: only once one shows
         // up with real geometry do we consider the editor alive.
         let mut painted_now = false;
-        for _ in 0..60 {
+        for _it in 0..60u32 {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
             handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
+            if dbg && (_it % 10 == 0 || _it < 3) {
+                let (kid, w, h) = first_sized_child(d, win).unwrap_or((0, 0, 0));
+                eprintln!(
+                    "[vstedit] {title}: idle {_it} child=({kid:x} {w}x{h}) px={}",
+                    container_painted(d, win)
+                );
+            }
             if let Some((_kid, w, h)) = first_sized_child(d, win) {
                 if w >= 8 && h >= 8 {
                     painted_now = true;
@@ -434,7 +466,9 @@ fn editor_main(
         if !painted_now {
             // No live editor appeared: close cleanly so NO blank window is
             // left behind, and let the UI fall back to the slider panel.
+            let _loader = crate::vsthost::vst_loader_lock();
             handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
+            drop(_loader);
             XDestroySubwindows(d, win);
             XDestroyWindow(d, win);
             XFlush(d);
@@ -499,7 +533,10 @@ fn editor_main(
             handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
             std::thread::sleep(Duration::from_millis(30));
         }
-        handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
+        {
+            let _loader = crate::vsthost::vst_loader_lock();
+            handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
+        }
         XDestroyWindow(d, win);
         XFlush(d);
         XCloseDisplay(d);

@@ -596,6 +596,29 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
             }
         }
     });
+    // v0.10: built-in default presets (radio filter, concert hall, ...)
+    // ship with the program and appear right under the user preset row.
+    let defaults = fx::builtin_presets(&ed.stem);
+    if !defaults.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("defaults").weak().small());
+            egui::ComboBox::from_id_salt("fx_default_preset")
+                .selected_text("apply a built-in preset\u{25be}")
+                .show_ui(ui, |ui| {
+                    // Snapshot so the closure doesn't borrow `ed`.
+                    let items: Vec<(&str, Vec<(&str, f32)>)> =
+                        defaults.iter().map(|(n, p)| (*n, p.clone())).collect();
+                    for (name, pairs) in items {
+                        if ui.selectable_label(false, name).clicked() {
+                            let n = ed.apply_labeled(&pairs);
+                            ed.preset_msg =
+                                format!("default preset \"{name}\" applied ({n} params)");
+                            ui.close();
+                        }
+                    }
+                });
+        });
+    }
     if !ed.preset_msg.is_empty() {
         ui.label(RichText::new(&ed.preset_msg).weak().small());
     }
@@ -647,6 +670,23 @@ impl FxEditor {
     /// then by declaration order (hand-written files stay usable). Values
     /// clamp to the declared ranges; every ride also lands in `pending` so
     /// the main window persists the chain row.
+    /// Apply (label, value) pairs by LABEL (unknown labels skipped) and
+    /// ride them into the running chain — the loader used by built-in
+    /// default presets. Clamping matches `load_user_preset`.
+    pub fn apply_labeled(&mut self, pairs: &[(&str, f32)]) -> usize {
+        let mut applied = 0usize;
+        for (label, v) in pairs {
+            if let Some((k, p)) = self.desc.params.iter().enumerate().find(|(_, p)| p.label == *label)
+            {
+                let v = v.clamp(p.min.min(p.max), p.max.max(p.min));
+                self.inst.set_param(k, v);
+                self.pending.push((k, v));
+                applied += 1;
+            }
+        }
+        applied
+    }
+
     pub fn load_user_preset(&mut self, name: &str) {
         let path = fx::user_preset_path(&self.fx_dir, &self.stem, name);
         let pairs = match std::fs::read_to_string(&path)

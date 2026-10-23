@@ -1809,7 +1809,10 @@ fn e2e_preview_renders_and_plays() {
     // Play it: audible at the sink with the transport STOPPED, then silent
     // once the buffer ran out (auto-stop).
     std::thread::sleep(Duration::from_millis(150));
-    b.cmd(Cmd::PreviewPlay { samples: Arc::from(buf) });
+    b.cmd(Cmd::PreviewPlay {
+        id: 7,
+        samples: Arc::from(buf),
+    });
     wait_until(
         || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
         Duration::from_secs(5),
@@ -1931,7 +1934,178 @@ fn e2e_midi_seek_silences_held_note() {
     let _ = active;
 }
 
+// ===================== v0.10 acceptance pins =====================
 
+/// AC8 (realtime, honest): audition voices are strictly ADDITIVE at the
+/// master out — two overlapping previews mix to a peak that NEITHER voice
+/// reaches alone. The old single-slot preview could only ever play one.
+#[test]
+fn e2e_preview_voices_are_additive() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("additive_e2e", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
+            .is_some(),
+        "sink layout not applied"
+    );
 
+    // Two phase-independent voices (sines an octave apart) at equal level:
+    // one voice peaks at ~A*F1S2; a sum of two clearly beats A*F1S2 by 3 dB.
+    let mk = |f: f32| -> Arc<[f32]> {
+        let n = sr as usize;
+        Arc::from(
+            (0..n)
+                .map(|k| {
+                    (2.0 * std::f32::consts::PI * f * k as f32 / sr as f32).sin() * 0.4
+                })
+                .collect::<Vec<f32>>(),
+        )
+    };
+    b.cmd(Cmd::PreviewPlay { id: 11, samples: mk(440.0) });
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.2).unwrap_or(false),
+        Duration::from_secs(5),
+        "first preview audible",
+    );
+    let solo = ring_peak(&ring, &widx, 4800).unwrap_or(0.0);
+    // Second voice WHILE the first still runs (1 s buffers, ~0.9 s left).
+    b.cmd(Cmd::PreviewPlay { id: 12, samples: mk(880.0) });
+    let mut best = solo;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(30));
+        best = best.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+    }
+    assert!(
+        best > solo * 1.25 && best > 0.35,
+        "two overlapping previews must MIX: solo {solo} vs best {best}"
+    );
 
+    // Repeats of the SAME buffer stack too (two identical phases double up).
+    b.engine.stop_preview();
+    std::thread::sleep(Duration::from_millis(200));
+    let a = mk(660.0);
+    b.engine.play_preview(31, a.clone());
+    b.engine.play_preview(31, a);
+    let mut best2 = 0.0f32;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(30));
+        best2 = best2.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+    }
+    assert!(best2 > 0.42, "same asset twice must double: {best2}");
 
+    // AC6.2: starting the transport must clear every audition voice —
+    // auditions never double over real playback (manager-path wiring).
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p < 0.002 && b.engine.preview_snapshot().is_empty())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "PlayAll clears every audition voice",
+    );
+}
+
+/// AC3: a VST2 EFFECT on a track chain passes audio (effOpen handshake).
+/// Before the fix, every VST2 effect zeroed its track — the whole point of
+/// the "VST2 plugins silence everything" bug report.
+#[test]
+fn e2e_vst2_effect_not_silent() {
+    let _g = e2e_lock();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dll = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
+    if !dll.is_file() {
+        eprintln!("no wolf-shaper on this host: skipping");
+        return;
+    }
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("vst2fx_e2e", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
+            .is_some(),
+        "sink layout not applied"
+    );
+
+    // Loud-ish square through the plugin (wolf-shaper needs drive to move).
+    let a: Arc<[f32]> = Arc::from(
+        (0..(sr as usize))
+            .map(|k| if (k / 80) % 2 == 0 { 0.55f32 } else { -0.55 })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![a]),
+        arr: Arc::new(arr),
+        len: sr as u64,
+    });
+
+    // DRY reference first (no chain): proves the clip itself is audible.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.2).unwrap_or(false),
+        Duration::from_secs(5),
+        "dry clip audible",
+    );
+    b.cmd(Cmd::StopAll);
+
+    // Now the same clip behind the VST2 effect.
+    let load = slooper::vsthost::open(
+        &dll,
+        slooper::vsthost::VstKind::V2,
+        sr,
+        None,
+    )
+    .expect("open wolf-shaper");
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: slooper::audio::TrackFx {
+            slots: std::sync::Arc::new(vec![slooper::audio::FxSlot::vst(load.entry.clone())]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    b.cmd(Cmd::Seek { pos: 0 });
+    b.cmd(Cmd::PlayAll);
+    let mut peak = 0.0f32;
+    for _ in 0..80 {
+        std::thread::sleep(Duration::from_millis(30));
+        peak = peak.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+    }
+    b.cmd(Cmd::StopAll);
+    assert!(
+        peak > 0.05,
+        "VST2 effect muted the track (peak {peak}) — effOpen regression?"
+    );
+}

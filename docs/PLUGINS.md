@@ -23,12 +23,37 @@ and **binary VST2/VST3 plugins** loaded from `vst_dirs`.
   silence; slooper detects the zero-channel case and activates the output
   buses itself, so these plugins play normally as track instruments.
 
-## VSTi custom GUIs (VST2)
+## Installing plugins: just drop them in
 
-Opening a track-bound VST2 with a GUI: track synth window →
-“open plugin window”. The editor runs in its **own OS window** (slooper's
-main window is GPU-drawn by egui and has no child-window support), titled
-`slooper — <plugin>`.
+No import step, no rescan button needed: put a plugin file in any scan
+folder and it appears in the picker on the next scan (rescan happens on
+window open and after every drop). Scan folders: `~/.vst`, `~/.vst3`,
+`/usr/lib/vst(3)`, `/usr/local/lib/vst*`, `$VST_PATH`, plus anything in
+`vst_dirs` — and Wine prefixes' `Plugin DLLs`/`VSTPlugins` folders too.
+Understood layouts: loose `.so`, `.vst`/`.vst3` bundle directories, and
+**Windows `.dll` plugins via yabridge** (next section).
+
+### Windows-only VSTs (`.dll`) — automatic Wine bridge
+
+If [yabridge](https://github.com/robbert-vdh/yabridge) is installed
+(`yabridgectl` on `$PATH` or `~/.local/bin`), slooper registers every folder
+that contains `.dll` plugins with `yabridgectl add` + `sync` automatically
+during its scan — no terminal needed. yabridge then generates Linux
+sidecars (`foo.dll.so`) that load the Windows plugin under Wine and also
+bridge its **GUI** over X11, so Windows synths/effects appear and behave
+exactly like native ones: sound, sliders, and their custom editor window.
+(Install: AUR `yabridge`, or the release tarball + `./yabridgectl sync`.)
+
+## VST custom GUIs (VST2) — open automatically
+
+Binding a plugin instrument (track synth popup) or adding a plugin effect
+to a chain **opens the plugin's own GUI window immediately** — that window
+is now the standard editing surface for plugins; the parameter-slider
+window only appears when the plugin has no editor or the editor refuses
+(see below), and the track synth popup's "open plugin window" button just
+reopens whatever surface the plugin uses. The editor runs in its **own OS
+window** (slooper's main window is GPU-drawn by egui and has no
+child-window support), titled `slooper — <plugin>`.
 
 How it works (`src/vstedit.rs`) — the standard Linux VST2 hosting protocol,
 cross-checked against the VST2.4 SDK (`aeff.h` opcodes), Ardour
@@ -64,5 +89,14 @@ counts). Without X11 the button reports it and the slider fallback remains.
   parameter-change synchronization via `IEditController::setComponentHandler`
   and `Plugin::service_host_requests`. Until then VST3 instruments load and
   play, but only expose sliders.
-- A plugin that refuses `effEditOpen` (returns 0) is reported in the status
-  bar and its slider panel keeps working.
+- The `effEditOpen` **return value is advisory**: the VST2 spec says 0
+  means success, but many toolkits (VSTGUI-based plugins like Wolf Shaper
+  or Dragonfly) return 1 as a "true" success flag. Trusting the number
+  refused every working editor; slooper instead **verifies the embed**: the
+  plugin must actually create its child window or paint pixels within a
+  few seconds. Only when nothing appears is the open refused — reported in
+  the status bar, window torn down cleanly, sliders take over.
+- Probe and live instances of the same plugin binary intentionally share
+  one process-lifetime load (see `vst_loader_lock` / probe-leak comments):
+  plugin toolkits carry process-global state that does not survive
+  terminate/dlclose cycles inside a running host.

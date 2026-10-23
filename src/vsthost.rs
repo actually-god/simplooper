@@ -109,12 +109,33 @@ pub fn default_vst_dirs() -> Vec<PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(PathBuf::from(&home).join(".vst3"));
         dirs.push(PathBuf::from(&home).join(".vst"));
+        // Wine prefixes: the folders common Windows installers drop
+        // plugins into, so a .dll placed there is found (and yabridged)
+        // with zero configuration.
+        let win = [
+            "drive_c/Program Files/Steinberg/VSTPlugins",
+            "drive_c/Program Files/Common Files/VSTPlugins",
+            "drive_c/Program Files/VSTPlugins",
+            "drive_c/VSTPlugins",
+        ];
+        for base in ["wine", ".wine"] {
+            for w in win {
+                dirs.push(PathBuf::from(&home).join(base).join(w));
+            }
+        }
     }
     dirs.push(PathBuf::from("/usr/lib/vst3"));
     dirs.push(PathBuf::from("/usr/lib/vst"));
     dirs.push(PathBuf::from("/usr/lib64/vst3"));
     dirs.push(PathBuf::from("/usr/local/lib/vst3"));
     dirs.push(PathBuf::from("/usr/local/lib/vst"));
+    if let Ok(extra) = std::env::var("VST_PATH") {
+        for p in extra.split(':') {
+            if !p.is_empty() {
+                dirs.push(PathBuf::from(p));
+            }
+        }
+    }
     dirs.retain(|d| d.is_dir());
     dirs
 }
@@ -151,6 +172,14 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<VstEntry> {
                 if name.ends_with(".vst3") {
                     seen.push(p.clone());
                     out.push(probe_vst3(&p));
+                } else if name.ends_with(".vst") && p.is_dir() {
+                    // VST2 bundle layout (`Foo.vst/Contents/<arch>.so`) —
+                    // what yabridge writes for Windows plugins and what
+                    // many Linux packs ship. Probe the real library inside.
+                    if let Some(so) = bundle_so(&p) {
+                        seen.push(p.clone());
+                        out.push(probe_vst2(&so));
+                    }
                 } else if name.ends_with(".so") && !p.is_dir() {
                     seen.push(p.clone());
                     out.push(probe_vst2(&p));
@@ -160,6 +189,117 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<VstEntry> {
     }
     out.sort_by_key(|e| e.name.to_lowercase());
     out
+}
+
+/// Locate the loadable library inside a `Foo.vst` bundle directory.
+fn bundle_so(dir: &Path) -> Option<PathBuf> {
+    let c = dir.join("Contents");
+    for name in ["x86-64.so", "x86_64-linux.so", "x86_64.so", "x86-linux.so"] {
+        let p = c.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Unknown arch spelling: take the only .so if there is exactly one.
+    let oks: Vec<PathBuf> = std::fs::read_dir(&c)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "so").unwrap_or(false))
+        .collect();
+    if oks.len() == 1 {
+        Some(oks.into_iter().next().unwrap())
+    } else {
+        None
+    }
+}
+
+/// True when the yabridge control tool is installed (Windows VST support).
+pub fn yabridge_available() -> bool {
+    yabridgectl_path().is_some()
+}
+
+fn yabridgectl_path() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        cands.push(PathBuf::from(&home).join(".local/bin/yabridgectl"));
+    }
+    cands.push(PathBuf::from("/usr/bin/yabridgectl"));
+    cands.push(PathBuf::from("/usr/local/bin/yabridgectl"));
+    cands.into_iter().find(|p| p.is_file())
+}
+
+/// v0.10 drop-in Windows VST support (yabridge + Wine), no configuration.
+///
+/// Scans the plugin folders for `.dll` files — Windows plugins the user
+/// simply dropped in — registers each containing folder with yabridgectl
+/// and runs `sync`, which writes native `.so` wrappers into `~/.vst` and
+/// `~/.vst3` (the folders we already scan). Returns a one-line summary
+/// when any wrapping happened, `None` when there was nothing to do or
+/// yabridge is not installed. Never fails the caller's native scan.
+pub fn yabridge_sync(roots: &[PathBuf]) -> Option<String> {
+    let exe = yabridgectl_path()?;
+    // Collect the folders that directly contain Windows plugin files.
+    let mut dll_dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let subdirs = std::fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir());
+        for dir in std::iter::once(root.clone()).chain(subdirs) {
+            let has = std::fs::read_dir(&dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x.eq_ignore_ascii_case("dll"))
+                        .unwrap_or(false)
+                });
+            if has && !dll_dirs.contains(&dir) {
+                dll_dirs.push(dir);
+            }
+        }
+    }
+    if dll_dirs.is_empty() {
+        return None;
+    }
+    let mut added = 0usize;
+    for d in &dll_dirs {
+        // `add` is idempotent in practice; errors (already known) are fine.
+        let _ = std::process::Command::new(&exe)
+            .arg("add")
+            .arg(d)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        added += 1;
+    }
+    let out = std::process::Command::new(&exe)
+        .arg("sync")
+        .env("PATH", format!("{}:/usr/bin:/bin", exe.parent()?.display()))
+        .output()
+        .ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = text
+        .lines()
+        .rev()
+        .find(|l| l.contains("Finished setting up"))
+        .unwrap_or("yabridge sync done")
+        .trim()
+        .to_string();
+    Some(format!(
+        "yabridge: {added} Windows plugin folder(s) processed — {line}"
+    ))
 }
 
 fn base_label(path: &Path) -> String {
@@ -208,6 +348,13 @@ fn probe_vst2(path: &Path) -> VstEntry {
     match probed {
         Ok(Ok(inst)) => {
             let info = inst.get_info();
+            // NEVER drop the probe instance: PluginInstance::drop dispatches
+            // Shutdown — VSTPluginMain(terminate) — into the plugin binary,
+            // and toolkits with one-shot process globals (VSTGUI et al.) tear
+            // down editor machinery every LATER instance still uses: the next
+            // effEditOpen dereferences freed C++ statics and dies (SIGSEGV
+            // mid-editor-open). Read the metadata, then leak the instance.
+            std::mem::forget(inst);
             VstEntry {
                 path: path.to_path_buf(),
                 kind: VstKind::V2,
@@ -412,6 +559,21 @@ pub struct VstLoad {
     pub entry: Arc<RtStageEntry>,
 }
 
+/// Process-wide plugin instantiation lock. dlopen-ing plugin code and
+/// running a plugin's factory/editor bootstrap touch PROCESS-GLOBAL state
+/// inside the plugin binary (toolkit singletons, lazy statics). A per-frame
+/// VST scan instantiating plugins on the UI thread raced an editor thread's
+/// effEditOpen on those statics and produced calls through garbage pointers
+/// (SIGSEGV inside Dragonfly's editor open). Every entry point that creates
+/// plugin instances or opens/closes plugin editors serializes on this lock.
+static VST_LOADER: Mutex<()> = Mutex::new(());
+
+/// Take the loader lock (poison-tolerant: a failed `open` must not
+/// permanently deadlock plugin loading).
+pub fn vst_loader_lock() -> std::sync::MutexGuard<'static, ()> {
+    VST_LOADER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Load a plugin from `path` on the UI thread and prepare its realtime
 /// entry. `saved` (normalized, in `descs` order) overrides defaults.
 pub fn open(
@@ -420,6 +582,7 @@ pub fn open(
     sample_rate: u32,
     saved: Option<&[f32]>,
 ) -> Result<VstLoad, String> {
+    let _loader = vst_loader_lock();
     let entry = match kind {
         VstKind::V3 => open_v3(path, sample_rate, saved)?,
         VstKind::V2 => open_v2(path, sample_rate, saved)?,
@@ -572,6 +735,13 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     if info.inputs > 2 || info.outputs > 2 {
         return Err("multi-channel plugins are not supported".into());
     }
+    // effOpen (opcode 0) — THE VST2 init handshake. The vendored loader
+    // never sends it, and EFFECT plugins (distortion, reverb, ...) keep
+    // their audio path closed until it arrives: every VST2 effect came back
+    // as pure silence, muting whatever track it sat on. Instruments tolerate
+    // its absence (that is why VST2 synths seemed fine). Verified against
+    // wolf-shaper (0 → 0.5 peak) and Dragonfly.
+    inst.init();
     inst.set_sample_rate(sample_rate as f32);
     inst.set_block_size(VST_BLOCK as i64);
     inst.resume();
@@ -1052,4 +1222,72 @@ mod tests {
         // Informational: CI has no instruments installed.
         let _ = checked;
     }
+
+    // ===================== v0.10 acceptance pins =====================
+
+    /// AC2.4: drop-in install layout. A folder may contain loose `.so`
+    /// plugins, `.vst` / `.vst3` bundles, and yabridge sidecars (the
+    /// `foo.dll.so` wrappers yabridgectl generates for Windows `.dll`s —
+    /// they are ordinary Linux `.so`s to the loader). scan() must find
+    /// every native-loadable form; the raw `.dll` itself is registered
+    /// with yabridgectl (yabridge_sync), never dlopen'd.
+    #[test]
+    fn v10_scan_finds_yabridge_wrappers_and_dlls() {
+        let dir = std::env::temp_dir().join(format!("sp-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let src = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
+        if !src.is_file() {
+            eprintln!("skip: no wolf-shaper on this host");
+            return;
+        }
+        // Loose .so
+        std::fs::copy(&src, dir.join("loose.so")).unwrap();
+        // yabridge sidecar naming for a Windows plugin + the .dll it wraps
+        std::fs::copy(&src, dir.join("synth.dll.so")).unwrap();
+        std::fs::write(dir.join("synth.dll"), b"MZ not really").unwrap();
+        // macOS-style bundle directory (what yabridge also emits)
+        std::fs::create_dir_all(dir.join("Nested.vst/Contents")).unwrap();
+        std::fs::copy(&src, dir.join("Nested.vst/Contents/wolf.so")).unwrap();
+
+        let found = scan(std::slice::from_ref(&dir));
+        let names: Vec<&str> = found.iter().map(|e| e.name.as_str()).collect();
+        // All three native forms enumerated, sidecar included; the raw .dll
+        // is NOT probed (that would dlopen PE bytes and always fail).
+        assert!(found.iter().any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("so")),
+            "loose .so missing: {names:?}");
+        assert!(
+            found.iter().any(|e| e.path.to_string_lossy().contains("synth.dll.so")),
+            "yabridge sidecar not scanned: {names:?}"
+        );
+        assert!(
+            found.iter().any(|e| e.path.to_string_lossy().contains("Nested.vst")),
+            "bundle dir layout not scanned: {names:?}"
+        );
+        assert!(
+            !found.iter().any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("dll")),
+            "raw .dll must never be dlopen'd by scan"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AC3.1: opening a local VST2 EFFECT goes through the full handshake
+    /// (effOpen + resume) without error and yields a live, parameterised
+    /// instance. The audible proof (track not silenced) is pinned by the
+    /// e2e test `e2e_vst2_effect_not_silent` under real JACK.
+    #[test]
+    fn v10_local_vst2_effect_passes_audio() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let p = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
+        if !p.is_file() {
+            eprintln!("skip: no wolf-shaper on this host");
+            return;
+        }
+        let load = open(&p, VstKind::V2, 48_000, None).expect("open wolf-shaper effect");
+        assert_eq!(load.entry.spec().1, VstKind::V2);
+        assert!(!load.entry.descs().is_empty(), "effect exposes its parameters");
+        assert!(load.entry.vst2_handle().is_some(), "editor-capable handle");
+    }
+
 }

@@ -213,6 +213,125 @@ pub fn list_user_presets(fx_dir: &Path, stem: &str) -> Vec<String> {
     out
 }
 
+/// Built-in default presets, shipped with the program (v0.10) — these do
+/// NOT live in the user-preset folder and are always available. Each is a
+/// (name, [(param label, value)]) pair; unknown labels in a re-compiled
+/// effect script are simply skipped by the loader, so presets can never
+/// brick an editor.
+pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)>)> {
+    // EQ band order: type 0 off, 1 low shelf, 2 high shelf, 3 peak,
+    // 4 low pass, 5 high pass, 6 notch, 7 band pass.
+    fn eq(b: &[[f32; 4]], mix: f32, out: f32) -> Vec<(&'static str, f32)> {
+        let mut v = Vec::with_capacity(26);
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        for (i, band) in b.iter().enumerate() {
+            let n = (i + 1).to_string();
+            for (suf, val) in [("type", 0usize), ("freq", 1), ("gain", 2), ("Q", 3)] {
+                let s = leak(format!("B{n} {suf}"));
+                v.push((s, band[val]));
+            }
+        }
+        v.push((leak("mix".into()), mix));
+        v.push((leak("out".into()), out));
+        v
+    }
+    match stem {
+        "parametric_eq" => vec![
+            (
+                "Radio filter",
+                eq(
+                    &[
+                        [5.0, 300.0, 0.0, 0.7],
+                        [3.0, 1500.0, 5.0, 1.1],
+                        [3.0, 2500.0, 4.0, 1.1],
+                        [4.0, 3500.0, 0.0, 0.71],
+                        [0.0, 6000.0, 0.0, 1.1],
+                        [0.0, 11000.0, 0.0, 0.71],
+                    ],
+                    1.0,
+                    1.0,
+                ),
+            ),
+            (
+                "Concert hall",
+                eq(
+                    &[
+                        [1.0, 90.0, 3.0, 0.71],
+                        [3.0, 250.0, -2.0, 0.9],
+                        [3.0, 1000.0, 0.0, 1.0],
+                        [3.0, 4000.0, 2.0, 1.0],
+                        [3.0, 8000.0, 1.5, 1.2],
+                        [2.0, 12000.0, 2.0, 0.71],
+                    ],
+                    1.0,
+                    1.0,
+                ),
+            ),
+            (
+                "Podcast voice",
+                eq(
+                    &[
+                        [5.0, 90.0, 0.0, 0.7],
+                        [3.0, 200.0, -3.0, 1.2],
+                        [3.0, 2500.0, 3.0, 1.3],
+                        [3.0, 5000.0, 2.0, 1.4],
+                        [3.0, 8000.0, -1.0, 1.2],
+                        [0.0, 11000.0, 0.0, 0.71],
+                    ],
+                    1.0,
+                    1.0,
+                ),
+            ),
+            (
+                "Bass boost",
+                eq(
+                    &[
+                        [1.0, 120.0, 6.0, 0.71],
+                        [3.0, 250.0, 2.0, 1.0],
+                        [0.0, 800.0, 0.0, 1.1],
+                        [0.0, 2500.0, 0.0, 1.1],
+                        [0.0, 6000.0, 0.0, 1.1],
+                        [2.0, 10000.0, 1.0, 0.71],
+                    ],
+                    1.0,
+                    1.0,
+                ),
+            ),
+            (
+                "Lo-fi tape",
+                eq(
+                    &[
+                        [5.0, 150.0, 0.0, 0.7],
+                        [0.0, 250.0, 0.0, 1.1],
+                        [3.0, 1000.0, 4.0, 1.0],
+                        [4.0, 4000.0, 0.0, 0.71],
+                        [0.0, 6000.0, 0.0, 1.1],
+                        [0.0, 11000.0, 0.0, 0.71],
+                    ],
+                    1.0,
+                    1.0,
+                ),
+            ),
+            (
+                "Treble sparkle",
+                eq(
+                    &[
+                        [0.0, 80.0, 0.0, 0.71],
+                        [0.0, 250.0, 0.0, 1.1],
+                        [0.0, 800.0, 0.0, 1.1],
+                        [3.0, 4000.0, 1.5, 1.0],
+                        [3.0, 9000.0, 4.0, 1.0],
+                        [2.0, 12000.0, 3.0, 0.71],
+                    ],
+                    1.0,
+                    1.0,
+                ),
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// Delete a preset. Missing file counts as success (idempotent).
 pub fn delete_user_preset(fx_dir: &Path, stem: &str, name: &str) -> Result<(), String> {
     let p = user_preset_path(fx_dir, stem, name);
@@ -1842,4 +1961,87 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         delete_user_preset(&dir, "space_echo", "Warm Room").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ===================== v0.10 acceptance pins =====================
+
+    /// AC5.1: default EQ presets ship with the program (no user files) and
+    /// are well-formed: named, 26 labeled values, finite, in range.
+    #[test]
+    fn v10_eq_ships_default_presets() {
+        let defs = builtin_presets("parametric_eq");
+        let names: Vec<&str> = defs.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"Radio filter"), "radio filter preset missing: {names:?}");
+        assert!(names.contains(&"Concert hall"), "concert hall preset missing: {names:?}");
+        assert!(defs.len() >= 5, "a decent starter set: {names:?}");
+        for (name, pairs) in &defs {
+            assert_eq!(pairs.len(), 26, "{name}: one value per EQ param");
+            let mut labels: Vec<&str> = pairs.iter().map(|(l, _)| *l).collect();
+            labels.sort_unstable();
+            labels.dedup();
+            assert_eq!(labels.len(), 26, "{name}: labels unique");
+            for (label, v) in pairs {
+                assert!(v.is_finite(), "{name}/{label} not finite");
+                if label.ends_with("type") {
+                    assert!((0.0..=7.0).contains(v), "{name}/{label} bad type {v}");
+                }
+            }
+        }
+        assert!(builtin_presets("space_echo").is_empty(), "other effects stay preset-free");
+    }
+
+    /// AC5.2: a default preset lands on a REAL compiled EQ instance —
+    /// applying "Radio filter" must visibly crush the low end it promises.
+    #[test]
+    fn v10_default_preset_lands_on_the_chain() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v10-eqpreset");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let desc = reg.desc("parametric_eq").expect("desc").clone();
+
+        let measure = |apply: bool, freq: f32| -> f32 {
+            let inst = reg.create_instance("parametric_eq", 48_000.0, &[]).expect("eq");
+            if apply {
+                let (_, pairs) = builtin_presets("parametric_eq")
+                    .into_iter()
+                    .find(|(n, _)| *n == "Radio filter")
+                    .unwrap();
+                // Exactly the fxgui label lookup (clamped, unknown skipped).
+                for (label, v) in &pairs {
+                    if let Some((k, p)) =
+                        desc.params.iter().enumerate().find(|(_, p)| p.label == *label)
+                    {
+                        inst.set_param(k, v.clamp(p.min, p.max));
+                    }
+                }
+            }
+            // Let coefficient glide settle, then measure.
+            let mut rms = 0.0f64;
+            let n = 48_000usize / 2;
+            for i in 0..n {
+                let t = i as f32 / 48_000.0;
+                let s = (t * freq * std::f32::consts::TAU).sin() * 0.5;
+                let y = inst.process_private(s);
+                if i > n / 2 {
+                    rms += (y as f64) * (y as f64);
+                }
+            }
+            (rms / ((n / 2) as f64)).sqrt() as f32
+        };
+
+        let flat_lo = measure(false, 100.0);
+        let radio_lo = measure(true, 100.0);
+        let radio_hi = measure(true, 1200.0);
+        assert!(flat_lo > 0.2, "flat EQ passes 100 Hz (got {flat_lo})");
+        assert!(
+            radio_lo < flat_lo / 4.0,
+            "radio filter must gut 100 Hz: flat {flat_lo} vs {radio_lo}"
+        );
+        assert!(radio_hi > radio_lo * 4.0, "…while keeping presence band (got {radio_hi})");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 3
+// slooper-synth-version: 4
 // sampler.rs — pitch-following audio-clip synthesizer.
 //
 // Plays ANY audio asset from the rack as an instrument: pick the asset id,
@@ -32,6 +32,10 @@ struct Voice {
 struct Sampler {
     host: *const SynthHostV1,
     asset: i32, // id currently copied into buf (-1 = none)
+    // Identity of the copied buffer (host data pointer + length): a content
+    // change under the SAME id shows up as a pointer/length move.
+    data_ptr: usize,
+    data_len: u32,
     buf: std::vec::Vec<f32>,
     buf_rate: f64,
     sr: f64,
@@ -46,6 +50,8 @@ extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_voi
     let s = Box::new(Sampler {
         host,
         asset: -1,
+        data_ptr: 0,
+        data_len: 0,
         buf: Vec::new(),
         buf_rate: 0.0,
         sr: if sr > 1.0 { sr } else { 48000.0 },
@@ -62,15 +68,12 @@ extern "C" fn destroy(s: *mut core::ffi::c_void) {
     }
 }
 
-/// Copy the wanted asset out of the host (only when the id changed).
+/// Copy the wanted asset out of the host when the id changes OR the asset
+/// buffer moved/regrew under the same id (v0.10: trimming, re-deriving or
+/// re-recording a sample keeps its id, so id-only comparison left the
+/// sampler replaying STALE contents until the synth was re-selected).
 fn sync_asset(s: &mut Sampler, want: i32) {
-    if want == s.asset {
-        return;
-    }
-    s.asset = want;
-    s.buf.clear();
-    s.buf_rate = 0.0;
-    if s.host.is_null() || want < 0 {
+    if s.host.is_null() {
         return;
     }
     let host = unsafe { &*s.host };
@@ -78,7 +81,23 @@ fn sync_asset(s: &mut Sampler, want: i32) {
         return;
     }
     let mut info = SynthAssetV1::default();
-    if (host.load_asset)(want as u32, &mut info) == 1 && info.len > 0 && !info.data.is_null() {
+    let ok = (host.load_asset)(want as u32, &mut info) == 1
+        && info.len > 0
+        && !info.data.is_null();
+    let ptr = if ok { info.data as usize } else { 0 };
+    if want == s.asset && ptr == s.data_ptr && info.len == s.data_len {
+        return; // nothing moved
+    }
+    s.asset = want;
+    s.data_ptr = ptr;
+    s.data_len = if ok { info.len } else { 0 };
+    s.buf.clear();
+    s.buf_rate = 0.0;
+    if want < 0 || !ok {
+        s.data_ptr = 0;
+        return;
+    }
+    {
         let n = (info.len as usize).min(12 * 1024 * 1024);
         unsafe {
             s.buf.extend_from_slice(std::slice::from_raw_parts(info.data, n));

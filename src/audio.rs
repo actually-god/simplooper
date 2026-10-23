@@ -54,8 +54,19 @@ pub fn pan_gains(p: f32) -> (f32, f32) {
     (th.cos(), th.sin())
 }
 
+/// Audition voice list: (voice id, asset id, samples). Starts are additive,
+/// so the list is the whole audition state the RT thread mixes.
+pub type PreviewVoices = Arc<Vec<(u64, u32, Arc<[f32]>)>>;
+
 /// Number of simultaneous tracks.
-pub const MAX_LOOPS: usize = 16;
+/// Track capacity (v0.10: 16 → 128). Fixed-size RT arrays scale with this;
+/// the per-sample mix path iterates a compact ACTIVE-track list so an empty
+/// 128-track project costs the same CPU as a 16-track one did before.
+pub const MAX_LOOPS: usize = 128;
+
+/// Preview voice id for auditions that belong to no rack asset (piano-roll
+/// note taps, edit echoes). Stopping by this id never touches asset previews.
+pub const PREVIEW_TRANSIENT: u32 = u32::MAX;
 /// Per-track recording capacity: ~60 s @ 48 kHz (~30 s @ 96 kHz).
 pub const LOOP_CAP: u32 = 2_880_000;
 
@@ -322,13 +333,20 @@ pub enum Cmd {
     },
     /// Audition a sample at the master output (asset-preview click). The
     /// buffer plays once from its start through the output mix only (never
-    /// recorded, never loops); a shorter previous preview is replaced, and
-    /// the engine clears its own flag when the buffer runs out.
+    /// recorded, never loops). v0.10: ADDITIVE — every play starts a new
+    /// independent voice, and repeated clicks of the same asset stack
+    /// instead of cutting each other off. `id` tags the source asset so a
+    /// rack row re-click can stop just its own voices.
     PreviewPlay {
+        id: u32,
         samples: Arc<[f32]>,
     },
-    /// Stop the asset preview immediately (audition is also a toggle).
-    PreviewStop,
+    /// Stop audition voices. `None` stops everything (transport stop);
+    /// `Some(id)` stops only the voices started from that asset (the rack
+    /// row toggle).
+    PreviewStop {
+        id: Option<u32>,
+    },
     Quit,
 }
 
@@ -494,7 +512,7 @@ pub struct Engine {
     /// Bitmask of tracks whose take the RT handler auto-stopped at buffer
     /// capacity. The manager polls + clears it (it owns the event channel)
     /// and ships those takes to the GUI like any other finished take.
-    take_pending: AtomicU64,
+    take_pending: [AtomicU64; 2],
 
     // ---- global transport ------------------------------------------------
     /// 1 = running (timeline advances), 0 = stopped (playhead holds).
@@ -578,7 +596,11 @@ pub struct Engine {
     // ---- asset preview -----------------------------------------------------
     /// Sample buffer being auditioned (swapped wholesale, RT reads an Arc
     /// clone refreshed on `preview_gen`).
-    preview: std::sync::Mutex<Arc<[f32]>>,
+    /// Audition voice pool (v0.10). Each voice is (voice id, asset id,
+    /// buffer). Starts are additive: every play_preview appends a voice and
+    /// the RT thread runs all of them with independent cursors.
+    preview_voices: std::sync::Mutex<PreviewVoices>,
+    preview_vid: AtomicU64,
     preview_gen: AtomicU64,
     /// 1 = a preview is playing (RT clears it when the buffer runs out).
     preview_on: AtomicU8,
@@ -599,7 +621,7 @@ impl Engine {
             rec_at: core::array::from_fn(|_| AtomicU64::new(0)),
             latency: AtomicU32::new(0),
             rec_skip: core::array::from_fn(|_| AtomicU32::new(0)),
-            take_pending: AtomicU64::new(0),
+            take_pending: [AtomicU64::new(0), AtomicU64::new(0)],
             transport_on: AtomicU8::new(0),
             loop_tl: AtomicU8::new(1),
             loop_start: AtomicU64::new(0),
@@ -636,7 +658,8 @@ impl Engine {
             metro_bpm: AtomicU32::new(120),
             metro_sub: AtomicU32::new(1),
             metro_num: AtomicU32::new(4),
-            preview: std::sync::Mutex::new(Arc::from(Vec::new())),
+            preview_voices: std::sync::Mutex::new(Arc::new(Vec::new())),
+            preview_vid: AtomicU64::new(0),
             preview_gen: AtomicU64::new(0),
             preview_on: AtomicU8::new(0),
         })
@@ -687,13 +710,18 @@ impl Engine {
     /// to pick up and ship to the GUI.
     #[inline]
     pub fn mark_take_pending(&self, i: usize) {
-        self.take_pending.fetch_or(1u64 << i, Ordering::SeqCst);
+        self.take_pending[i / 64].fetch_or(1u64 << (i % 64), Ordering::SeqCst);
     }
 
     /// Manager: claim every flagged take (returns a bitmask; bit `i` =
     /// track `i` has a capacity-stopped take ready to copy).
-    pub fn claim_takes(&self) -> u64 {
-        self.take_pending.swap(0, Ordering::SeqCst)
+    pub fn claim_takes(&self) -> u128 {
+        // Two swaps are individually atomic; a bit set between them is simply
+        // claimed by the following claim (no lost updates, claim order
+        // irrelevant for the take queue).
+        let lo = self.take_pending[0].swap(0, Ordering::SeqCst) as u128;
+        let hi = self.take_pending[1].swap(0, Ordering::SeqCst) as u128;
+        lo | (hi << 64)
     }
 
     pub fn rec_len_of(&self, i: usize) -> u32 {
@@ -1008,20 +1036,48 @@ impl Engine {
 
     // ---- asset preview -----------------------------------------------------------
 
-    /// Start auditioning `samples` at the master output: swaps the preview
-    /// buffer, bumps the generation (the RT handler refreshes its Arc
-    /// clone), and restarts playback from sample 0.
-    pub fn play_preview(&self, samples: Arc<[f32]>) {
-        if let Ok(mut p) = self.preview.lock() {
-            *p = samples;
+    /// Add an audition voice at the master output (mono, mixed to both
+    /// channels). STRICTLY ADDITIVE (v0.10): every call is a NEW voice with
+    /// its own RT cursor, so repeated clicks stack, including repeats of the
+    /// same asset, instead of cutting each other off. Bounded pool: the
+    /// oldest voice is dropped when the ceiling is reached.
+    pub fn play_preview(&self, id: u32, samples: Arc<[f32]>) {
+        const MAX_VOICES: usize = 12;
+        let mut v = (**self.preview_voices.lock().unwrap()).clone();
+        if v.len() >= MAX_VOICES {
+            v.remove(0);
         }
+        let vid = self.preview_vid.fetch_add(1, Ordering::Relaxed) + 1;
+        v.push((vid, id, samples));
+        *self.preview_voices.lock().unwrap() = Arc::new(v);
         self.preview_gen.fetch_add(1, Ordering::SeqCst);
         self.preview_on.store(1, Ordering::Relaxed);
     }
 
-    /// Stop the asset preview (also clears a finished one).
+    /// Stop every audition voice (transport stop / global stop).
     pub fn stop_preview(&self) {
+        *self.preview_voices.lock().unwrap() = Arc::new(Vec::new());
+        self.preview_gen.fetch_add(1, Ordering::SeqCst);
         self.preview_on.store(0, Ordering::Relaxed);
+    }
+
+    /// Stop only the voices started from asset `id` (rack row toggle): a
+    /// re-click silences that clip's audition while previews of other
+    /// assets keep playing (v0.10 parallel preview).
+    pub fn stop_preview_id(&self, id: u32) {
+        let mut v = (**self.preview_voices.lock().unwrap()).clone();
+        v.retain(|(_, vid, _)| *vid != id);
+        let empty = v.is_empty();
+        *self.preview_voices.lock().unwrap() = Arc::new(v);
+        self.preview_gen.fetch_add(1, Ordering::SeqCst);
+        if empty {
+            self.preview_on.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of the voice list for the RT handler (cheap Arc clone).
+    pub fn preview_snapshot(&self) -> PreviewVoices {
+        self.preview_voices.lock().unwrap().clone()
     }
 
     pub fn preview_active(&self) -> bool {
@@ -1360,9 +1416,7 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
         engine.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
         // The GUI owns this take now; drop any capacity-stop flag so the
         // manager poll doesn't ship the same take twice.
-        engine
-            .take_pending
-            .fetch_and(!(1u64 << i), Ordering::SeqCst);
+        engine.mark_take_pending(i);
         // Let the RT thread quiesce before cloning the take buffer.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let (at, data) = engine.copy_take(i);
@@ -1500,13 +1554,9 @@ fn run(
         arr_cache_gen: engine.arr_gen(),
         assets: engine.assets(),
         assets_cache_gen: engine.assets_gen(),
-        preview: engine
-            .preview
-            .lock()
-            .map(|p| p.clone())
-            .unwrap_or_else(|_| Arc::from(Vec::new())),
+        preview: engine.preview_snapshot(),
         preview_cache_gen: engine.preview_gen(),
-        preview_idx: 0,
+        preview_curs: Vec::new(),
         preview_live: false,
         clip_buf: Vec::new(),
         synths_cache: engine.synths(),
@@ -1598,10 +1648,16 @@ fn run(
                 if engine.pos() >= engine.proj_len() {
                     engine.seek_to(0);
                 }
+                // v0.10: starting the transport clears pending auditions.
+                // A leftover rack preview kept playing OVER the real
+                // playback — the "something else is processing my audio"
+                // double-voice. Auditions belong to browsing, not mixing.
+                engine.stop_preview();
                 engine.set_transport(true);
                 let _ = evt_tx.try_send(Evt::Transport { on: true });
             }
             Ok(Cmd::StopAll) => {
+                engine.stop_preview();
                 engine.set_transport(false);
                 let _ = evt_tx.try_send(Evt::Transport { on: false });
             }
@@ -1707,8 +1763,9 @@ fn run(
                 engine.metro_sub.store(sub.clamp(1, 16), Ordering::Relaxed);
                 engine.metro_num.store(num.clamp(1, 16), Ordering::Relaxed);
             }
-            Ok(Cmd::PreviewPlay { samples }) => engine.play_preview(samples),
-            Ok(Cmd::PreviewStop) => engine.stop_preview(),
+            Ok(Cmd::PreviewPlay { id, samples }) => engine.play_preview(id, samples),
+            Ok(Cmd::PreviewStop { id: None }) => engine.stop_preview(),
+            Ok(Cmd::PreviewStop { id: Some(id) }) => engine.stop_preview_id(id),
             Ok(Cmd::Quit) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Takes the RT handler auto-stopped at buffer capacity never
@@ -1717,7 +1774,7 @@ fn run(
                 let mut pend = engine.claim_takes();
                 while pend != 0 {
                     let i = pend.trailing_zeros() as usize;
-                    pend &= !(1u64 << i);
+                    pend &= !(1u128 << i);
                     std::thread::sleep(std::time::Duration::from_millis(25));
                     let (at, data) = engine.copy_take(i);
                     if !data.is_empty() {
@@ -2299,6 +2356,9 @@ pub fn render_midi_events(
 ) {
     let mut p: [f32; crate::synth::MAX_PARAMS] = [0.0; crate::synth::MAX_PARAMS];
     inst.read_params(&mut p);
+    // Prime before events (see render_midi_block): a note at offset 0 must
+    // not be delivered onto a script instrument that has never processed.
+    unsafe { inst.process_into(&mut out[..0], &p) };
     let mut ev: Vec<(usize, u8, u8, u8, u8)> = ev
         .iter()
         .filter(|(at, ..)| *at >= from && *at - from < len as u64)
@@ -2499,6 +2559,15 @@ impl Proc {
                         inst.read_params(synth_p);
                         synth_pg[t] = gen;
                     }
+                    // Prime the instrument with a zero-length block before
+                    // delivering any event. A sampler syncs its asset buffer
+                    // (and root param) inside process(), so a note staged at
+                    // sample 0 delivered FIRST would find an empty buffer
+                    // and vanish — the sampler "needs a synth re-selection
+                    // to work" bug. One call, no audio, exact params.
+                    if has_ev {
+                        unsafe { inst.process_into(&mut [], synth_p) };
+                    }
                     mono.clear();
                     mono.resize(block_n, 0.0);
                     let mut cur = 0usize;
@@ -2610,7 +2679,7 @@ struct Proc {
     /// Tracks that hit LOOP_CAP while recording: suppresses the auto-stop
     /// state store from re-firing on every remaining sample of the block.
     /// Cleared on the track's next state edge.
-    rec_full: u16,
+    rec_full: u128,
     /// RT-local playhead (the engine atomic is the published copy).
     pos: u64,
     /// Last transport flag; the falling edge publishes an auto-stop event.
@@ -2649,9 +2718,11 @@ struct Proc {
     assets_cache_gen: u64,
     /// Asset preview: cached audition buffer (refreshed on preview_gen),
     /// its RT read cursor, and whether one plays this block.
-    preview: Arc<[f32]>,
+    preview: PreviewVoices,
     preview_cache_gen: u64,
-    preview_idx: usize,
+    /// RT read cursors, (voice id, sample index), kept across generation
+    /// bumps so surviving voices never restart when a new one joins.
+    preview_curs: Vec<(u64, usize)>,
     preview_live: bool,
     /// Reusable per-block clip window list (taken out of self during the
     /// block so the sample loop can call `&mut self` effect code freely).
@@ -2836,6 +2907,49 @@ impl Proc {
     }
 }
 
+/// Per-block compact track lists for the mix loop (v0.10 / 128 tracks).
+///
+/// `entry_mask` marks tracks holding clip windows, `has_midi` + `midi_live`
+/// the tracks whose synth is sounding, `chain` the tracks with a non-empty
+/// FX chain (their tails must keep decaying), and `vst_mask` the tracks
+/// whose chain hosts a plugin. Only these tracks touch the per-sample loop,
+/// so CPU scales with ACTIVE tracks, not with the 128-track capacity.
+#[derive(Clone, Copy)]
+struct MixLists {
+    mix: [u16; MAX_LOOPS],
+    n_mix: usize,
+    acc: [u16; MAX_LOOPS],
+    n_acc: usize,
+}
+
+fn build_mix_lists(
+    entry_mask: u128,
+    has_midi: bool,
+    midi_live: &[bool],
+    audible: &[bool],
+    vst_mask: &[bool],
+    chain: &[bool],
+) -> MixLists {
+    let mut out = MixLists {
+        mix: [0u16; MAX_LOOPS],
+        n_mix: 0,
+        acc: [0u16; MAX_LOOPS],
+        n_acc: 0,
+    };
+    for t in 0..MAX_LOOPS {
+        let is_src = ((entry_mask >> t) & 1) != 0 || (has_midi && midi_live[t]);
+        if is_src {
+            out.acc[out.n_acc] = t as u16;
+            out.n_acc += 1;
+        }
+        if audible[t] && (vst_mask[t] || chain[t] || is_src) {
+            out.mix[out.n_mix] = t as u16;
+            out.n_mix += 1;
+        }
+    }
+    out
+}
+
 impl ProcessHandler for Proc {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
         let n = ps.n_frames() as usize;
@@ -2920,13 +3034,23 @@ impl ProcessHandler for Proc {
         // the RT side clears the flag itself when a buffer runs out.
         let pvg = self.engine.preview_gen();
         if pvg != self.preview_cache_gen {
-            if let Ok(p) = self.engine.preview.try_lock() {
-                self.preview = p.clone();
-                self.preview_cache_gen = pvg;
-                self.preview_idx = 0;
+            let snap = self.engine.preview_snapshot();
+            // Cursors are keyed by voice id: a new voice joins without
+            // rewinding the ones already playing, and stopped voices lose
+            // their cursor.
+            let mut curs = std::mem::take(&mut self.preview_curs);
+            curs.retain(|(vid, _)| snap.iter().any(|(v, _, _)| v == vid));
+            for (vid, _, _) in snap.iter() {
+                if !curs.iter().any(|(v, _)| v == vid) {
+                    curs.push((*vid, 0));
+                }
             }
+            self.preview_curs = curs;
+            self.preview = snap;
+            self.preview_cache_gen = pvg;
         }
-        self.preview_live = self.engine.preview_on.load(Ordering::Relaxed) != 0;
+        self.preview_live = self.engine.preview_on.load(Ordering::Relaxed) != 0
+            && !self.preview_curs.is_empty();
 
         // Per-track output trim (volume x gain, linear) snapshotted once per
         // cycle; applied to each clip's PLAYBACK contribution only, so the
@@ -2964,7 +3088,7 @@ impl ProcessHandler for Proc {
         let mut nrec = 0usize;
         for (t, &s) in st_now.iter().enumerate() {
             if s != self.prev_rec[t] {
-                self.rec_full &= !(1u16 << t);
+                self.rec_full &= !(1u128 << t);
                 self.prev_rec[t] = s;
             }
             if s == TR_REC {
@@ -3165,12 +3289,15 @@ impl ProcessHandler for Proc {
         // chains there is nothing to run at all. `has_entries` is
         // block-constant: the accumulator only needs refilling when this
         // block actually holds clip windows.
-        let has_entries = !entries.is_empty();
         let mut mixer_live = clip_sound;
+        let mut chain_mask = [false; MAX_LOOPS];
+        let mut any_chain = false;
+        for (t, m) in chain_mask.iter_mut().enumerate() {
+            *m = !self.fx_cache[t].is_empty();
+            any_chain |= *m;
+        }
         if transport && !mixer_live {
-            mixer_live = (0..MAX_LOOPS).any(|t| {
-                self.engine.track_on(t) && !self.fx_cache[t].is_empty()
-            });
+            mixer_live = any_chain;
         }
         // Per-track sample accumulators for the clip mix.
         let mut acc = [0.0f32; MAX_LOOPS];
@@ -3183,6 +3310,25 @@ impl ProcessHandler for Proc {
         }
         let sel_vst = audible[sel] && self.fx_cache[sel].has_vst();
         let has_vst = vst_mask.iter().any(|v| *v) || sel_vst;
+
+        // v0.10 (128 tracks): compact per-block lists of the tracks that can
+        // actually contribute — clip windows, live MIDI, or a non-empty FX
+        // chain (whose tail must keep decaying). The per-sample loop below
+        // touches ONLY these, so an empty 128-track project costs exactly
+        // what an empty 16-track one did before.
+        let mut entry_mask = 0u128;
+        for e in entries.iter() {
+            entry_mask |= 1u128 << e.track;
+        }
+        let lists = build_mix_lists(
+            entry_mask,
+            has_midi,
+            &self.midi_live,
+            &audible,
+            &vst_mask,
+            &chain_mask,
+        );
+        let MixLists { mix: mix_list, n_mix: nmix, acc: acc_list, n_acc: nacc } = lists;
 
         // Per-block mix buffers (taken out of self so the sample loop can
         // call `&mut self` effect code freely; `clip_buf` uses the same trick).
@@ -3233,11 +3379,11 @@ impl ProcessHandler for Proc {
             if any_rec {
                 for &ti in &rec_tracks[..nrec] {
                     let t = ti as usize;
-                    if self.engine.rec_sample(t, src_in) && self.rec_full & (1u16 << t) == 0 {
+                    if self.engine.rec_sample(t, src_in) && self.rec_full & (1u128 << t) == 0 {
                         // Capacity reached: stop capturing into this track;
                         // the manager still hasn't been told, so finish the
                         // take here and hand it over asynchronously.
-                        self.rec_full |= 1u16 << t;
+                        self.rec_full |= 1u128 << t;
                         self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
                         self.engine.mark_take_pending(t);
                     }
@@ -3250,8 +3396,10 @@ impl ProcessHandler for Proc {
             let mut play_l = 0.0f32;
             let mut play_r = 0.0f32;
             if live && mixer_live {
-                if has_entries || has_midi {
-                    acc.fill(0.0);
+                if nacc != 0 {
+                    for k in 0..nacc {
+                        acc[acc_list[k] as usize] = 0.0;
+                    }
                     for e in entries.iter() {
                         if i >= e.i0 && i < e.i1 {
                             let mut v = unsafe { *e.ptr.add(i - e.i0) } * e.gain;
@@ -3265,25 +3413,26 @@ impl ProcessHandler for Proc {
                         }
                     }
                     if has_midi {
-                        for (t, ml) in self.midi_live.iter().enumerate() {
-                            if *ml && i < block_n {
+                        for &tt in &acc_list[..nacc] {
+                            let t = tt as usize;
+                            if self.midi_live[t] && i < block_n {
                                 acc[t] += self.midi_scratch[t][i];
                             }
                         }
                     }
                 }
-                for (t, &a) in acc.iter().enumerate() {
-                    if audible[t] {
-                        if vst_mask[t] {
-                            // Held back: this track's chain (scripts and
-                            // plugins, in chain order) runs block-wise over
-                            // the pre-pan sum after the sample loop.
-                            trk_bufs[t][i] = a * amp[t];
-                        } else {
-                            let m = self.fx_mix(t, a * amp[t]);
-                            play_l += m * pgl[t];
-                            play_r += m * pgr[t];
-                        }
+                for &tt in &mix_list[..nmix] {
+                    let t = tt as usize;
+                    let a = acc[t];
+                    if vst_mask[t] {
+                        // Held back: this track's chain (scripts and
+                        // plugins, in chain order) runs block-wise over
+                        // the pre-pan sum after the sample loop.
+                        trk_bufs[t][i] = a * amp[t];
+                    } else {
+                        let m = self.fx_mix(t, a * amp[t]);
+                        play_l += m * pgl[t];
+                        play_r += m * pgr[t];
                     }
                 }
             }
@@ -3346,10 +3495,17 @@ impl ProcessHandler for Proc {
             // Auto-stops when the buffer runs out.
             let mut pvc = 0.0f32;
             if self.preview_live {
-                if self.preview_idx < self.preview.len() {
-                    pvc = self.preview[self.preview_idx] * F1S2;
-                    self.preview_idx += 1;
-                } else {
+                let mut any = false;
+                for (k, (_, idx)) in self.preview_curs.iter_mut().enumerate() {
+                    let buf = &self.preview[k].2;
+                    if *idx < buf.len() {
+                        pvc += buf[*idx] * F1S2;
+                        *idx += 1;
+                        any = true;
+                    }
+                }
+                if !any {
+                    // All voices finished: auto-stop like a single one-shot.
                     self.preview_live = false;
                     self.engine.preview_on.store(0, Ordering::Relaxed);
                 }
@@ -3913,4 +4069,217 @@ mod tests {
         let e = Engine::new();
         assert_eq!(e.metro(), (false, 120, 1, 4));
     }
+
+    // ===================== v0.10 acceptance pins =====================
+
+    /// AC8.1/8.2: the audition pool is additive — every start is a new
+    /// voice, and the same asset twice is two voices with distinct ids.
+    #[test]
+    fn v10_preview_voices_play_in_parallel() {
+        let e = Engine::new();
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 100]);
+        let b: Arc<[f32]> = Arc::from(vec![0.25f32; 80]);
+        e.play_preview(1, a.clone());
+        e.play_preview(2, b.clone());
+        let snap = e.preview_snapshot();
+        assert_eq!(snap.len(), 2, "two starts = two simultaneous voices");
+        assert_eq!(snap[0].1, 1);
+        assert_eq!(snap[1].1, 2);
+        assert_ne!(snap[0].0, snap[1].0, "voice ids are unique");
+        assert!(e.preview_active());
+    }
+
+    #[test]
+    fn v10_preview_same_asset_twice_is_two_voices() {
+        let e = Engine::new();
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 100]);
+        e.play_preview(7, a.clone());
+        e.play_preview(7, a);
+        let snap = e.preview_snapshot();
+        assert_eq!(snap.len(), 2, "a repeat of the SAME asset stacks, never cuts off");
+        assert_ne!(snap[0].0, snap[1].0);
+    }
+
+    #[test]
+    fn v10_preview_voices_retire_and_stop_clears() {
+        let e = Engine::new();
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 40]);
+        let b: Arc<[f32]> = Arc::from(vec![0.5f32; 40]);
+        e.play_preview(3, a.clone());
+        e.play_preview(4, b.clone());
+        // Rack toggle stops ONLY that asset's voices (AC8.4 semantics).
+        e.stop_preview_id(3);
+        let snap = e.preview_snapshot();
+        assert_eq!(snap.len(), 1, "stopping asset 3 leaves asset 4 auditioning");
+        assert_eq!(snap[0].1, 4);
+        assert!(e.preview_active(), "a voice is still playing");
+        e.stop_preview_id(4);
+        assert!(e.preview_snapshot().is_empty());
+        assert!(!e.preview_active(), "nothing left: auditions fully stopped");
+        // Global stop clears everything at once.
+        e.play_preview(5, a.clone());
+        e.play_preview(6, a);
+        e.stop_preview();
+        assert!(e.preview_snapshot().is_empty());
+        assert!(!e.preview_active());
+    }
+
+    #[test]
+    fn v10_preview_voice_pool_is_bounded() {
+        let e = Engine::new();
+        for i in 0..30u32 {
+            let a: Arc<[f32]> = Arc::from(vec![0.05f32; 20]);
+            e.play_preview(i, a);
+        }
+        let snap = e.preview_snapshot();
+        assert!(snap.len() <= 12, "pool stays bounded: {}", snap.len());
+        // Oldest-first eviction: the most recent start survives.
+        assert_eq!(snap.last().unwrap().1, 29);
+    }
+
+    /// AC7.2: per-block work scales with ACTIVE tracks, not the 128
+    /// capacity — the compact lists must hold exactly the sounding ones.
+    #[test]
+    fn v10_active_track_list_compact() {
+        let mut audible = [true; MAX_LOOPS];
+        let no = [false; MAX_LOOPS];
+        let mut midi_live = [false; MAX_LOOPS];
+        let mut chain = [false; MAX_LOOPS];
+
+        // One clip on track 70 in a 128-track project.
+        let l = build_mix_lists(1u128 << 70, false, &midi_live, &audible, &no, &chain);
+        assert_eq!(l.n_mix, 1, "only the clip track reaches the mix loop");
+        assert_eq!(l.mix[0], 70);
+        assert_eq!(l.n_acc, 1);
+
+        // Live MIDI on 9 and an FX chain tail on 5 add exactly two more.
+        midi_live[9] = true;
+        chain[5] = true;
+        let l = build_mix_lists(1u128 << 70, true, &midi_live, &audible, &no, &chain);
+        assert_eq!(l.n_mix, 3);
+        assert_eq!(l.n_acc, 2, "tail track accumulates nothing");
+
+        // Inaudible (track-off) contributes nothing at all.
+        audible = [false; MAX_LOOPS];
+        let l = build_mix_lists(1u128 << 70, true, &midi_live, &audible, &no, &chain);
+        assert_eq!(l.n_mix, 0);
+    }
+
+    /// AC7.1: tracks past the old 16 limit are real: track 64 plays, and
+    /// its play flag mutes it like any other track.
+    #[test]
+    fn v10_track_64_plays_and_mutes() {
+        let a: Arc<[f32]> = Arc::from((0..1000).map(|k| ((k % 40) as f32) * 0.01 - 0.2).collect::<Vec<f32>>());
+        let mut arr = Arrangement::new();
+        arr.insert(64, 0, Clip::new(0, 0));
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![a]), Arc::new(arr), 1000);
+        let out = e.render_project().expect("render");
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.05, "clip on track 64 must sound (peak {peak})");
+
+        e.set_track_on(64, false);
+        let out = e.render_project().unwrap_or_default();
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(peak < 1e-9, "stopped track 64 must be silent, got {peak}");
+    }
+
+    /// AC6.1 (sample side): a track's audio clip renders EXACTLY its
+    /// samples — no synth, no doubling — even when the same engine also
+    /// holds a MIDI clip elsewhere.
+    #[test]
+    fn v10_audio_clip_is_sample_only_midi_is_synth_only() {
+        let a: Arc<[f32]> = Arc::from((0..600).map(|k| (k as f32) * 0.001 - 0.3).collect::<Vec<f32>>());
+        // Pattern asset (id 1) on track 2: the SAMPLE path must ignore it
+        // entirely — pattern audio comes only through the track's synth,
+        // which the head render never runs.
+        let pat = crate::midipat::Pattern::new(120);
+        let mut arr = Arrangement::new();
+        arr.insert(1, 0, Clip::new(0, 0));
+        arr.insert(2, 0, Clip::new(1, 0));
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![a.clone(), Arc::from(Vec::<f32>::new())]), Arc::new(arr), 600);
+        e.set_midi_assets(Arc::new(vec![None, Some(std::sync::Arc::new(pat))]));
+        let out = e.render_project().expect("render");
+        assert_eq!(out.len(), 600);
+        for (i, want) in a.iter().enumerate() {
+            assert!(
+                (out[i] - want).abs() < 1e-6,
+                "sample {i}: {} vs {want} — audio clip must render exactly its samples",
+                out[i]
+            );
+        }
+        // A pattern clip contributes zero samples to the render.
+        let mut arr2 = Arrangement::new();
+        arr2.insert(2, 0, Clip::new(1, 0));
+        let e2 = Engine::new();
+        e2.set_project(Arc::new(vec![a]), Arc::new(arr2), 600);
+        e2.set_midi_assets(Arc::new(vec![None, Some(std::sync::Arc::new(crate::midipat::Pattern::new(120)))]));
+        let out = e2.render_project().unwrap_or_default();
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(peak < 1e-9, "a MIDI clip never renders raw samples (peak {peak})");
+    }
+
+
+    /// AC1.3: the full user flow with NO re-selection ritual: bind a fresh
+    /// sampler to asset id 2, play a note (must sound); then the user drags
+    /// a NEW sample in under the same asset id and plays again — the new
+    /// content sounds immediately. Both stages use the SAME instance, i.e.
+    /// exactly what the track keeps while the user swaps samples.
+    #[test]
+    fn v10_sampler_binding_needs_no_ritual() {
+        let dir = std::env::temp_dir().join(format!("sp-ritual-{}", std::process::id()));
+        std::env::set_var("SLOOPER_SYNTHS_DIR", &dir);
+        let reg = crate::synth::Registry::open(dir.clone());
+        std::env::remove_var("SLOOPER_SYNTHS_DIR");
+
+        let table = |v: f32| {
+            let mut t: Vec<crate::assets::AssetData> =
+                (0..3).map(|_| std::sync::Arc::from(Vec::<f32>::new())).collect();
+            t[2] = std::sync::Arc::from(vec![v; 1200]);
+            std::sync::Arc::new(t)
+        };
+        crate::synth::set_host_assets(table(0.85), 48_000);
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[2.0, 48.0, 1.0])
+            .expect("fresh sampler binds without ritual");
+        let render = |inst: &crate::synth::Instance| {
+            let mut ev = vec![(0u64, 3u8, 0u8, 60u8, 110u8), (30_000, 0, 0, 60, 0)];
+            let mut out = vec![0f32; 48_000 / 8];
+            render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
+            out.iter().fold(0f32, |m, x| m.max(x.abs()))
+        };
+        let first = render(&inst);
+        assert!(first > 0.5, "first bound sample must sound (peak {first})");
+        // User drags a new sample in (same id, new contents) — play again.
+        crate::synth::set_host_assets(table(0.05), 48_000);
+        let second = render(&inst);
+        assert!(
+            second < first / 8.0 && second > 0.01,
+            "new sample must sound without re-selecting the synth: {second} vs {first}"
+        );
+        crate::synth::set_host_assets(std::sync::Arc::new(Vec::new()), 48_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AC6.2: audition voices are additive AND isolated per asset: stopping
+    /// one asset never touches another voice, and the same asset stacks.
+    #[test]
+    fn v10_audition_voices_are_additive_and_isolated() {
+        let e = Engine::new();
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 500]);
+        let b: Arc<[f32]> = Arc::from(vec![0.5f32; 500]);
+        e.play_preview(1, a.clone());
+        e.play_preview(1, a.clone()); // repeat of the same asset stacks
+        e.play_preview(2, b);
+        let snap = e.preview_snapshot();
+        assert_eq!(snap.len(), 3, "three additive voices live");
+        e.stop_preview_id(1);
+        let snap = e.preview_snapshot();
+        assert_eq!(snap.len(), 1, "asset 1's voices all stop; asset 2 survives");
+        assert_eq!(snap[0].1, 2);
+        e.stop_preview_id(99); // unknown id: no-op, never panics
+        assert_eq!(e.preview_snapshot().len(), 1);
+    }
+
 }

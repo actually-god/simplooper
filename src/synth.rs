@@ -40,7 +40,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
 ];
 /// Bump when a bundled script changes, so shipped fixes replace the user
 /// folder's copy (with a `.bak` backup) instead of freezing at first seed.
-const BUNDLED_VERSION: &str = "5";
+const BUNDLED_VERSION: &str = "6";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
@@ -696,6 +696,8 @@ mod tests {
         }
     }
 
+
+
     /// v0.8 item 2: "the sampler doesn't currently work" — beyond making
     /// sound, the sampler must PITCH the rack asset by the semitone
     /// distance from its root note: +12 st ⇒ exactly twice the rate.
@@ -865,4 +867,64 @@ mod tests {
         assert!(errs.iter().any(|(s, _)| s == "broken"), "errors: {errs:?}");
         assert!(!reg.stems().contains(&"broken".to_string()));
     }
+
+    // ===================== v0.10 acceptance pins =====================
+
+    fn v10_host_table(data: Vec<f32>, extra: usize) {
+        let mut v: Vec<crate::assets::AssetData> =
+            (0..extra + 1).map(|_| std::sync::Arc::from(Vec::<f32>::new())).collect();
+        v[2] = std::sync::Arc::from(data);
+        set_host_assets(std::sync::Arc::new(v), 48_000);
+    }
+
+    /// AC1.1: a note staged at sample 0 of the very first block must sound
+    /// — the sampler syncs its buffer inside process(), and without priming
+    /// the first note_on landed on an empty buffer (the "must re-select the
+    /// synth for it to work" bug).
+    #[test]
+    fn v10_sampler_note_at_block_zero_is_not_dropped() {
+        let reg = test_registry("v10-first-note");
+        v10_host_table(vec![0.8f32; 900], 2);
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[2.0, 48.0, 1.0])
+            .expect("sampler instance");
+        let mut ev = vec![(0u64, 3u8, 0u8, 60u8, 110u8), (40_000, 0, 0, 60, 0)];
+        let mut out = vec![0f32; 48_000 / 4];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.05, "first note dropped: peak {peak}");
+    }
+
+    /// AC1.2: re-recording / re-deriving a sample keeps its asset id — the
+    /// sampler must notice the content moved and replay the NEW data
+    /// (previously it kept the stale buffer until the synth was re-bound).
+    #[test]
+    fn v10_sampler_rereads_asset_when_content_moves() {
+        let reg = test_registry("v10-stale");
+        v10_host_table(vec![0.9f32; 900], 2);
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[2.0, 48.0, 1.0])
+            .expect("sampler instance");
+        let render = |inst: &Instance| {
+            let mut ev = vec![(0u64, 3u8, 0u8, 60u8, 110u8), (40_000, 0, 0, 60, 0)];
+            let mut out = vec![0f32; 48_000 / 8];
+            crate::audio::render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
+            out.iter().fold(0f32, |m, x| m.max(x.abs()))
+        };
+        let peak1 = render(&inst);
+        assert!(peak1 > 0.5, "loud sample must render loud (peak {peak1})");
+
+        // Same asset id, new contents (a quieter take).
+        v10_host_table(vec![0.02f32; 700], 2);
+        let peak2 = render(&inst);
+        assert!(
+            peak2 < peak1 / 10.0,
+            "sampler replayed STALE data: old {peak1} vs new {peak2}"
+        );
+
+        // Nothing moved since: identical render (no re-copy churn).
+        let peak3 = render(&inst);
+        assert!((peak3 - peak2).abs() < 1e-6, "stable table must not alter output");
+    }
+
 }
