@@ -201,8 +201,10 @@ editable in the [piano roll](#piano-roll), notes visible on the clip.
 Each track plays its MIDI clips through its own **synth binding** (the
 `♪ …` combo on the strip):
 
-- **default (piano)** — a bundled physical-modelled (modal string + hammer)
-  piano; any track without an explicit binding falls back to it.
+- **default (piano)** — a bundled **recorded grand piano**: a multisample
+  instrument (loop-aware zones across the full keyboard, real hammer and
+  damper behaviour) built from the open TimGM6mb soundfont — not a synthetic
+  model; any track without an explicit binding falls back to it.
 - **sampler** — a bundled script that plays any rack asset pitched around a
   **root note** (the slider shows `C3`-style note names).
 - **other script synths** — plain Rust files in
@@ -223,7 +225,11 @@ mixes.
 
 ## Piano roll
 
-The grid toolbar's **♫ Piano roll** opens a full-window MIDI note editor:
+The grid toolbar's **♫ Piano roll** opens a full-window MIDI note editor.
+**With a MIDI clip selected (or a MIDI asset picked in the rack) it opens
+THAT for editing** — save overwrites the asset in place and every clip
+using it updates. Otherwise it starts a fresh pattern you can save as a
+new asset:
 
 - **Draw** notes on the snap grid (click), drag bodies to move, **drag the
   note edges** to resize (arm-on-press, like grid clips), marquee-box to
@@ -236,9 +242,13 @@ The grid toolbar's **♫ Piano roll** opens a full-window MIDI note editor:
   every note onto the quantize grid), **▶ preview**, **clear**, and
   **save**. The status shows `notes · bars · bpm` — the tempo **is** the
   metronome's; change the bpm up top and the roll follows.
-- **save** writes a `roll.mid` (unique name) into the **primary folder**,
-  adds it as an asset, and places a clip on the selected track at the
-  playhead.
+- **save** on a fresh pattern writes `roll.mid` (unique name) into the
+  **primary folder**, adds it as an asset, and places a clip on the
+  playhead of the selected track. On an **opened asset** it overwrites that
+  asset's file in place — no new asset, no new clip.
+- Scrolling: the wheel scrolls the keyboard (up = higher notes), **Ctrl +
+  wheel** zooms time, **Alt + wheel** zooms rows — the same as the two
+  **zoom time** / **zoom rows** sliders in the roll's toolbar.
 - The roll **fills the window** with its own H/V scrollbars and takes
   keyboard focus when clicked — while it holds focus, main-window shortcuts
   (Space included) don't fire; the **X** in its title bar closes just the

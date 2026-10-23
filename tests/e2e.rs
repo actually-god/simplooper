@@ -1796,8 +1796,13 @@ fn e2e_preview_renders_and_plays() {
     let head_rms = rms(&buf[(sr as usize) / 20..(sr as usize) / 20 + win]);
     let mid_rms = rms(&buf[(sr as usize)..(sr as usize) + win]);
     assert!(head_rms > 1e-3, "preview head must carry audio: {head_rms}");
+    // "Not a blip": the note lasts 1.5 s, so 0.5–1.0 s must still carry it.
+    // The recorded piano DECAYS (a real grand loses roughly half its level
+    // in the first second), so the bar is a blip-proof floor, not the flat
+    // sustain the old oscillator piano made easy: a 30 ms blip leaves
+    // mid_rms ~1e-4 here.
     assert!(
-        mid_rms > 0.2 * head_rms && mid_rms > 2e-3,
+        mid_rms > 0.05 * head_rms && mid_rms > 2e-3,
         "preview must sustain, not blip: mid {mid_rms} vs head {head_rms}"
     );
 

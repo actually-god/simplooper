@@ -60,13 +60,17 @@ guide](docs/AGENT-GUIDE.md)
   asset in the primary folder plus a placed clip — playable, editable in the
   piano roll, and shown as notes on the clip itself.
 - **Instruments & synths** — every track binds a synthesizer: the bundled
-  **modal piano** (physical-modelled, credit in `synths/`), the **sampler**
+  **grand piano** (recorded multisample instrument built from the open
+  TimGM6mb soundfont; generator in `tools/`, credit in `synths/`), the
+  **sampler**
   script (plays any rack asset pitched around a root note shown as `C3`-style
   note names), or **any scanned VSTi**. Parameters open in a sliders window;
   VST2 instruments can open their native editor window (see
   [docs/PLUGINS.md](docs/PLUGINS.md)).
 - **Piano roll** — the grid toolbar's **♫ Piano roll** opens a full-window
-  note editor: draw notes on the snap grid, drag to move, edge-resize,
+  note editor: with a MIDI clip or rack asset selected it **opens that
+  asset for editing** (save overwrites it in place), otherwise it starts a
+  fresh pattern; draw notes on the snap grid, drag to move, edge-resize,
   marquee / Ctrl / Shift select, Ctrl + C/V/A, one-click **quantize**.
   Preview routes through the picked track's *synth + effects chain*; the
   tempo follows the metronome. **save** writes the pattern as a MIDI asset
