@@ -300,6 +300,10 @@ struct PianoRoll {
     /// frame. `WindowResponse.response.rect` excludes the title bar, so
     /// anything that locates the title bar (tests, close logic) needs this.
     win_rect: Option<egui::Rect>,
+    /// When set, the roll is EDITING this asset (opened from a selected
+    /// MIDI clip or rack asset): **save** overwrites the asset in place
+    /// instead of minting a new one.
+    edit_asset: Option<u32>,
 }
 
 /// One in-flight piano-roll canvas gesture.
@@ -2888,18 +2892,18 @@ impl App {
                 let s_px = roll.vscroll_px;
                 painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
                 let x_of = |t: f64| grid_x0 + ((t - roll.scroll_sec) * px_per_sec) as f32;
-                let y_of = |n: i32| rect.max.y - SB - (s_px + n as f32 * roll.row_h) - roll.row_h;
+                // vscroll_px counts keyboard pixels scrolled up from the
+                // bottom, so a row's TOP sits at B + s − (n+1)·r. (The old
+                // sign subtracted s: scrolling then slid the note grid one
+                // way while lo/hi and the keyboard strip moved the other —
+                // the "inverted scroll" users reported, plus notes vanishing
+                // because drawing was culled against lo..hi.)
+                let y_of = |n: i32| rect.max.y - SB + s_px - n as f32 * roll.row_h - roll.row_h;
                 let sec_at =
                     |x: f32| roll.scroll_sec + (x - grid_x0) as f64 / px_per_sec;
                 let row_at = |y: f32| -> i32 {
-                    // Row n occupies y ∈ [B - n·r - r, B - n·r) where
-                    // B = bottom minus scrollbar minus vscroll, so the
-                    // exact inverse is ceil((B - y - r)/r). The old
-                    // floor(...)+lo floored to the row BELOW for any
-                    // interior click and double-counted the scroll
-                    // (s_px is already in B) — notes were only clickable
-                    // on their top pixel row.
-                    let b = rect.max.y - SB - s_px;
+                    // Exact inverse of y_of: row = ceil((B + s − y)/r) − 1.
+                    let b = rect.max.y - SB + s_px;
                     (((b - y - roll.row_h) / roll.row_h).ceil() as i32).clamp(0, 127)
                 };
 
@@ -3413,10 +3417,17 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add(Slider::new(&mut roll.new_vel, 1..=127).text("vel"))
                         .on_hover_text("Velocity of newly drawn notes");
-                    ui.add(Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("px/beat"))
-                        .on_hover_text("Ctrl+wheel over the grid does this too");
-                    ui.add(Slider::new(&mut roll.row_h, 6.0..=22.0).text("row px"))
-                        .on_hover_text("Alt+wheel over the grid does this too");
+                    // The old "px/beat"/"row px" units were engineering
+                    // labels, not what the sliders do: they are the two
+                    // zoom controls (user complaint: "mislabeled").
+                    ui.add(
+                        Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("zoom time"),
+                    )
+                    .on_hover_text("Horizontal zoom (pixels per beat) \u{b7} ctrl+wheel over the grid does this too");
+                    ui.add(
+                        Slider::new(&mut roll.row_h, 6.0..=22.0).text("zoom rows"),
+                    )
+                    .on_hover_text("Vertical zoom (pixels per semitone row) \u{b7} alt+wheel over the grid does this too");
                     ui.label(
                         RichText::new(
                             "drag empty = draw \u{b7} drag note = move \u{b7} yellow caps = resize \u{b7} ctrl/shift+drag = box select \u{b7} right-click = delete",
@@ -3494,7 +3505,10 @@ impl App {
             }
         }
         if save {
-            self.save_piano_roll(&mut roll.pat, sel);
+            match roll.edit_asset {
+                Some(id) => self.update_piano_roll_asset(&mut roll.pat, id),
+                None => self.save_piano_roll(&mut roll.pat, sel),
+            }
             roll.sel_notes.clear();
             roll.sel_anchor = None;
         }
@@ -3518,6 +3532,29 @@ impl App {
             roll.drag_notes.clear();
         }
         self.piano_roll = Some(roll);
+    }
+
+    /// In-place edit-save: overwrite the MIDI asset the roll was opened
+    /// from (file + in-memory pattern), refresh the engine. No new asset,
+    /// no new clip — every clip already pointing at it plays the update.
+    fn update_piano_roll_asset(&mut self, pat: &mut Pattern, id: u32) {
+        pat.sort();
+        let a = match self.assets.get_mut(id as usize) {
+            Some(a) => a,
+            None => {
+                self.status = "piano roll: the edited asset no longer exists".into();
+                return;
+            }
+        };
+        if let Err(e) = pat.save_mid(&a.path) {
+            self.status = format!("piano roll: {e}");
+            return;
+        }
+        let name = a.name.clone();
+        a.pattern = Some(Arc::new(pat.clone()));
+        a.dirty = false;
+        self.push_project();
+        self.status = format!("piano roll: updated \u{201c}{name}\u{201d} in place");
     }
 
     /// Bounce the piano roll: unique .mid in the primary folder, new asset,
@@ -3782,7 +3819,8 @@ impl App {
                             match crate::vstedit::open_editor(&h, pth.as_str(), entry.name()) {
                                 Ok(w) => {
                                     self.status = format!(
-                                        "{}: editor window opened",
+                                        "{}: opening plugin window \u{2014} if the plugin \
+                                         cannot draw it, the sliders below take over",
                                         entry.name()
                                     );
                                     self.vst_editors.insert(t, w);
@@ -3834,7 +3872,9 @@ impl App {
             self.vst_editors.remove(&t);
         }
         if refused {
-            self.status = "editor: plugin refused to open its window".into();
+            self.status = "plugin editor could not draw (or refused to open) \u{2014} the \
+                           sliders set this plugin's parameters instead"
+                .into();
         }
     }
 
@@ -5638,15 +5678,46 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
         if ui
             .button(RichText::new("\u{266b} Piano roll").strong())
             .on_hover_text(
-                "Open the piano-roll editor: draw notes on the snap grid, \
-                 save the pattern as a MIDI asset (primary folder) and drop \
-                 it onto a track",
+                "Open the piano-roll editor. With a MIDI clip selected (or a \
+                 MIDI asset picked in the rack) the roll OPENS THAT for \
+                 editing — save overwrites it in place. Otherwise it starts a \
+                 fresh pattern; save then creates a new asset + clip.",
             )
             .clicked()
             && app.piano_roll.is_none()
         {
-            let mut pat = Pattern::new(app.bpm().clamp(20, 999) as u16);
-            pat.len_ticks = 4 * PPQ as u32;
+            // Edit target: the single selected clip's asset, else the
+            // rack-selected asset — and only when it is a MIDI (pattern)
+            // asset. Anything else keeps the old fresh-pattern behaviour.
+            let edit = app
+                .sel_clips
+                .first()
+                .filter(|_| app.sel_clips.len() == 1)
+                .and_then(|(t, k, c)| {
+                    let cl = app.arr.tracks.get(*t)?.lanes.get(*k)?.clips.get(*c)?;
+                    Some(cl.asset)
+                })
+                .or_else(|| app.sel_asset.map(|i| i as u32))
+                .filter(|id| {
+                    app.assets
+                        .get(*id as usize)
+                        .and_then(|a| a.pattern.as_ref())
+                        .is_some()
+                });
+            let mut pat = match edit {
+                Some(id) => (**app.assets[id as usize].pattern.as_ref().unwrap()).clone(),
+                None => {
+                    let mut p = Pattern::new(app.bpm().clamp(20, 999) as u16);
+                    p.len_ticks = 4 * PPQ as u32;
+                    p
+                }
+            };
+            pat.bpm = app.bpm().clamp(20, 999) as u16;
+            if edit.is_some() {
+                app.status =
+                    "piano roll: editing the selected MIDI asset \u{2014} save overwrites it"
+                        .into();
+            }
             app.piano_roll = Some(Box::new(PianoRoll {
                 pat,
                 px_per_beat: 90.0,
@@ -5662,6 +5733,7 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 drag_notes: Vec::new(),
                 focused: true,
                 win_rect: None,
+                edit_asset: edit,
             }));
         }
         ui.label(RichText::new("grid:").strong());
@@ -9431,6 +9503,16 @@ mod tests {
         // 4) Preview renders audio: PreviewPlay fires and the status is not
         // the "no synth available" failure. (Match the BUTTON, not the
         // "preview:" combo label.)
+        //
+        // Quality gate first: the rendered buffer itself must contain real
+        // signal — "preview doesn't work with any synth" shipped once as a
+        // silent success, so peak level is asserted, not just status text.
+        {
+            let pat = app.piano_roll.as_ref().unwrap().pat.clone();
+            let buf = app.render_pattern_preview(&pat).expect("preview render");
+            let peak = buf.iter().fold(0f32, |m, s| m.max(s.abs()));
+            assert!(peak > 1e-3, "preview through the default synth must make sound, peak {peak}");
+        }
         app.drain_events();
         let pv = find_galley(&mut app, &ctx, "\u{25b6} preview")
             .expect("preview button")
@@ -9540,6 +9622,192 @@ mod tests {
         // Saving again bumps the name (roll-2.mid), never overwrites.
         app.save_piano_roll(&mut pat, 2);
         assert!(app.assets.last().unwrap().name.contains("roll-2"));
+    }
+
+    /// Item 3+4 regression pins: opening the roll with a MIDI asset
+    /// SELECTED (clip or rack) edits that asset in place, the wheel scrolls
+    /// the note grid in the conventional direction (wheel up = view up =
+    /// higher notes, matching the lo/hi culling the old sign contradicted),
+    /// and save on an edited asset overwrites the file instead of minting
+    /// a new asset.
+    #[test]
+    fn v08_roll_edits_selected_asset_and_wheel_direction() {
+        fn galley_of(
+            app: &mut App,
+            ctx: &egui::Context,
+            needle: &str,
+            exact: bool,
+        ) -> Option<egui::Rect> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let txt = t.galley.text();
+                    let m = if exact { txt == needle } else { txt.contains(needle) };
+                    if m {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.map(|p| egui::Rect::from_min_size(p, egui::vec2(4.0, 12.0)))
+        }
+
+        let mut app = headless_app("rolldit");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sample_rate = 48_000;
+
+        // One MIDI asset + a clip pointing at it.
+        let mut pat = Pattern::new(120);
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
+        let before = app.assets.len();
+        app.save_piano_roll(&mut pat, 1);
+        let id = app.assets.len() as u32 - 1;
+        let sel = app
+            .arr
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(t, tr)| {
+                tr.lanes.iter().enumerate().flat_map(move |(k, l)| {
+                    l.clips
+                        .iter()
+                        .enumerate()
+                        .filter(move |c| c.1.asset == id)
+                        .map(move |(c, _)| (t, k, c))
+                })
+            })
+            .next()
+            .expect("placed clip");
+        app.sel_clips = vec![sel];
+        let n_assets = app.assets.len();
+        assert_eq!(n_assets, before + 1);
+
+        // Open through the toolbar button: it must load the selection.
+        let btn = galley_of(&mut app, &ctx, "Piano roll", false)
+            .expect("toolbar button")
+            .center();
+        frame(&mut app, &ctx, vec![moved(btn), btn_btn(btn, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(btn, false)]);
+        {
+            let roll = app.piano_roll.as_ref().expect("roll opened");
+            assert_eq!(roll.edit_asset, Some(id), "opens the SELECTED asset for editing");
+            assert_eq!(roll.pat.notes.len(), 1, "asset notes loaded into the roll");
+        }
+        for _ in 0..8 {
+            frame(&mut app, &ctx, vec![]);
+        }
+
+        // Wheel direction over the canvas: positive delta (wheel up /
+        // scroll-up) raises vscroll_px — the direction the lo/hi note
+        // culling and the keyboard strip already move.
+        let canvas = app.piano_roll.as_ref().unwrap().canvas_rect.expect("canvas rect");
+        let c = canvas.center();
+        let wheel = |dy: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, &ctx, vec![moved(c)]);
+        let s0 = app.piano_roll.as_ref().unwrap().vscroll_px;
+        frame(&mut app, &ctx, vec![wheel(1.0)]);
+        let s1 = app.piano_roll.as_ref().unwrap().vscroll_px;
+        assert!(s1 > s0, "wheel up scrolls the keyboard up ({s0} -> {s1})");
+        frame(&mut app, &ctx, vec![wheel(-1.0), wheel(-1.0)]);
+        let s2 = app.piano_roll.as_ref().unwrap().vscroll_px;
+        assert!(s2 < s1, "wheel down scrolls back down ({s1} -> {s2})");
+
+        // Edit and SAVE: in place, no new asset, file really updated.
+        app.piano_roll
+            .as_mut()
+            .unwrap()
+            .pat
+            .notes
+            .push(crate::midipat::Note {
+                ch: 0,
+                note: 64,
+                vel: 90,
+                press: 0,
+                start: 480,
+                len: 240,
+            });
+        let sv = galley_of(&mut app, &ctx, "save", true).expect("roll save button");
+        let sv = sv.center();
+        frame(&mut app, &ctx, vec![moved(sv), btn_btn(sv, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(sv, false)]);
+        assert!(
+            app.status.contains("in place"),
+            "in-place save status: {}",
+            app.status
+        );
+        assert_eq!(app.assets.len(), n_assets, "no new asset minted");
+        assert_eq!(app.assets[id as usize].pattern.as_ref().unwrap().notes.len(), 2);
+        let back = Pattern::load_mid(&app.assets[id as usize].path).unwrap();
+        assert_eq!(back.notes.len(), 2, "the .mid on disk was rewritten");
+
+        // Bottom-toolbar zoom sliders carry honest labels now (the old
+        // "px/beat" / "row px" engineering units read as mislabeled).
+        let labels_raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(labels_raw, |ui| app.ui_root(ui));
+        let has = |needle: &str| {
+            out.shapes.iter().any(|cs| {
+                matches!(&cs.shape, egui::epaint::Shape::Text(t)
+                    if t.galley.text().contains(needle))
+            })
+        };
+        assert!(has("zoom time"), "time-zoom slider must read 'zoom time'");
+        assert!(has("zoom rows"), "row-zoom slider must read 'zoom rows'");
+    }
+
+    /// The preview path must put real signal through the chosen synth —
+    /// "preview doesn't work with any synth" was silent-success rendering.
+    #[test]
+    fn v08_preview_default_synth_makes_sound() {
+        let mut app = headless_app("prevsound");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sample_rate = 48_000;
+        let mut pat = Pattern::new(120);
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 57,
+            vel: 110,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
+        let buf = app.render_pattern_preview(&pat).expect("preview renders");
+        let peak = buf.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 1e-3, "preview peak must be audible, got {peak}");
+        // Second render must also work right after a "playhead move" (the
+        // old per-click synth instance died silently on the second go).
+        let buf2 = app.render_pattern_preview(&pat).expect("second preview");
+        let peak2 = buf2.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak2 > 1e-3, "repeat preview peak, got {peak2}");
     }
 
     /// Mixer chain regression pin: the "FX" chip opens the unified per-track
