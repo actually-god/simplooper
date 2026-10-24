@@ -96,6 +96,27 @@ counts). Without X11 the button reports it and the slider fallback remains.
   plugin must actually create its child window or paint pixels within a
   few seconds. Only when nothing appears is the open refused — reported in
   the status bar, window torn down cleanly, sliders take over.
+- The embed probe is exact, never "non-black pixels": the container is
+  painted a sentinel background colour and counts as showing live UI only
+  when a probe pixel is neither that sentinel nor the all-zero state of a
+  not-yet-exposed window. An earlier probe accepted the container's own
+  grey background as "painted", which turned broken editors (e.g. amsynth
+  2.0's VST2 GUI, whose editor build dies mid-construction and leaves a
+  1×1 child window) into permanent blank panels instead of the slider
+  fallback (v0.10.1).
+- The title-bar **close button works**: the editor thread dispatches X
+  events instead of discarding them (`XNextEvent` returns 0 on *success*;
+  an early pump treated that as an error and dropped every
+  `WM_DELETE_WINDOW`, so the window ignored the window manager's close),
+  and it also exits when the container is destroyed outright. `cargo run
+  --release --example editor_smoke [so]` opens a real editor, verifies it,
+  injects the same `WM_DELETE_WINDOW` client message a close button sends,
+  and asserts the editor exits.
+- Known broken plugin GUIs fall back rather than hang: **amsynth 2.0's
+  VST2** (`amsynth_vst.so`) throws `unordered_map::at` during
+  instantiation/editor build in this environment — its editor window never
+  appears, slooper refuses the open within ~3 s and its parameter sliders
+  drive the plugin.
 - Probe and live instances of the same plugin binary intentionally share
   one process-lifetime load (see `vst_loader_lock` / probe-leak comments):
   plugin toolkits carry process-global state that does not survive

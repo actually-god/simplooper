@@ -41,6 +41,26 @@ fn main() {
         entry.name(),
         win.child_count()
     );
+    // If it painted, prove the WINDOW-MANAGER close button works: inject
+    // the same WM_DELETE_WINDOW client message a title-bar X sends.
+    if painted {
+        let xid = win.xid();
+        if xid != 0 && slooper::vstedit::request_wm_delete(xid) {
+            let mut closed = false;
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if win.is_closed() {
+                    closed = true;
+                    break;
+                }
+            }
+            println!("WM_DELETE_WINDOW injected: closed = {closed}");
+            if !closed {
+                win.close();
+                std::process::exit(3);
+            }
+        }
+    }
     win.close();
     drop(entry);
     println!("editor closed cleanly (effEditClose done, X window destroyed)");

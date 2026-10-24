@@ -19,6 +19,15 @@
 //! * `effEditClose` (opcode 15) must be dispatched before the plugin is
 //!   unloaded; the editor thread owns that ordering.
 //!
+//! The open is VERIFIED, not trusted: the plugin must either reparent a
+//! child window with real geometry into the container or paint pixels on
+//! it (compared against a sentinel background — never "non-black", the
+//! container's own background is not content). Nothing appearing within
+//! ~3 s means the editor is refused, the window destroyed, and the UI
+//! falls back to sliders — a blank, dead panel is never left on screen.
+//! The container pumps X events and honours `WM_DELETE_WINDOW` /
+//! `DestroyNotify`, so the window-manager close button always works.
+//!
 //! Every editor dispatch runs on ONE dedicated GUI thread per editor (Xlib
 //! is not thread-safe, and plugin UIs bind to the thread that opened them)
 //! while the audio thread keeps processing — exactly how desktop Linux VST
@@ -97,6 +106,13 @@ extern "C" {
     fn XSetErrorHandler(
         handler: Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
     ) -> Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
+    fn XSendEvent(
+        d: *mut Display,
+        w: XWindow,
+        propagate: c_int,
+        mask: u64,
+        ev: *const u64,
+    ) -> c_int;
 }
 
 extern "C" fn x_error_noop(_display: *mut c_void, _event: *mut c_void) -> c_int {
@@ -106,10 +122,22 @@ extern "C" fn x_error_noop(_display: *mut c_void, _event: *mut c_void) -> c_int 
 }
 
 const STRUCTURE_NOTIFY_MASK: u64 = 1 << 20;
+// X protocol event codes (XSendEvent(7X)): 17 DestroyNotify, 18 UnmapNotify,
+// 21 ReparentNotify, 22 ConfigureNotify, 33 ClientMessage. (An earlier
+// comment block here called 18 "ReparentNotify" — 18 is UnmapNotify.)
 const EVENT_DESTROY_NOTIFY: i32 = 17;
-const EVENT_REPARENT_NOTIFY: i32 = 18;
+const EVENT_REPARENT_NOTIFY: i32 = 21;
 const EVENT_CONFIGURE_NOTIFY: i32 = 22;
 const EVENT_CLIENT_MESSAGE: i32 = 33;
+
+/// Distinctive container background. The "did the plugin paint?" probe
+/// compares pixels against THIS, never against black: the old probe
+/// treated the window's own grey background as painted content, so a
+/// broken plugin that never drew a pixel was accepted and the user got a
+/// permanent blank panel (the amsynth report, 2026-10). Black is equally
+/// unusable — a mapped-but-never-exposed window reads all-zero under a
+/// compositing manager, indistinguishable from drawn black.
+const CONTAINER_BG: u64 = 0x2A16B4;
 
 // VST2 editor opcodes (aeff.h / vestige.h, cross-checked against the
 // vendored vst2 crate's OpCode enum).
@@ -150,9 +178,82 @@ extern "C" {
     fn XDestroyImage(img: *mut XImage) -> c_int;
 }
 
-/// True when a corner probe of `win` holds any non-black pixel — proof the
-/// plugin painted DIRECTLY on the container (VSTGUI-style editors never
-/// create a child window, so child polling alone false-negatives them).
+/// Drain and DISPATCH every pending X event on `d`, returning true when
+/// one of them says the window must close: a `WM_DELETE_WINDOW` client
+/// message (the window manager's close button), or the container's own
+/// DestroyNotify (xkill / forced close).
+///
+/// The old pump broke on `XNextEvent`'s return value — XNextEvent returns
+/// 0 on SUCCESS, so every event it read was popped off the queue and
+/// dropped before the match, and the close button did nothing (the
+/// "cannot close plugin window" report). XNextEvent blocking is not a
+/// risk either: the caller only calls it while `XPending > 0`.
+unsafe fn drain_events(d: *mut Display, win: XWindow, wm_protocols: Atom, wm_delete: Atom) -> bool {
+    let mut drained = 0;
+    while XPending(d) > 0 && drained < 256 {
+        let mut ev = [0u64; 24];
+        XNextEvent(d, &mut ev);
+        drained += 1;
+        match (ev[0] as u32) as i32 {
+            EVENT_CLIENT_MESSAGE => {
+                // XClientMessageEvent on x86_64: message_type atom
+                // (unsigned long) at byte 40 -> ev[5]; data.l[0]
+                // at byte 56 -> ev[7].
+                if ev[5] == wm_protocols && ev[7] == wm_delete {
+                    return true;
+                }
+            }
+            EVENT_DESTROY_NOTIFY => {
+                // XDestroyWindowEvent: the destroyed window is at byte 32.
+                if ev[4] == win {
+                    return true;
+                }
+            }
+            EVENT_CONFIGURE_NOTIFY | EVENT_REPARENT_NOTIFY => {
+                // Container resizes and plugin window churn: the child
+                // count and rect refresh in the caller track them.
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Send a `WM_DELETE_WINDOW` client message to an X window from a fresh
+/// connection — exactly what a window manager does when the user clicks
+/// the close button. Used by the editor close-button regression pins.
+pub fn request_wm_delete(xid: u64) -> bool {
+    xlib_threads_ready();
+    unsafe {
+        let d = XOpenDisplay(ptr::null());
+        if d.is_null() {
+            return false;
+        }
+        XSetErrorHandler(Some(x_error_noop));
+        let wm_delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
+        let wm_protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
+        // XClientMessageEvent as u64 words (x86_64): [0] type (ClientMessage
+        // = 33, int), [2] send_event, [4] window, [5] message_type,
+        // [6] format = 32, [7] data.l[0] = the protocol atom.
+        let mut ev = [0u64; 24];
+        ev[0] = EVENT_CLIENT_MESSAGE as u64;
+        ev[2] = 1;
+        ev[4] = xid;
+        ev[5] = wm_protocols;
+        ev[6] = 32;
+        ev[7] = wm_delete;
+        XSendEvent(d, xid, 0, 0, ev.as_ptr());
+        XFlush(d);
+        XCloseDisplay(d);
+        true
+    }
+}
+
+/// True when a corner probe of `win` holds any pixel that is neither the
+/// sentinel background nor the all-zero "nothing painted yet" state —
+/// proof the plugin painted DIRECTLY on the container (VSTGUI-style
+/// editors never create a child window, so child polling alone
+/// false-negatives them).
 unsafe fn container_painted(d: *mut Display, win: XWindow) -> bool {
     const ALL_PLANES: u64 = !0u64;
     const Z_PIXMAP: c_int = 2;
@@ -163,10 +264,14 @@ unsafe fn container_painted(d: *mut Display, win: XWindow) -> bool {
     let mut hit = false;
     for y in 0..24 {
         for x in 0..24 {
-            if XGetPixel(img, x, y) != 0 {
+            let p = XGetPixel(img, x, y);
+            if p != CONTAINER_BG && p != 0 {
                 hit = true;
                 break;
             }
+        }
+        if hit {
+            break;
         }
     }
     XDestroyImage(img);
@@ -210,6 +315,8 @@ pub struct EditorWindow {
     children: Arc<AtomicUsize>,
     width: Arc<AtomicI32>,
     height: Arc<AtomicI32>,
+    /// The host container's XID (0 until the editor thread creates it).
+    xid: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -246,6 +353,11 @@ impl EditorWindow {
             self.height.load(Ordering::SeqCst),
         )
     }
+    /// The host container window's XID, or 0 before the editor thread has
+    /// created it (integration tests / WM-protocol close injection).
+    pub fn xid(&self) -> u64 {
+        self.xid.load(Ordering::SeqCst) as u64
+    }
     /// Close the editor and join its thread. Idempotent.
     pub fn close(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -278,11 +390,12 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
     let children = Arc::new(AtomicUsize::new(0));
     let width = Arc::new(AtomicI32::new(0));
     let height = Arc::new(AtomicI32::new(0));
+    let xid = Arc::new(AtomicUsize::new(0));
     // Seed the container size from a pre-open rect query when offered.
     let initial = edit_rect(handle).unwrap_or((640, 420));
     let ae = *handle;
     let title = title.to_string();
-    let (t_stop, t_closed, t_failed, t_painted, t_children, t_w, t_h) = (
+    let (t_stop, t_closed, t_failed, t_painted, t_children, t_w, t_h, t_xid) = (
         stop.clone(),
         closed.clone(),
         open_failed.clone(),
@@ -290,6 +403,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         children.clone(),
         width.clone(),
         height.clone(),
+        xid.clone(),
     );
     // Vst2Handle is explicitly Send: just the AEffect address.
     let thread = std::thread::Builder::new()
@@ -297,7 +411,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         .spawn(move || {
             editor_main(
                 ae, &title, initial, t_stop, t_closed, t_failed, t_painted, t_children, t_w,
-                t_h,
+                t_h, t_xid,
             );
         })
         .map_err(|e| format!("spawn editor thread: {e}"))?;
@@ -310,6 +424,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         children,
         width,
         height,
+        xid,
         thread: Some(thread),
     })
 }
@@ -377,6 +492,7 @@ fn editor_main(
     children: Arc<AtomicUsize>,
     width: Arc<AtomicI32>,
     height: Arc<AtomicI32>,
+    xid_out: Arc<AtomicUsize>,
 ) {
     unsafe {
         if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
@@ -392,13 +508,18 @@ fn editor_main(
         }
         let root = root_window(d);
         let (w0, h0) = (initial.0.clamp(120, 16384), initial.1.clamp(60, 16384));
-        let win = XCreateSimpleWindow(d, root, 0, 0, w0, h0, 1, 0x202020, 0x181818);
+        // Border width 0 and a SENTINEL background/border (see
+        // CONTAINER_BG): the pixel probe must be able to tell "plugin
+        // drew here" apart from "empty window furniture".
+        let win = XCreateSimpleWindow(d, root, 0, 0, w0, h0, 0, CONTAINER_BG, CONTAINER_BG);
+        xid_out.store(win as usize, Ordering::SeqCst);
         XSelectInput(d, win, STRUCTURE_NOTIFY_MASK);
-        let cname = CString::new(format!("slooper \\u2014 {title}"))
+        let cname = CString::new(format!("slooper \u{2014} {title}"))
             .or_else(|_| CString::new(format!("slooper - {title}")))
             .unwrap();
         XStoreName(d, win, cname.as_ptr());
         let wm_delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
+        let wm_protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
         let mut protocols = [wm_delete];
         XSetWMProtocols(d, win, protocols.as_mut_ptr(), 1);
         XMapWindow(d, win);
@@ -437,8 +558,15 @@ fn editor_main(
         // idle and poll the plugin's child windows: only once one shows
         // up with real geometry do we consider the editor alive.
         let mut painted_now = false;
+        let mut user_closed = false;
         for _it in 0..60u32 {
             if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            // The user can hit the close button while we are still
+            // verifying: honour it instead of holding a doomed window.
+            if drain_events(d, win, wm_protocols, wm_delete) {
+                user_closed = true;
                 break;
             }
             handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
@@ -464,8 +592,9 @@ fn editor_main(
             std::thread::sleep(Duration::from_millis(50));
         }
         if !painted_now {
-            // No live editor appeared: close cleanly so NO blank window is
-            // left behind, and let the UI fall back to the slider panel.
+            // No live editor appeared (or the user closed the still-
+            // unverified window): close cleanly so NO blank panel is left
+            // behind, and let the UI fall back to the slider panel.
             let _loader = crate::vsthost::vst_loader_lock();
             handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
             drop(_loader);
@@ -473,44 +602,20 @@ fn editor_main(
             XDestroyWindow(d, win);
             XFlush(d);
             XCloseDisplay(d);
-            open_failed.store(true, Ordering::SeqCst);
+            // A refused open pushes the slider fallback; a close the user
+            // already performed during verification just retires the
+            // editor quietly.
+            open_failed.store(!user_closed, Ordering::SeqCst);
             closed.store(true, Ordering::SeqCst);
             return;
         }
         painted.store(true, Ordering::SeqCst);
         let mut last_size = (0i32, 0i32);
         let mut since_rect = 0u32;
-        let mut quit = false;
-        while !quit {
-            // Drain pending X events (bounded so a chatty plugin cannot
-            // starve the idle pump).
-            let mut drained = 0;
-            while XPending(d) > 0 && drained < 64 {
-                let mut ev = [0u64; 24];
-                if XNextEvent(d, &mut ev) == 0 {
-                    break;
-                }
-                drained += 1;
-                let etype = (ev[0] as u32) as i32;
-                match etype {
-                    EVENT_CLIENT_MESSAGE => {
-                        // XClientMessageEvent on x86_64: message_type atom
-                        // (unsigned long) at byte 40 -> ev[5]; data.l[0]
-                        // at byte 56 -> ev[7].
-                        if ev[7] == wm_delete {
-                            quit = true;
-                        }
-                    }
-                    EVENT_CONFIGURE_NOTIFY
-                    | EVENT_DESTROY_NOTIFY
-                    | EVENT_REPARENT_NOTIFY => {
-                        // Container resizes and plugin window churn: the
-                        // child count and rect refresh below track them.
-                    }
-                    _ => {}
-                }
-            }
-            if quit || stop.load(Ordering::SeqCst) {
+        loop {
+            // Dispatch X events (close button / window destruction),
+            // bounded so a chatty plugin cannot starve the idle pump.
+            if drain_events(d, win, wm_protocols, wm_delete) || stop.load(Ordering::SeqCst) {
                 break;
             }
             // Count plugin windows parented into the container.
@@ -665,5 +770,93 @@ mod tests {
 
     fn dirs_home() -> std::path::PathBuf {
         std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default()
+    }
+
+    /// Shared gate for the live-X pins: explicit opt-in + X11 + a plugin.
+    fn smoke_gate(plugin: &str) -> Option<std::path::PathBuf> {
+        if std::env::var("SLOOPER_VST_SMOKE").unwrap_or_default() != "1" || !x11_available() {
+            return None;
+        }
+        let p = dirs_home().join(plugin);
+        p.exists().then_some(p)
+    }
+
+    /// v10.1 pin (amsynth blank-panel report): a plugin whose editor dies
+    /// mid-build — it throws `unordered_map::at` and its child window
+    /// stays 1x1 — must be REFUSED: container destroyed, thread exited,
+    /// `open_failed` set so the UI falls back to sliders. The historical
+    /// bug: the paint probe compared against black, and the container's
+    /// own background counted as "painted", leaving a permanent blank,
+    /// uncloseable window.
+    #[test]
+    fn v101_vstedit_refuses_unpainted_editor() {
+        let Some(path) = smoke_gate(".vst/amsynth_vst.so") else {
+            eprintln!("skip: SLOOPER_VST_SMOKE=1 + ~/.vst/amsynth_vst.so required");
+            return;
+        };
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("plugin loads");
+        let entry = &load.entry;
+        let h = entry.vst2_handle().expect("vst2 handle");
+        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-refuse").expect("open_editor");
+        // Verification timeout is 60 x 50 ms; give it generous slack.
+        let mut waited = 0u32;
+        while !win.open_failed() && !win.painted() && waited < 8000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        if win.painted() {
+            eprintln!(
+                "note: {} paints a live editor on this build; pin passes trivially",
+                path.display()
+            );
+            win.close();
+            return;
+        }
+        assert!(win.open_failed(), "unpainted editor must report open_failed");
+        assert!(win.is_closed(), "refused editor must destroy its window and exit");
+        assert_eq!(win.child_count(), 0, "no children may survive the refuse");
+        win.close();
+    }
+
+    /// v10.1 pin (uncloseable-window report): a `WM_DELETE_WINDOW` client
+    /// message — exactly what the window manager sends for the title-bar
+    /// X — must close a painted editor within seconds. The old pump tested
+    /// `XNextEvent(...) == 0` as an error, but 0 IS success, so every
+    /// event was popped and dropped and the close button did nothing.
+    #[test]
+    fn v101_vstedit_wm_delete_closes_editor() {
+        let Some(path) = smoke_gate(".vst/wolf-shaper-vst.so") else {
+            eprintln!("skip: SLOOPER_VST_SMOKE=1 + ~/.vst/wolf-shaper-vst.so required");
+            return;
+        };
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("plugin loads");
+        let entry = &load.entry;
+        let h = entry.vst2_handle().expect("vst2 handle");
+        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-close").expect("open_editor");
+        let mut waited = 0u32;
+        while !win.painted() && !win.is_closed() && waited < 8000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        if !win.painted() {
+            eprintln!("skip: wolf-shaper editor did not paint in 8 s (no X session?)");
+            win.close();
+            return;
+        }
+        let xid = win.xid();
+        assert_ne!(xid, 0, "container XID must be published");
+        assert!(request_wm_delete(xid), "WM_DELETE injection failed");
+        let mut waited = 0u32;
+        while !win.is_closed() && waited < 4000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        assert!(
+            win.is_closed(),
+            "editor must exit on WM_DELETE_WINDOW (close button)"
+        );
+        win.close();
     }
 }
