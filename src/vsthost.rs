@@ -574,22 +574,84 @@ pub fn vst_loader_lock() -> std::sync::MutexGuard<'static, ()> {
     VST_LOADER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Load a plugin from `path` on the UI thread and prepare its realtime
-/// entry. `saved` (normalized, in `descs` order) overrides defaults.
+// ---------------------------------------------------------------- GUI thread
+//
+// ONE thread owns every plugin *control-plane* call: instantiation,
+// editor open/idle/close, and editor teardown. Why this exists: plugin
+// GUI toolkits bind their global event loop to the thread that first
+// touches the plugin (JUCE's `MessageManager`, FLTK). When instantiating
+// ran on the UI thread but `effEditOpen` ran on a per-editor thread,
+// JUCE deferred every editor operation onto the (idle) load thread
+// forever: the child window appeared created-and-sized but never mapped,
+// and no VST2 GUI ever showed (the v10.2 "plugin GUIs don't work"
+// report — verified on this machine for wolf-shaper, Dragonfly and
+// amsynth: the identical open becomes painted-at-first-idle when load
+// and editOpen share a thread). Serializing instantiation AND all editor
+// dispatch on this thread makes every toolkit's affinity assumption
+// true by construction.
+type GuiJob = Box<dyn FnOnce() + Send + 'static>;
+
+fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<GuiJob>> =
+        std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<GuiJob>();
+        std::thread::Builder::new()
+            .name("vst2-gui".into())
+            .spawn(move || loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(30)) {
+                    Ok(job) => {
+                        job();
+                        while let Ok(job) = rx.try_recv() {
+                            job();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                // Editor idle pump for every open editor (30 ms cadence,
+                // what FLTK/JUCE/VSTGUI expect from effEditIdle).
+                crate::vstedit::pump_editors();
+            })
+            .expect("spawn vst2-gui thread");
+        tx
+    })
+}
+
+/// Run `f` on the VST GUI thread and block the caller for its result.
+/// Never call from a GUI job (deadlock); no job ever does.
+pub fn on_gui_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
+    gui_tx()
+        .send(Box::new(move || {
+            let _ = rtx.send(f());
+        }))
+        .map_err(|_| "vst gui thread gone".to_string())?;
+    rrx.recv().map_err(|_| "vst gui thread gone".to_string())
+}
+
+/// Load a plugin (UI/manager/render thread entry point) — the actual
+/// instantiation is proxied onto the shared VST GUI thread so toolkit
+/// thread affinity binds there, where the editors also run. `saved`
+/// (normalized, in `descs` order) overrides defaults.
 pub fn open(
     path: &Path,
     kind: VstKind,
     sample_rate: u32,
     saved: Option<&[f32]>,
 ) -> Result<VstLoad, String> {
-    let _loader = vst_loader_lock();
-    let entry = match kind {
-        VstKind::V3 => open_v3(path, sample_rate, saved)?,
-        VstKind::V2 => open_v2(path, sample_rate, saved)?,
-    };
-    Ok(VstLoad {
-        entry: Arc::new(entry),
-    })
+    let path = path.to_path_buf();
+    let saved = saved.map(|s| s.to_vec());
+    on_gui_thread(move || {
+        let _loader = vst_loader_lock();
+        let entry = match kind {
+            VstKind::V3 => open_v3(&path, sample_rate, saved.as_deref())?,
+            VstKind::V2 => open_v2(&path, sample_rate, saved.as_deref())?,
+        };
+        Ok(VstLoad {
+            entry: Arc::new(entry),
+        })
+    })?
 }
 
 fn stage_buf() -> Vec<f32> {
