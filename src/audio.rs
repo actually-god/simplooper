@@ -604,6 +604,11 @@ pub struct Engine {
     preview_gen: AtomicU64,
     /// 1 = a preview is playing (RT clears it when the buffer runs out).
     preview_on: AtomicU8,
+    /// Samples consumed by the YOUNGEST preview voice, republished per RT
+    /// block — the piano-roll playhead follows its own preview (transport
+    /// does not move while auditioning, so reading `pos` left the bar
+    /// permanently static, the v10.2 report).
+    preview_pos: AtomicU64,
 }
 
 impl Engine {
@@ -662,6 +667,7 @@ impl Engine {
             preview_vid: AtomicU64::new(0),
             preview_gen: AtomicU64::new(0),
             preview_on: AtomicU8::new(0),
+            preview_pos: AtomicU64::new(0),
         })
     }
 
@@ -1082,6 +1088,12 @@ impl Engine {
 
     pub fn preview_active(&self) -> bool {
         self.preview_on.load(Ordering::Relaxed) != 0
+    }
+
+    /// Samples elapsed in the youngest preview voice (only meaningful
+    /// while `preview_active()`).
+    pub fn preview_pos(&self) -> u64 {
+        self.preview_pos.load(Ordering::Relaxed)
     }
 
     pub fn preview_gen(&self) -> u64 {
@@ -3629,6 +3641,10 @@ impl ProcessHandler for Proc {
         // Publish the playhead for the GUI (display resolution is far
         // coarser than the block rate).
         self.engine.pos.store(self.pos, Ordering::Relaxed);
+        self.engine.preview_pos.store(
+            self.preview_curs.last().map(|(_, i)| *i as u64).unwrap_or(0),
+            Ordering::Relaxed,
+        );
         self.peak.store(peak_val, Ordering::Relaxed);
 
         Control::Continue

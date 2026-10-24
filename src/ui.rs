@@ -2681,12 +2681,13 @@ impl App {
     }
 
     /// Render a whole pattern through the audition target for PREVIEW.
+    /// Always the FULL pattern plus a release tail — the rack's audition
+    /// length cap exists for one-shot samples; cutting a multi-bar
+    /// pattern down to it made "preview" play a meaningless blip (the
+    /// v10.2 "preview doesn't work in the piano roll" report).
     fn render_pattern_preview(&mut self, pat: &Pattern) -> Option<Arc<[f32]>> {
         let sr = self.sample_rate.max(1);
-        let secs = self
-            .preview_secs_f()
-            .min(30.0)
-            .min(pat.len_samples(sr) as f32 / sr as f32 + 2.0);
+        let secs = (pat.len_samples(sr) as f32 / sr as f32 + 1.0).clamp(0.5, 60.0);
         self.audition_render(&self.pattern_events(pat), secs)
     }
 
@@ -2738,7 +2739,15 @@ impl App {
             1.0 / sr as f64
         };
         let min_len_ticks = ((step_sec / sec_per_beat) * PPQ as f64).max(1.0) as u32;
-        let playhead = self.backend.engine.pos();
+        // Playhead source: while a preview plays, the TRANSPORT does not
+        // move — the bar must follow the preview voice's own cursor or it
+        // sits at zero all audition long (the v10.2 "bar never moves"
+        // report). Otherwise the transport position as always.
+        let playhead = if self.backend.engine.preview_active() {
+            self.backend.engine.preview_pos()
+        } else {
+            self.backend.engine.pos()
+        };
         let sel = self.selected;
         let mut save = false;
         let mut clear = false;
@@ -4288,8 +4297,30 @@ impl App {
         self.sel_asset = None;
         self.sel_clips.clear();
         self.sel_anchor = None;
+        // Asset ids ARE table indices, so this removal invalidates every
+        // id any open view still holds. Without this remap the piano roll
+        // keeps editing whatever slid into (or past) the dead slot — the
+        // v10.2 "deleting assets crashes to desktop" report.
+        let mut roll_closed = false;
+        if let Some(r) = self.piano_roll.as_mut() {
+            match r.edit_asset {
+                Some(id) if (id as usize) == k => roll_closed = true,
+                Some(id) if (id as usize) > k => r.edit_asset = Some(id - 1),
+                _ => {}
+            }
+        }
+        if roll_closed {
+            self.piano_roll = None;
+        }
+        // An in-flight audition may reference the dead id; the name-based
+        // toggle would stop a DIFFERENT asset's preview on the next click.
+        self.preview_playing = None;
         self.push_project();
-        self.status = "asset removed (its clips too)".into();
+        self.status = if roll_closed {
+            "asset removed (its clips too); piano roll closed with it".into()
+        } else {
+            "asset removed (its clips too)".into()
+        };
     }
 
     // ---- projects --------------------------------------------------------
@@ -4966,8 +4997,10 @@ impl eframe::App for App {
         ctx.set_zoom_factor(self.gui_scale);
         // Keep the update loop ticking so backend events (MIDI, port
         // changes, transport) are drained promptly; while the transport
-        // runs or a take rolls, tick at ~50 fps so the playhead is smooth.
+        // runs, a take rolls, or a preview auditions, tick at ~50 fps so
+        // the playhead is smooth.
         let active = self.backend.engine.transport_on()
+            || self.backend.engine.preview_active()
             || (0..MAX_LOOPS).any(|t| self.backend.engine.rec_state_of(t) == TR_REC);
         ctx.request_repaint_after(std::time::Duration::from_millis(if active {
             20
@@ -11171,4 +11204,122 @@ mod tests {
         app.backend.engine.stop_preview();
     }
 
+    /// v10.2 "deleting assets crashes to desktop" sweep: delete every
+    /// asset, in several orders, while views that hold asset ids stay
+    /// open — the piano roll editing one of them, clips referencing the
+    /// rest, selection hot — running real frames between removals so any
+    /// stale-id index (the class of bug: ids ARE indices) panics here.
+    #[test]
+    fn v102_delete_asset_stress_with_views_open() {
+        use std::path::PathBuf;
+        let mut app = headless_app("delstress");
+        let ctx = egui::Context::default();
+        let samples = PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap()).join("samples");
+        let kick = samples.join("kick.wav");
+        for n in ["snare.wav", "hat.wav"] {
+            let d = samples.join(n);
+            if !d.exists() {
+                std::fs::copy(&kick, &d).unwrap();
+            }
+        }
+        let mut pat = Pattern::new(120);
+        pat.len_ticks = 4 * PPQ as u32;
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
+        pat.save_mid(&samples.join("roll.mid")).unwrap();
+        let a0 = app.ensure_asset(&kick).unwrap();
+        let a1 = app.ensure_asset(&samples.join("snare.wav")).unwrap();
+        let a2 = app.ensure_asset(&samples.join("hat.wav")).unwrap();
+        let m = app.ensure_asset(&samples.join("roll.mid")).unwrap();
+        assert_eq!(app.assets.len(), 4);
+        for (lane, asset) in [(0usize, a0), (1, a1), (2, a2), (3, m)] {
+            app.arr.insert(0, lane, Clip::new(asset as u32, (lane as u64) * 4800));
+        }
+        let sel = app
+            .arr
+            .tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(t, tr)| {
+                tr.lanes.iter().enumerate().flat_map(move |(k, l)| {
+                    l.clips.iter().enumerate().map(move |(c, _)| (t, k, c))
+                })
+            })
+            .find(|(t, k, c)| app.arr.tracks[*t].lanes[*k].clips[*c].asset as usize == m)
+            .unwrap();
+        app.sel_clips = vec![sel];
+        app.sel_asset = Some(a2);
+
+        let btn = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text().contains("Piano roll") {
+                        return Some(egui::Rect::from_min_size(t.pos, egui::vec2(4.0, 12.0)));
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.expect("Piano roll button").center()
+        };
+        frame(&mut app, &ctx, vec![moved(btn), btn_btn(btn, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(btn, false)]);
+        assert!(app.piano_roll.is_some(), "roll opens");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().edit_asset,
+            Some(m as u32),
+            "roll edits the MIDI asset"
+        );
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+
+        // Delete the asset the roll is editing WHILE it is open.
+        app.remove_asset_at(m);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.assets.len(), 3, "the deleted asset is gone");
+        for tr in app.arr.tracks.iter() {
+            for l in tr.lanes.iter() {
+                for c in l.clips.iter() {
+                    assert!((c.asset as usize) < app.assets.len(), "clip holds a dead id");
+                }
+            }
+        }
+        if let Some(r) = app.piano_roll.as_ref() {
+            assert!(
+                r.edit_asset.map_or(true, |id| (id as usize) < app.assets.len()),
+                "roll kept a stale edit_asset id after delete: {:?}",
+                r.edit_asset
+            );
+        }
+        if let Some(r) = app.piano_roll.as_mut() {
+            let id = r.edit_asset.unwrap_or(0);
+            let mut p = r.pat.clone();
+            app.update_piano_roll_asset(&mut p, id);
+        }
+        while !app.assets.is_empty() {
+            let k = app.assets.len() - 1;
+            app.remove_asset_at(k);
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.assets.len(), 0);
+    }
 }
