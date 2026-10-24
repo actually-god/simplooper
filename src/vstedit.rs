@@ -616,7 +616,7 @@ impl Editor {
     fn step(&mut self) {
         unsafe {
             match self.phase {
-                Phase::Done => return,
+                Phase::Done => {}
                 Phase::Verify { it } => {
                     // The user can hit the close button while we are
                     // still verifying: honour it instead of holding a

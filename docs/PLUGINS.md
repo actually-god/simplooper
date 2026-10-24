@@ -69,6 +69,29 @@ cross-checked against the VST2.4 SDK (`aeff.h` opcodes), Ardour
 Requirements: an X11 display (`$DISPLAY`; XWayland under a Wayland session
 counts). Without X11 the button reports it and the slider fallback remains.
 
+Three host-wide rules make the difference between painted windows and
+blank sentinels — all verified against JUCE, FLTK and VSTGUI editors on
+this project (v10.2):
+
+- **One thread owns every plugin control-plane call.** Instantiation,
+  `effEditOpen/Idle/Close`, teardown: all on the shared `vst2-gui`
+  thread. JUCE (and FLTK) bind their *global* message loop to the
+  thread that first touches the plugin; when instantiation ran
+  elsewhere, editors were created, sized — and never mapped.
+- **Never call `XInitThreads()`.** With it in effect (it is
+  process-global), plugin editors stop mapping their windows — verified
+  by bisection, identical open sequence, painted vs. never-mapped.
+- **The container window stays bare until the editor proves itself.**
+  No `XStoreName`, no `WM_PROTOCOLS`, no `XSelectInput` before
+  `effEditOpen`: any of those change how the window manager engages the
+  window in time, and JUCE then never maps its child. The title and
+  close protocol are added after the first verified paint.
+- **The app takes the X11 backend whenever one exists.** Plugin editors
+  are X11 clients by ABI; a Wayland main window plus Xwayland plugin
+  windows cannot be managed as one world, so `WAYLAND_DISPLAY` is
+  dropped at startup when `$DISPLAY` is set (escape hatch:
+  `SLOOPER_FORCE_WAYLAND=1`, at the cost of plugin GUIs).
+
 ### Diagnostics / limitations
 
 - **No-GUI plugins** (`effFlagsHasEditor` clear) keep the automatic

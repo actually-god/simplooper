@@ -2613,8 +2613,7 @@ impl Proc {
                     // A VSTi generates from events: feed each event, drive
                     // the plugin over silence in between, straight into the
                     // row. Events land at internal-block boundaries (the
-                    // host's uniform ≤ VST_BLOCK staging delay). Channel
-                    // pressure has no message form here — dropped.
+                    // host's uniform ≤ VST_BLOCK staging delay).
                     sil.clear();
                     sil.resize(block_n, 0.0);
                     let mut cur = 0usize;
@@ -2630,7 +2629,7 @@ impl Proc {
                             match kind {
                                 0 => e.note_off(ch, d1),
                                 1 => e.cc(ch, d1, d2),
-                                2 => {}
+                                2 => e.press(ch, d2),
                                 _ => e.note_on(ch, d1, d2),
                             }
                             i += 1;

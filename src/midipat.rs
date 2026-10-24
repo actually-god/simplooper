@@ -227,6 +227,10 @@ impl Pattern {
                 } else {
                     p += 1;
                 }
+                if p >= end {
+                    // Truncated chunk: status with no room for its payload.
+                    break;
+                }
                 if st == 0xFF {
                     // Meta: type + length + data.
                     let mt = b[p];
@@ -304,13 +308,45 @@ impl Pattern {
                         p += 1;
                         running = st;
                     }
-                    0xC0 | 0xE0 => {
-                        p += 1; // program / pitch bend: recorded, not stored
+                    0xC0 => {
+                        // Program change: one data byte.
+                        if p + 1 > end {
+                            break;
+                        }
+                        p += 1;
                         running = st;
                     }
-                    0xA0 | 0xF0 => {
+                    0xE0 => {
+                        // Pitch bend: TWO data bytes (LSB, MSB). Consuming
+                        // one desynced the stream — every event after the
+                        // first bend in a file parsed as garbage.
+                        if p + 2 > end {
+                            break;
+                        }
                         p += 2;
                         running = st;
+                    }
+                    0xA0 => {
+                        // Poly aftertouch: two data bytes.
+                        if p + 2 > end {
+                            break;
+                        }
+                        p += 2;
+                        running = st;
+                    }
+                    0xF0 => {
+                        // System common/realtime: nothing here belongs to
+                        // the pattern model; skip the right number of
+                        // payload bytes so the stream stays aligned.
+                        let extra: usize = match st {
+                            0xF2 => 2,
+                            0xF3 => 1,
+                            _ => 0,
+                        };
+                        if p + extra > end {
+                            break;
+                        }
+                        p += extra;
                     }
                     _ => break,
                 }
@@ -410,5 +446,39 @@ mod tests {
         assert_eq!(n.start % (PPQ as u32 / 4), 0);
         assert_eq!(n.len % (PPQ as u32 / 4), 0);
         assert_eq!(p.len_ticks % (4 * PPQ as u32), 0);
+    }
+
+    #[test]
+    fn smf_pitch_bend_and_syscommon_keep_the_stream_aligned() {
+        // Track: C-3 on; PITCH BEND (2 bytes, LSB/MSB); C#3 on via
+        // RUNNING status / off; poly-aftertouch; a system-realtime byte.
+        let mut trk: Vec<u8> = Vec::new();
+        trk.extend_from_slice(&[0x00, 0x90, 60, 100]); // C-3 on
+        trk.extend_from_slice(&[0x00, 0xE0, 0x40, 0x20]); // pitch bend (2 bytes!)
+        // explicit note-on at 16 (a mis-sized pitch-bend skip would
+        // consume THIS status byte), then running-status note-off
+        trk.extend_from_slice(&[0x10, 0x90, 61, 100]);
+        trk.extend_from_slice(&[0x00, 61, 0x00]);
+        trk.extend_from_slice(&[0x00, 0xA0, 60, 50]); // poly aftertouch (2 bytes)
+        trk.extend_from_slice(&[0x00, 0xFA]); // timing clock (realtime, 0 bytes)
+        trk.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]); // end of track
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"MThd");
+        b.extend_from_slice(&6u32.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 1, 0x01, 0xE0]); // fmt 0, 1 track, 480 PPQ
+        b.extend_from_slice(b"MTrk");
+        b.extend_from_slice(&(trk.len() as u32).to_be_bytes());
+        b.extend_from_slice(&trk);
+        let dir = std::env::temp_dir().join("sp-smfalign.mid");
+        std::fs::write(&dir, &b).unwrap();
+        let pat = Pattern::load_mid(&dir).expect("parse");
+        let notes: Vec<(u8, u32, u32)> =
+            pat.notes.iter().map(|n| (n.note, n.start, n.len)).collect();
+        assert_eq!(
+            notes,
+            vec![(60, 0, 4 * PPQ as u32), (61, 16, 1)],
+            "pitch bend must consume exactly its two payload bytes \
+             (one-byte consumption desynced every following event)"
+        );
     }
 }

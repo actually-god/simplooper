@@ -933,6 +933,13 @@ impl RtStageEntry {
         self.feed_midi([0xB0 | ch & 0x0F, ctl & 0x7F, val & 0x7F]);
     }
 
+    /// Channel pressure (0-127) — the pattern's expression lane. VST3
+    /// delivery maps it to ChannelAftertouch; VST2 plugins take the raw
+    /// 0xD0 message directly.
+    pub fn press(&self, ch: u8, val: u8) {
+        self.feed_midi([0xD0 | ch & 0x0F, val & 0x7F, 0]);
+    }
+
     /// Panic switch: all-notes-off + all-sounds-off on every channel.
     /// Audio thread only.
     pub fn all_notes_off(&self) {
@@ -1035,6 +1042,19 @@ impl RtStageEntry {
                             0xC0 => {
                                 c.send_midi(MidiEvent::ProgramChange { channel: ch, program: d1 })
                             }
+                            0xD0 => c.send_midi(MidiEvent::ChannelAftertouch {
+                                channel: ch,
+                                pressure: d1,
+                            }),
+                            0xA0 => c.send_midi(MidiEvent::PolyAftertouch {
+                                channel: ch,
+                                note: d1,
+                                pressure: d2,
+                            }),
+                            0xE0 => c.send_midi(MidiEvent::PitchBend {
+                                channel: ch,
+                                value: ((d2 as u16) << 7) | (d1 as u16),
+                            }),
                             _ => false,
                         };
                     }

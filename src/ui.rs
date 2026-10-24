@@ -11305,7 +11305,7 @@ mod tests {
         }
         if let Some(r) = app.piano_roll.as_ref() {
             assert!(
-                r.edit_asset.map_or(true, |id| (id as usize) < app.assets.len()),
+                r.edit_asset.is_none_or(|id| (id as usize) < app.assets.len()),
                 "roll kept a stale edit_asset id after delete: {:?}",
                 r.edit_asset
             );
@@ -11321,5 +11321,51 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
         }
         assert_eq!(app.assets.len(), 0);
+    }
+
+    /// v10.2 pin — the v0.10 "plugin opens its GUI when bound" standard,
+    /// wired end to end through the App (not just the editor unit):
+    /// binding a VST2 stem must instantiate on the shared GUI thread,
+    /// open the plugin's own editor window, and keep the slider window
+    /// CLOSED (editor-first). With no plugins/display installed the VST2
+    /// half skips; a script synth must never open an editor at all.
+    #[test]
+    fn v102_bind_synth_opens_plugin_editor() {
+        let mut app = headless_app("bindgui");
+        // Script synth: never an editor, never the slider fallback.
+        app.set_track_synth_stem(0, "piano");
+        assert!(app.vst_editors.is_empty(), "a script synth opened an editor");
+        assert_ne!(app.synth_win, Some(0), "slider window for a script synth");
+        assert!(app.track_synth_inst[0].is_some(), "script instance bound");
+
+        let plugin = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".vst/amsynth_vst.so");
+        if std::env::var_os("SLOOPER_VST_SMOKE").is_none() || !plugin.exists() {
+            eprintln!("skip: SLOOPER_VST_SMOKE unset or no amsynth");
+            return;
+        }
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        let stem = format!("vst2:{}", plugin.display());
+        app.set_track_synth_stem(0, &stem);
+        // Editor-first: bound, editor open, NO slider window.
+        assert!(app.track_synth_inst[0].is_some(), "plugin instance bound: {}", app.status);
+        assert!(
+            app.vst_editors.contains_key(&0),
+            "editor did not open at bind time: status {:?}",
+            app.status
+        );
+        assert_ne!(app.synth_win, Some(0), "slider window opened beside the editor");
+        // The window must still be alive after frames (watchdog keeps it).
+        let ctx = egui::Context::default();
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.vst_editors.contains_key(&0), "editor vanished after bind");
+        // Unbinding retires the editor cleanly.
+        app.set_track_synth_stem(0, "");
+        assert!(app.vst_editors.is_empty(), "editor left open after unbind");
     }
 }

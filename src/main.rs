@@ -12,6 +12,20 @@
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result {
+    // Plugin editors decide the app's windowing world: the VST2 spec has
+    // exactly one Linux UI ABI — native X11 embedding — so every hosted
+    // plugin opens plain X11 windows. Under a Wayland session winit would
+    // take the main window to Wayland while all those plugin windows land
+    // on Xwayland, and no host can manage across that seam (the v10.2
+    // "plugin GUIs don't even show up as a window" report on KDE). When
+    // an X display exists, run the whole app through it (Xwayland under
+    // Wayland): one server, one world, editors embed and stack normally.
+    // Opt back into Wayland (losing VST2 GUIs) with SLOOPER_FORCE_WAYLAND=1.
+    if std::env::var_os("SLOOPER_FORCE_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some()
+    {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("WAYLAND_SOCKET");
+    }
     // Start the JACK/PipeWire-JACK backend thread (NO_START: never auto-starts a server).
     let backend = slooper::audio::Backend::start();
 
